@@ -457,6 +457,41 @@
             return data;
         }
 
+        async function fetchBomData(dateStr) {
+            // Fetch stored BOM forecast data from CSV
+            const [year, month, day] = dateStr.split('-');
+            const url = `${BASE_URL}/${year}/${month}/${day}_bom.csv`;
+
+            try {
+                const response = await fetch(url);
+                if (!response.ok) return [];
+
+                const text = await response.text();
+                const lines = text.trim().split('\n');
+                if (lines.length < 2) return [];
+
+                const headers = lines[0].split(',');
+                const data = [];
+                for (let i = 1; i < lines.length; i++) {
+                    const values = lines[i].split(',');
+                    const record = {};
+                    headers.forEach((h, idx) => {
+                        const val = values[idx];
+                        if (h === 'timestamp') {
+                            record[h] = val;
+                        } else {
+                            record[h] = val === '' ? null : parseFloat(val);
+                        }
+                    });
+                    record.time = new Date(record.timestamp);
+                    data.push(record);
+                }
+                return data;
+            } catch (e) {
+                return [];
+            }
+        }
+
         async function fetchHourlyForecast() {
             try {
                 const response = await fetch(BOM_HOURLY_API);
@@ -543,19 +578,32 @@
                 data[data.length-1].timestamp.split(' ')[1];
         }
 
-        function createWindChart(data, forecast, dateStr) {
+        function createWindChart(data, bomData, forecast, dateStr) {
             const ctx = document.getElementById('windChart').getContext('2d');
 
             if (windChart) windChart.destroy();
 
-            // Filter forecast to selected date
+            // Filter forecast to selected date (for future hours)
             const selectedDate = parseDate(dateStr);
             const nextDate = new Date(selectedDate);
             nextDate.setDate(nextDate.getDate() + 1);
 
+            // Get last observation time to avoid overlap
+            const lastObsTime = data.length > 0 ? data[data.length - 1].time : new Date(0);
+
             const dayForecast = forecast.filter(f =>
-                f.time >= selectedDate && f.time < nextDate
+                f.time >= selectedDate && f.time < nextDate && f.time > lastObsTime
             );
+
+            // Combine stored BOM data with live forecast (no overlap)
+            let bomWindData = bomData.map(d => ({x: d.time, y: d.bom_wind_kt}));
+            let bomGustData = bomData.map(d => ({x: d.time, y: d.bom_gust_kt}));
+
+            // Append live forecast data for future hours
+            if (dayForecast.length > 0) {
+                bomWindData = bomWindData.concat(dayForecast.map(f => ({x: f.time, y: f.wind_kt})));
+                bomGustData = bomGustData.concat(dayForecast.map(f => ({x: f.time, y: f.gust_kt})));
+            }
 
             const datasets = [
                 {
@@ -564,14 +612,6 @@
                     borderColor: '#3498db',
                     backgroundColor: 'rgba(52, 152, 219, 0.1)',
                     fill: true,
-                    tension: 0.3,
-                    pointRadius: 0
-                },
-                {
-                    label: '10-min Avg',
-                    data: data.map(d => ({x: d.time, y: d.wind_avg_kt})),
-                    borderColor: '#2ecc71',
-                    backgroundColor: 'transparent',
                     tension: 0.3,
                     pointRadius: 0
                 },
@@ -585,27 +625,25 @@
                 }
             ];
 
-            // Add forecast datasets if available
-            if (dayForecast.length > 0) {
+            // Add combined BOM forecast (stored + live)
+            if (bomWindData.length > 0) {
                 datasets.push({
-                    label: 'BOM Forecast',
-                    data: dayForecast.map(f => ({x: f.time, y: f.wind_kt})),
+                    label: 'Forecast',
+                    data: bomWindData,
                     borderColor: '#9b59b6',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
                     tension: 0.3,
-                    pointRadius: 3,
-                    pointBackgroundColor: '#9b59b6'
+                    pointRadius: 0
                 });
                 datasets.push({
-                    label: 'BOM Gust Forecast',
-                    data: dayForecast.map(f => ({x: f.time, y: f.gust_kt})),
+                    label: 'Forecast Gust',
+                    data: bomGustData,
                     borderColor: '#e67e22',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
                     tension: 0.3,
-                    pointRadius: 3,
-                    pointBackgroundColor: '#e67e22'
+                    pointRadius: 0
                 });
             }
 
@@ -650,7 +688,7 @@
             });
         }
 
-        function createDirectionChart(data, forecast, dateStr) {
+        function createDirectionChart(data, bomData, forecast, dateStr) {
             const ctx = document.getElementById('directionChart').getContext('2d');
 
             if (directionChart) directionChart.destroy();
@@ -660,31 +698,39 @@
             const nextDate = new Date(selectedDate);
             nextDate.setDate(nextDate.getDate() + 1);
 
+            // Get last observation time to avoid overlap
+            const lastObsTime = data.length > 0 ? data[data.length - 1].time : new Date(0);
+
             const dayForecast = forecast.filter(f =>
-                f.time >= selectedDate && f.time < nextDate
+                f.time >= selectedDate && f.time < nextDate && f.time > lastObsTime
             );
+
+            // Combine stored BOM data with live forecast
+            let bomDirData = bomData.map(d => ({x: d.time, y: d.bom_wind_dir}));
+            if (dayForecast.length > 0) {
+                bomDirData = bomDirData.concat(dayForecast.map(f => ({x: f.time, y: compassToDeg(f.direction)})));
+            }
 
             const datasets = [{
                 label: 'Wind Direction',
                 data: data.map(d => ({x: d.time, y: d.wind_dir})),
-                borderColor: '#9b59b6',
-                backgroundColor: 'rgba(155, 89, 182, 0.1)',
+                borderColor: '#3498db',
+                backgroundColor: 'rgba(52, 152, 219, 0.1)',
                 fill: true,
                 tension: 0,
-                pointRadius: 1
+                pointRadius: 0
             }];
 
-            // Add forecast direction if available
-            if (dayForecast.length > 0) {
+            // Add combined BOM direction (stored + live)
+            if (bomDirData.length > 0) {
                 datasets.push({
-                    label: 'BOM Forecast Dir',
-                    data: dayForecast.map(f => ({x: f.time, y: compassToDeg(f.direction)})),
-                    borderColor: '#e67e22',
+                    label: 'Forecast',
+                    data: bomDirData,
+                    borderColor: '#9b59b6',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
                     tension: 0,
-                    pointRadius: 3,
-                    pointBackgroundColor: '#e67e22'
+                    pointRadius: 0
                 });
             }
 
@@ -906,9 +952,10 @@
             document.getElementById('error').style.display = 'none';
 
             try {
-                // Fetch wind data and hourly forecast in parallel
-                const [windData, forecast] = await Promise.all([
+                // Fetch wind data, stored BOM data, and live forecast in parallel
+                const [windData, bomData, forecast] = await Promise.all([
                     fetchWindData(dateStr),
+                    fetchBomData(dateStr),
                     hourlyForecast.length > 0 ? Promise.resolve(hourlyForecast) : fetchHourlyForecast()
                 ]);
 
@@ -922,8 +969,8 @@
 
                 updateCurrentConditions(currentData);
                 updateStats(currentData);
-                createWindChart(currentData, hourlyForecast, dateStr);
-                createDirectionChart(currentData, hourlyForecast, dateStr);
+                createWindChart(currentData, bomData, forecast, dateStr);
+                createDirectionChart(currentData, bomData, forecast, dateStr);
                 createWindRose(currentData);
                 createTempChart(currentData);
                 showContent();
