@@ -185,6 +185,55 @@
             background: #2c3e50;
             color: white;
         }
+        .forecast-section {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .forecast-section h3 {
+            margin: 0 0 15px 0;
+            color: #2c3e50;
+        }
+        .forecast-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .forecast-day {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 15px;
+            border-left: 4px solid #3498db;
+        }
+        .forecast-day .day-name {
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 8px;
+        }
+        .forecast-day .temps {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 8px;
+        }
+        .forecast-day .temp-high {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+        .forecast-day .temp-low {
+            color: #3498db;
+        }
+        .forecast-day .wind-forecast {
+            font-size: 0.9em;
+            color: #555;
+            line-height: 1.4;
+        }
+        .forecast-day .rain-chance {
+            font-size: 0.85em;
+            color: #7f8c8d;
+            margin-top: 8px;
+        }
         @media (max-width: 600px) {
             .controls {
                 flex-direction: column;
@@ -292,6 +341,13 @@
                 <div class="stat-row"><span>Last:</span><span id="lastRecord">--</span></div>
             </div>
         </div>
+
+        <div class="forecast-section">
+            <h3>BOM Forecast</h3>
+            <div id="forecastGrid" class="forecast-grid">
+                <span class="loading">Loading forecast...</span>
+            </div>
+        </div>
     </div>
 
     <div class="available-dates">
@@ -303,13 +359,16 @@
 
     <footer style="text-align: center; margin-top: 30px; padding: 20px; color: #7f8c8d; font-size: 0.9em;">
         With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather data
+        and <a href="http://www.bom.gov.au/" style="color: #3498db;">Bureau of Meteorology</a> for forecasts
     </footer>
 
     <script>
         const BASE_URL = 'wind_logs';
+        const BOM_HOURLY_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly';
         let windChart, directionChart, windRoseChart, tempChart;
         let currentData = [];
         let availableDates = [];
+        let hourlyForecast = [];
 
         // Direction labels
         const DIRECTIONS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
@@ -398,6 +457,34 @@
             return data;
         }
 
+        async function fetchHourlyForecast() {
+            try {
+                const response = await fetch(BOM_HOURLY_API);
+                if (!response.ok) return [];
+
+                const data = await response.json();
+                return data.data.map(h => ({
+                    time: new Date(h.time),
+                    wind_kt: h.wind?.speed_knot ?? null,
+                    gust_kt: h.wind?.gust_speed_knot ?? null,
+                    direction: h.wind?.direction ?? null
+                }));
+            } catch (e) {
+                console.error('Failed to fetch hourly forecast:', e);
+                return [];
+            }
+        }
+
+        function compassToDeg(dir) {
+            const map = {
+                'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
+                'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
+                'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
+                'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5
+            };
+            return map[dir] ?? null;
+        }
+
         function updateCurrentConditions(data) {
             if (data.length === 0) return;
 
@@ -456,43 +543,75 @@
                 data[data.length-1].timestamp.split(' ')[1];
         }
 
-        function createWindChart(data) {
+        function createWindChart(data, forecast, dateStr) {
             const ctx = document.getElementById('windChart').getContext('2d');
 
             if (windChart) windChart.destroy();
 
+            // Filter forecast to selected date
+            const selectedDate = parseDate(dateStr);
+            const nextDate = new Date(selectedDate);
+            nextDate.setDate(nextDate.getDate() + 1);
+
+            const dayForecast = forecast.filter(f =>
+                f.time >= selectedDate && f.time < nextDate
+            );
+
+            const datasets = [
+                {
+                    label: 'Wind Speed',
+                    data: data.map(d => ({x: d.time, y: d.wind_kt})),
+                    borderColor: '#3498db',
+                    backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0
+                },
+                {
+                    label: '10-min Avg',
+                    data: data.map(d => ({x: d.time, y: d.wind_avg_kt})),
+                    borderColor: '#2ecc71',
+                    backgroundColor: 'transparent',
+                    tension: 0.3,
+                    pointRadius: 0
+                },
+                {
+                    label: 'Gust',
+                    data: data.map(d => ({x: d.time, y: d.wind_gust_kt})),
+                    borderColor: '#e74c3c',
+                    backgroundColor: 'transparent',
+                    tension: 0.3,
+                    pointRadius: 0
+                }
+            ];
+
+            // Add forecast datasets if available
+            if (dayForecast.length > 0) {
+                datasets.push({
+                    label: 'BOM Forecast',
+                    data: dayForecast.map(f => ({x: f.time, y: f.wind_kt})),
+                    borderColor: '#9b59b6',
+                    backgroundColor: 'transparent',
+                    borderDash: [5, 5],
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#9b59b6'
+                });
+                datasets.push({
+                    label: 'BOM Gust Forecast',
+                    data: dayForecast.map(f => ({x: f.time, y: f.gust_kt})),
+                    borderColor: '#e67e22',
+                    backgroundColor: 'transparent',
+                    borderDash: [5, 5],
+                    tension: 0.3,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#e67e22'
+                });
+            }
+
             windChart = new Chart(ctx, {
                 type: 'line',
-                data: {
-                    labels: data.map(d => d.time),
-                    datasets: [
-                        {
-                            label: 'Wind Speed',
-                            data: data.map(d => d.wind_kt),
-                            borderColor: '#3498db',
-                            backgroundColor: 'rgba(52, 152, 219, 0.1)',
-                            fill: true,
-                            tension: 0.3,
-                            pointRadius: 0
-                        },
-                        {
-                            label: '10-min Avg',
-                            data: data.map(d => d.wind_avg_kt),
-                            borderColor: '#2ecc71',
-                            backgroundColor: 'transparent',
-                            tension: 0.3,
-                            pointRadius: 0
-                        },
-                        {
-                            label: 'Gust',
-                            data: data.map(d => d.wind_gust_kt),
-                            borderColor: '#e74c3c',
-                            backgroundColor: 'transparent',
-                            tension: 0.3,
-                            pointRadius: 0
-                        }
-                    ]
-                },
+                data: { datasets },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
@@ -531,25 +650,47 @@
             });
         }
 
-        function createDirectionChart(data) {
+        function createDirectionChart(data, forecast, dateStr) {
             const ctx = document.getElementById('directionChart').getContext('2d');
 
             if (directionChart) directionChart.destroy();
 
+            // Filter forecast to selected date
+            const selectedDate = parseDate(dateStr);
+            const nextDate = new Date(selectedDate);
+            nextDate.setDate(nextDate.getDate() + 1);
+
+            const dayForecast = forecast.filter(f =>
+                f.time >= selectedDate && f.time < nextDate
+            );
+
+            const datasets = [{
+                label: 'Wind Direction',
+                data: data.map(d => ({x: d.time, y: d.wind_dir})),
+                borderColor: '#9b59b6',
+                backgroundColor: 'rgba(155, 89, 182, 0.1)',
+                fill: true,
+                tension: 0,
+                pointRadius: 1
+            }];
+
+            // Add forecast direction if available
+            if (dayForecast.length > 0) {
+                datasets.push({
+                    label: 'BOM Forecast Dir',
+                    data: dayForecast.map(f => ({x: f.time, y: compassToDeg(f.direction)})),
+                    borderColor: '#e67e22',
+                    backgroundColor: 'transparent',
+                    borderDash: [5, 5],
+                    tension: 0,
+                    pointRadius: 3,
+                    pointBackgroundColor: '#e67e22'
+                });
+            }
+
             directionChart = new Chart(ctx, {
                 type: 'line',
-                data: {
-                    labels: data.map(d => d.time),
-                    datasets: [{
-                        label: 'Wind Direction',
-                        data: data.map(d => d.wind_dir),
-                        borderColor: '#9b59b6',
-                        backgroundColor: 'rgba(155, 89, 182, 0.1)',
-                        fill: true,
-                        tension: 0,
-                        pointRadius: 1
-                    }]
-                },
+                data: { datasets },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
@@ -765,7 +906,14 @@
             document.getElementById('error').style.display = 'none';
 
             try {
-                currentData = await fetchWindData(dateStr);
+                // Fetch wind data and hourly forecast in parallel
+                const [windData, forecast] = await Promise.all([
+                    fetchWindData(dateStr),
+                    hourlyForecast.length > 0 ? Promise.resolve(hourlyForecast) : fetchHourlyForecast()
+                ]);
+
+                currentData = windData;
+                hourlyForecast = forecast;
 
                 if (currentData.length === 0) {
                     showError('No data available for this date');
@@ -774,8 +922,8 @@
 
                 updateCurrentConditions(currentData);
                 updateStats(currentData);
-                createWindChart(currentData);
-                createDirectionChart(currentData);
+                createWindChart(currentData, hourlyForecast, dateStr);
+                createDirectionChart(currentData, hourlyForecast, dateStr);
                 createWindRose(currentData);
                 createTempChart(currentData);
                 showContent();
@@ -834,6 +982,70 @@
             loadData(formatDate(date));
         }
 
+        // BOM Forecast
+        const BOM_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e0/forecasts/daily';
+
+        function kmhToKnots(kmh) {
+            return Math.round(kmh * 0.54);
+        }
+
+        function convertWindToKnots(text) {
+            // Convert wind speeds from km/h to knots in text
+            if (!text) return null;
+            // Match patterns like "15 to 25 km/h" or "20 km/h"
+            return text.replace(/(\d+)\s+to\s+(\d+)\s*km\/h/gi, (match, low, high) => {
+                return `${kmhToKnots(parseInt(low))} to ${kmhToKnots(parseInt(high))} kt`;
+            }).replace(/(\d+)\s*km\/h/gi, (match, speed) => {
+                return `${kmhToKnots(parseInt(speed))} kt`;
+            });
+        }
+
+        function extractWindInfo(text) {
+            // Extract wind information from the extended_text
+            if (!text) return null;
+            const windMatch = text.match(/[Ww]inds?\s+([^.]+\.)/);
+            if (!windMatch) return null;
+            return convertWindToKnots(windMatch[0]);
+        }
+
+        async function loadForecast() {
+            const forecastGrid = document.getElementById('forecastGrid');
+
+            try {
+                const response = await fetch(BOM_API);
+                if (!response.ok) throw new Error('Failed to fetch forecast');
+
+                const data = await response.json();
+                const days = data.data.slice(0, 5); // Show 5 days
+
+                forecastGrid.innerHTML = days.map((day, idx) => {
+                    const date = new Date(day.date);
+                    const dayName = idx === 0 ? 'Today' :
+                                   idx === 1 ? 'Tomorrow' :
+                                   date.toLocaleDateString('en-AU', { weekday: 'long' });
+
+                    const windInfo = extractWindInfo(day.extended_text) || 'No wind forecast';
+                    const rainChance = day.rain?.chance || 0;
+
+                    return `
+                        <div class="forecast-day">
+                            <div class="day-name">${dayName}</div>
+                            <div class="temps">
+                                <span class="temp-high">${day.temp_max !== null ? day.temp_max + '°' : '--'}</span>
+                                <span class="temp-low">${day.temp_min !== null ? day.temp_min + '°' : '--'}</span>
+                            </div>
+                            <div class="wind-forecast">${windInfo}</div>
+                            ${rainChance > 0 ? `<div class="rain-chance">${rainChance}% chance of rain</div>` : ''}
+                        </div>
+                    `;
+                }).join('');
+
+            } catch (error) {
+                forecastGrid.innerHTML = '<span style="color: #e74c3c;">Unable to load BOM forecast</span>';
+                console.error('Forecast error:', error);
+            }
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
             const today = formatDate(new Date());
@@ -848,7 +1060,8 @@
             document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
             document.getElementById('today').addEventListener('click', () => loadData(formatDate(new Date())));
 
-            // Load available dates and initial data
+            // Load forecast, available dates, and initial data
+            loadForecast(); // Don't await - let it load in parallel
             await updateDateList();
             await loadData(today);
         });
