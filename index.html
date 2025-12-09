@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lake Burkey Griffin Wind</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 20px;
+        }
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            justify-content: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .control-group label {
+            font-weight: 500;
+            color: #555;
+        }
+        select, input[type="date"] {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            padding: 8px 16px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+        .current-conditions {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .condition-card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .condition-card .value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .condition-card .label {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        .condition-card .unit {
+            font-size: 0.5em;
+            color: #95a5a6;
+        }
+        .chart-container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .chart-wrapper {
+            position: relative;
+            height: 300px;
+        }
+        .wind-rose-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        #windRose {
+            max-width: 350px;
+            max-height: 350px;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #7f8c8d;
+        }
+        .error {
+            text-align: center;
+            padding: 20px;
+            color: #e74c3c;
+            background: #fdeaea;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .stat-card h3 {
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+            font-size: 1em;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+        .available-dates {
+            margin-top: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .available-dates h3 {
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+        }
+        .date-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .date-btn {
+            padding: 6px 12px;
+            background: #ecf0f1;
+            color: #2c3e50;
+            font-size: 13px;
+        }
+        .date-btn:hover {
+            background: #3498db;
+            color: white;
+        }
+        .date-btn.active {
+            background: #2c3e50;
+            color: white;
+        }
+        @media (max-width: 600px) {
+            .controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .control-group {
+                justify-content: space-between;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>Lake Burley Griffin Wind</h1>
+    <p class="subtitle">Canberra Yacht Club Weather Station Data</p>
+
+    <div class="controls">
+        <div class="control-group">
+            <label for="dateSelect">Date:</label>
+            <input type="date" id="dateSelect">
+        </div>
+        <div class="control-group">
+            <button id="prevDay">&larr; Prev</button>
+            <button id="today">Today</button>
+            <button id="nextDay">Next &rarr;</button>
+        </div>
+    </div>
+
+    <div id="error" class="error" style="display: none;"></div>
+    <div id="loading" class="loading">Loading wind data...</div>
+
+    <div id="content" style="display: none;">
+        <div class="current-conditions">
+            <div class="condition-card">
+                <div class="value" id="currentWind">--<span class="unit"> kt</span></div>
+                <div class="label">Current Wind</div>
+            </div>
+            <div class="condition-card">
+                <div class="value" id="avgWind">--<span class="unit"> kt</span></div>
+                <div class="label">10-min Average</div>
+            </div>
+            <div class="condition-card">
+                <div class="value" id="gustWind">--<span class="unit"> kt</span></div>
+                <div class="label">10-min Gust</div>
+            </div>
+            <div class="condition-card">
+                <div class="value" id="windDir">--<span class="unit">&deg;</span></div>
+                <div class="label">Direction</div>
+            </div>
+            <div class="condition-card">
+                <div class="value" id="temp">--<span class="unit">&deg;C</span></div>
+                <div class="label">Temperature</div>
+            </div>
+            <div class="condition-card">
+                <div class="value" id="humidity">--<span class="unit">%</span></div>
+                <div class="label">Humidity</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3>Wind Speed</h3>
+            <div class="chart-wrapper">
+                <canvas id="windChart"></canvas>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3>Wind Direction</h3>
+            <div class="chart-wrapper">
+                <canvas id="directionChart"></canvas>
+            </div>
+        </div>
+
+        <div class="chart-container wind-rose-container">
+            <div>
+                <h3 style="text-align: center;">Wind Rose</h3>
+                <canvas id="windRose"></canvas>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3>Temperature &amp; Humidity</h3>
+            <div class="chart-wrapper">
+                <canvas id="tempChart"></canvas>
+            </div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Wind Statistics</h3>
+                <div class="stat-row"><span>Max Speed:</span><span id="maxWind">--</span></div>
+                <div class="stat-row"><span>Max Gust:</span><span id="maxGust">--</span></div>
+                <div class="stat-row"><span>Avg Speed:</span><span id="dayAvgWind">--</span></div>
+                <div class="stat-row"><span>Predominant Dir:</span><span id="predominantDir">--</span></div>
+            </div>
+            <div class="stat-card">
+                <h3>Temperature</h3>
+                <div class="stat-row"><span>Max:</span><span id="maxTemp">--</span></div>
+                <div class="stat-row"><span>Min:</span><span id="minTemp">--</span></div>
+                <div class="stat-row"><span>Average:</span><span id="avgTemp">--</span></div>
+            </div>
+            <div class="stat-card">
+                <h3>Data Info</h3>
+                <div class="stat-row"><span>Records:</span><span id="recordCount">--</span></div>
+                <div class="stat-row"><span>First:</span><span id="firstRecord">--</span></div>
+                <div class="stat-row"><span>Last:</span><span id="lastRecord">--</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="available-dates">
+        <h3>Available Dates</h3>
+        <div id="dateList" class="date-list">
+            <span class="loading">Loading available dates...</span>
+        </div>
+    </div>
+
+    <footer style="text-align: center; margin-top: 30px; padding: 20px; color: #7f8c8d; font-size: 0.9em;">
+        With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather data
+    </footer>
+
+    <script>
+        const BASE_URL = 'wind_logs';
+        let windChart, directionChart, windRoseChart, tempChart;
+        let currentData = [];
+        let availableDates = [];
+
+        // Direction labels
+        const DIRECTIONS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                           'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+
+        function degToCompass(deg) {
+            if (deg === null || deg === undefined) return '--';
+            const index = Math.round(deg / 22.5) % 16;
+            return DIRECTIONS[index];
+        }
+
+        function formatDate(date) {
+            return date.toISOString().split('T')[0];
+        }
+
+        function parseDate(dateStr) {
+            const [year, month, day] = dateStr.split('-').map(Number);
+            return new Date(year, month - 1, day);
+        }
+
+        async function fetchAvailableDates() {
+            const dates = [];
+            const now = new Date();
+            const currentYear = now.getFullYear();
+
+            // Try to fetch years
+            for (let year = currentYear; year >= 2024; year--) {
+                try {
+                    const yearResp = await fetch(`${BASE_URL}/${year}/`);
+                    if (!yearResp.ok) continue;
+
+                    const yearHtml = await yearResp.text();
+                    const monthMatches = yearHtml.matchAll(/href="(\d{2})\/"/g);
+
+                    for (const match of monthMatches) {
+                        const month = match[1];
+                        try {
+                            const monthResp = await fetch(`${BASE_URL}/${year}/${month}/`);
+                            if (!monthResp.ok) continue;
+
+                            const monthHtml = await monthResp.text();
+                            const dayMatches = monthHtml.matchAll(/href="(\d{2})\.csv"/g);
+
+                            for (const dayMatch of dayMatches) {
+                                const day = dayMatch[1];
+                                dates.push(`${year}-${month}-${day}`);
+                            }
+                        } catch (e) {}
+                    }
+                } catch (e) {}
+            }
+
+            dates.sort().reverse();
+            return dates;
+        }
+
+        async function fetchWindData(dateStr) {
+            const [year, month, day] = dateStr.split('-');
+            const url = `${BASE_URL}/${year}/${month}/${day}.csv`;
+
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`No data available for ${dateStr}`);
+            }
+
+            const text = await response.text();
+            const lines = text.trim().split('\n');
+            const headers = lines[0].split(',');
+
+            const data = [];
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',');
+                const record = {};
+                headers.forEach((h, idx) => {
+                    const val = values[idx];
+                    if (h === 'timestamp') {
+                        record[h] = val;
+                    } else {
+                        record[h] = val === '' ? null : parseFloat(val);
+                    }
+                });
+                record.time = new Date(record.timestamp);
+                data.push(record);
+            }
+
+            return data;
+        }
+
+        function updateCurrentConditions(data) {
+            if (data.length === 0) return;
+
+            const latest = data[data.length - 1];
+            document.getElementById('currentWind').innerHTML =
+                `${latest.wind_kt ?? '--'}<span class="unit"> kt</span>`;
+            document.getElementById('avgWind').innerHTML =
+                `${latest.wind_avg_kt ?? '--'}<span class="unit"> kt</span>`;
+            document.getElementById('gustWind').innerHTML =
+                `${latest.wind_gust_kt ?? '--'}<span class="unit"> kt</span>`;
+            document.getElementById('windDir').innerHTML =
+                `${latest.wind_dir ?? '--'}<span class="unit">&deg; ${degToCompass(latest.wind_dir)}</span>`;
+            document.getElementById('temp').innerHTML =
+                `${latest.temp_c ?? '--'}<span class="unit">&deg;C</span>`;
+            document.getElementById('humidity').innerHTML =
+                `${latest.humidity ?? '--'}<span class="unit">%</span>`;
+        }
+
+        function updateStats(data) {
+            if (data.length === 0) return;
+
+            const winds = data.map(d => d.wind_kt).filter(v => v !== null);
+            const gusts = data.map(d => d.wind_gust_kt).filter(v => v !== null);
+            const temps = data.map(d => d.temp_c).filter(v => v !== null);
+            const dirs = data.map(d => d.wind_dir).filter(v => v !== null);
+
+            document.getElementById('maxWind').textContent =
+                winds.length ? `${Math.max(...winds)} kt` : '--';
+            document.getElementById('maxGust').textContent =
+                gusts.length ? `${Math.max(...gusts)} kt` : '--';
+            document.getElementById('dayAvgWind').textContent =
+                winds.length ? `${(winds.reduce((a,b) => a+b, 0) / winds.length).toFixed(1)} kt` : '--';
+
+            // Calculate predominant direction
+            if (dirs.length) {
+                const dirBins = new Array(16).fill(0);
+                dirs.forEach(d => {
+                    const idx = Math.round(d / 22.5) % 16;
+                    dirBins[idx]++;
+                });
+                const maxIdx = dirBins.indexOf(Math.max(...dirBins));
+                document.getElementById('predominantDir').textContent = DIRECTIONS[maxIdx];
+            }
+
+            document.getElementById('maxTemp').textContent =
+                temps.length ? `${Math.max(...temps)}\u00B0C` : '--';
+            document.getElementById('minTemp').textContent =
+                temps.length ? `${Math.min(...temps)}\u00B0C` : '--';
+            document.getElementById('avgTemp').textContent =
+                temps.length ? `${(temps.reduce((a,b) => a+b, 0) / temps.length).toFixed(1)}\u00B0C` : '--';
+
+            document.getElementById('recordCount').textContent = data.length;
+            document.getElementById('firstRecord').textContent =
+                data[0].timestamp.split(' ')[1];
+            document.getElementById('lastRecord').textContent =
+                data[data.length-1].timestamp.split(' ')[1];
+        }
+
+        function createWindChart(data) {
+            const ctx = document.getElementById('windChart').getContext('2d');
+
+            if (windChart) windChart.destroy();
+
+            windChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.map(d => d.time),
+                    datasets: [
+                        {
+                            label: 'Wind Speed',
+                            data: data.map(d => d.wind_kt),
+                            borderColor: '#3498db',
+                            backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 0
+                        },
+                        {
+                            label: '10-min Avg',
+                            data: data.map(d => d.wind_avg_kt),
+                            borderColor: '#2ecc71',
+                            backgroundColor: 'transparent',
+                            tension: 0.3,
+                            pointRadius: 0
+                        },
+                        {
+                            label: 'Gust',
+                            data: data.map(d => d.wind_gust_kt),
+                            borderColor: '#e74c3c',
+                            backgroundColor: 'transparent',
+                            tension: 0.3,
+                            pointRadius: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'hour',
+                                displayFormats: {
+                                    hour: 'HH:mm'
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Wind Speed (kt)'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            position: 'top'
+                        }
+                    }
+                }
+            });
+        }
+
+        function createDirectionChart(data) {
+            const ctx = document.getElementById('directionChart').getContext('2d');
+
+            if (directionChart) directionChart.destroy();
+
+            directionChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.map(d => d.time),
+                    datasets: [{
+                        label: 'Wind Direction',
+                        data: data.map(d => d.wind_dir),
+                        borderColor: '#9b59b6',
+                        backgroundColor: 'rgba(155, 89, 182, 0.1)',
+                        fill: true,
+                        tension: 0,
+                        pointRadius: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'hour',
+                                displayFormats: {
+                                    hour: 'HH:mm'
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            min: 0,
+                            max: 360,
+                            ticks: {
+                                stepSize: 45,
+                                callback: function(value) {
+                                    const labels = {0: 'N', 45: 'NE', 90: 'E', 135: 'SE',
+                                                   180: 'S', 225: 'SW', 270: 'W', 315: 'NW', 360: 'N'};
+                                    return labels[value] || value;
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Direction'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createWindRose(data) {
+            const ctx = document.getElementById('windRose').getContext('2d');
+
+            if (windRoseChart) windRoseChart.destroy();
+
+            // Calculate direction frequencies
+            const dirBins = new Array(16).fill(0);
+            data.forEach(d => {
+                if (d.wind_dir !== null) {
+                    const idx = Math.round(d.wind_dir / 22.5) % 16;
+                    dirBins[idx]++;
+                }
+            });
+
+            const total = dirBins.reduce((a, b) => a + b, 0);
+            const percentages = dirBins.map(v => total > 0 ? (v / total * 100).toFixed(1) : 0);
+
+            windRoseChart = new Chart(ctx, {
+                type: 'polarArea',
+                data: {
+                    labels: DIRECTIONS,
+                    datasets: [{
+                        data: percentages,
+                        backgroundColor: [
+                            'rgba(231, 76, 60, 0.7)',
+                            'rgba(230, 126, 34, 0.7)',
+                            'rgba(241, 196, 15, 0.7)',
+                            'rgba(46, 204, 113, 0.7)',
+                            'rgba(26, 188, 156, 0.7)',
+                            'rgba(52, 152, 219, 0.7)',
+                            'rgba(155, 89, 182, 0.7)',
+                            'rgba(52, 73, 94, 0.7)',
+                            'rgba(231, 76, 60, 0.7)',
+                            'rgba(230, 126, 34, 0.7)',
+                            'rgba(241, 196, 15, 0.7)',
+                            'rgba(46, 204, 113, 0.7)',
+                            'rgba(26, 188, 156, 0.7)',
+                            'rgba(52, 152, 219, 0.7)',
+                            'rgba(155, 89, 182, 0.7)',
+                            'rgba(52, 73, 94, 0.7)'
+                        ]
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `${context.label}: ${context.raw}%`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        r: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: function(value) {
+                                    return value + '%';
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function createTempChart(data) {
+            const ctx = document.getElementById('tempChart').getContext('2d');
+
+            if (tempChart) tempChart.destroy();
+
+            tempChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.map(d => d.time),
+                    datasets: [
+                        {
+                            label: 'Temperature',
+                            data: data.map(d => d.temp_c),
+                            borderColor: '#e74c3c',
+                            backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 0,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Humidity',
+                            data: data.map(d => d.humidity),
+                            borderColor: '#3498db',
+                            backgroundColor: 'transparent',
+                            tension: 0.3,
+                            pointRadius: 0,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'hour',
+                                displayFormats: {
+                                    hour: 'HH:mm'
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Time'
+                            }
+                        },
+                        y: {
+                            type: 'linear',
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'Temperature (\u00B0C)'
+                            }
+                        },
+                        y1: {
+                            type: 'linear',
+                            position: 'right',
+                            min: 0,
+                            max: 100,
+                            title: {
+                                display: true,
+                                text: 'Humidity (%)'
+                            },
+                            grid: {
+                                drawOnChartArea: false
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            position: 'top'
+                        }
+                    }
+                }
+            });
+        }
+
+        function showError(message) {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('content').style.display = 'none';
+            document.getElementById('error').style.display = 'block';
+            document.getElementById('error').textContent = message;
+        }
+
+        function showContent() {
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('content').style.display = 'block';
+        }
+
+        async function loadData(dateStr) {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('content').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+
+            try {
+                currentData = await fetchWindData(dateStr);
+
+                if (currentData.length === 0) {
+                    showError('No data available for this date');
+                    return;
+                }
+
+                updateCurrentConditions(currentData);
+                updateStats(currentData);
+                createWindChart(currentData);
+                createDirectionChart(currentData);
+                createWindRose(currentData);
+                createTempChart(currentData);
+                showContent();
+
+                // Update date input
+                document.getElementById('dateSelect').value = dateStr;
+
+                // Update active date button
+                document.querySelectorAll('.date-btn').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.date === dateStr);
+                });
+            } catch (error) {
+                showError(error.message);
+            }
+        }
+
+        async function updateDateList() {
+            const dateListEl = document.getElementById('dateList');
+
+            try {
+                availableDates = await fetchAvailableDates();
+
+                if (availableDates.length === 0) {
+                    dateListEl.innerHTML = '<span>No data available</span>';
+                    return;
+                }
+
+                dateListEl.innerHTML = availableDates.map(date => {
+                    const d = parseDate(date);
+                    const label = d.toLocaleDateString('en-AU', {
+                        weekday: 'short',
+                        day: 'numeric',
+                        month: 'short'
+                    });
+                    return `<button class="date-btn" data-date="${date}">${label}</button>`;
+                }).join('');
+
+                // Add click handlers
+                document.querySelectorAll('.date-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        loadData(btn.dataset.date);
+                    });
+                });
+
+            } catch (error) {
+                dateListEl.innerHTML = '<span>Error loading dates</span>';
+            }
+        }
+
+        function changeDay(offset) {
+            const currentDate = document.getElementById('dateSelect').value;
+            if (!currentDate) return;
+
+            const date = parseDate(currentDate);
+            date.setDate(date.getDate() + offset);
+            loadData(formatDate(date));
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', async () => {
+            const today = formatDate(new Date());
+            document.getElementById('dateSelect').value = today;
+
+            // Event listeners
+            document.getElementById('dateSelect').addEventListener('change', (e) => {
+                loadData(e.target.value);
+            });
+
+            document.getElementById('prevDay').addEventListener('click', () => changeDay(-1));
+            document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
+            document.getElementById('today').addEventListener('click', () => loadData(formatDate(new Date())));
+
+            // Load available dates and initial data
+            await updateDateList();
+            await loadData(today);
+        });
+    </script>
+</body>
+</html>
