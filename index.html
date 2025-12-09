@@ -155,36 +155,6 @@
         .stat-row:last-child {
             border-bottom: none;
         }
-        .available-dates {
-            margin-top: 20px;
-            padding: 15px;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .available-dates h3 {
-            margin: 0 0 10px 0;
-            color: #2c3e50;
-        }
-        .date-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-        .date-btn {
-            padding: 6px 12px;
-            background: #ecf0f1;
-            color: #2c3e50;
-            font-size: 13px;
-        }
-        .date-btn:hover {
-            background: #3498db;
-            color: white;
-        }
-        .date-btn.active {
-            background: #2c3e50;
-            color: white;
-        }
         .forecast-section {
             margin-bottom: 20px;
             padding: 15px;
@@ -251,14 +221,12 @@
 
     <div class="controls">
         <div class="control-group">
-            <label for="dateSelect">Date:</label>
-            <input type="date" id="dateSelect">
+            <button id="prevDay">&larr;</button>
+            <span id="dateDisplay" style="font-weight: bold; min-width: 140px; text-align: center;"></span>
+            <button id="nextDay">&rarr;</button>
         </div>
-        <div class="control-group">
-            <button id="prevDay">&larr; Prev</button>
-            <button id="today">Today</button>
-            <button id="nextDay">Next &rarr;</button>
-        </div>
+        <button id="today">Today</button>
+        <input type="date" id="dateSelect" style="display: none;">
     </div>
 
     <div id="error" class="error" style="display: none;"></div>
@@ -350,13 +318,6 @@
         </div>
     </div>
 
-    <div class="available-dates">
-        <h3>Available Dates</h3>
-        <div id="dateList" class="date-list">
-            <span class="loading">Loading available dates...</span>
-        </div>
-    </div>
-
     <footer style="text-align: center; margin-top: 30px; padding: 20px; color: #7f8c8d; font-size: 0.9em;">
         With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather data
         and <a href="http://www.bom.gov.au/" style="color: #3498db;">Bureau of Meteorology</a> for forecasts
@@ -367,7 +328,6 @@
         const BOM_HOURLY_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly';
         let windChart, directionChart, windRoseChart, tempChart;
         let currentData = [];
-        let availableDates = [];
         let hourlyForecast = [];
 
         // Direction labels
@@ -381,7 +341,24 @@
         }
 
         function formatDate(date) {
-            return date.toISOString().split('T')[0];
+            // Format as YYYY-MM-DD in Canberra timezone (for internal use)
+            return date.toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+        }
+
+        function formatDateDisplay(dateStr) {
+            // Format as "Wed 11 Dec 2024" for display
+            const date = parseDate(dateStr);
+            return date.toLocaleDateString('en-AU', {
+                weekday: 'short',
+                day: 'numeric',
+                month: 'short',
+                year: 'numeric'
+            });
+        }
+
+        function updateDateDisplay(dateStr) {
+            document.getElementById('dateDisplay').textContent = formatDateDisplay(dateStr);
+            document.getElementById('dateSelect').value = dateStr;
         }
 
         function parseDate(dateStr) {
@@ -389,40 +366,9 @@
             return new Date(year, month - 1, day);
         }
 
-        async function fetchAvailableDates() {
-            const dates = [];
-            const now = new Date();
-            const currentYear = now.getFullYear();
-
-            // Try to fetch years
-            for (let year = currentYear; year >= 2024; year--) {
-                try {
-                    const yearResp = await fetch(`${BASE_URL}/${year}/`);
-                    if (!yearResp.ok) continue;
-
-                    const yearHtml = await yearResp.text();
-                    const monthMatches = yearHtml.matchAll(/href="(\d{2})\/"/g);
-
-                    for (const match of monthMatches) {
-                        const month = match[1];
-                        try {
-                            const monthResp = await fetch(`${BASE_URL}/${year}/${month}/`);
-                            if (!monthResp.ok) continue;
-
-                            const monthHtml = await monthResp.text();
-                            const dayMatches = monthHtml.matchAll(/href="(\d{2})\.csv"/g);
-
-                            for (const dayMatch of dayMatches) {
-                                const day = dayMatch[1];
-                                dates.push(`${year}-${month}-${day}`);
-                            }
-                        } catch (e) {}
-                    }
-                } catch (e) {}
-            }
-
-            dates.sort().reverse();
-            return dates;
+        function getTodayCanberra() {
+            // Get today's date in Canberra timezone
+            return formatDate(new Date());
         }
 
         async function fetchWindData(dateStr) {
@@ -595,7 +541,7 @@
                 f.time >= selectedDate && f.time < nextDate && f.time > lastObsTime
             );
 
-            // Combine stored BOM data with live forecast (no overlap)
+            // Combine stored BOM data with live forecast
             let bomWindData = bomData.map(d => ({x: d.time, y: d.bom_wind_kt}));
             let bomGustData = bomData.map(d => ({x: d.time, y: d.bom_gust_kt}));
 
@@ -630,6 +576,7 @@
                 datasets.push({
                     label: 'Forecast',
                     data: bomWindData,
+                    isForecast: true,
                     borderColor: '#9b59b6',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
@@ -639,6 +586,7 @@
                 datasets.push({
                     label: 'Forecast Gust',
                     data: bomGustData,
+                    isForecast: true,
                     borderColor: '#e67e22',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
@@ -682,6 +630,19 @@
                     plugins: {
                         legend: {
                             position: 'top'
+                        },
+                        tooltip: {
+                            filter: function(tooltipItem, index, tooltipItems) {
+                                if (!tooltipItem.raw || tooltipItem.raw.y === null) return false;
+                                const isForecast = tooltipItem.dataset.isForecast;
+                                // Check if we have real observation data at this time
+                                const hasObservation = tooltipItems.some(t =>
+                                    !t.dataset.isForecast && t.raw && t.raw.y !== null
+                                );
+                                // Show forecast only if no observation data
+                                if (isForecast && hasObservation) return false;
+                                return true;
+                            }
                         }
                     }
                 }
@@ -726,6 +687,7 @@
                 datasets.push({
                     label: 'Forecast',
                     data: bomDirData,
+                    isForecast: true,
                     borderColor: '#9b59b6',
                     backgroundColor: 'transparent',
                     borderDash: [5, 5],
@@ -772,6 +734,19 @@
                             title: {
                                 display: true,
                                 text: 'Direction'
+                            }
+                        }
+                    },
+                    plugins: {
+                        tooltip: {
+                            filter: function(tooltipItem, index, tooltipItems) {
+                                if (!tooltipItem.raw || tooltipItem.raw.y === null) return false;
+                                const isForecast = tooltipItem.dataset.isForecast;
+                                const hasObservation = tooltipItems.some(t =>
+                                    !t.dataset.isForecast && t.raw && t.raw.y !== null
+                                );
+                                if (isForecast && hasObservation) return false;
+                                return true;
                             }
                         }
                     }
@@ -975,48 +950,10 @@
                 createTempChart(currentData);
                 showContent();
 
-                // Update date input
-                document.getElementById('dateSelect').value = dateStr;
-
-                // Update active date button
-                document.querySelectorAll('.date-btn').forEach(btn => {
-                    btn.classList.toggle('active', btn.dataset.date === dateStr);
-                });
+                // Update date display
+                updateDateDisplay(dateStr);
             } catch (error) {
                 showError(error.message);
-            }
-        }
-
-        async function updateDateList() {
-            const dateListEl = document.getElementById('dateList');
-
-            try {
-                availableDates = await fetchAvailableDates();
-
-                if (availableDates.length === 0) {
-                    dateListEl.innerHTML = '<span>No data available</span>';
-                    return;
-                }
-
-                dateListEl.innerHTML = availableDates.map(date => {
-                    const d = parseDate(date);
-                    const label = d.toLocaleDateString('en-AU', {
-                        weekday: 'short',
-                        day: 'numeric',
-                        month: 'short'
-                    });
-                    return `<button class="date-btn" data-date="${date}">${label}</button>`;
-                }).join('');
-
-                // Add click handlers
-                document.querySelectorAll('.date-btn').forEach(btn => {
-                    btn.addEventListener('click', () => {
-                        loadData(btn.dataset.date);
-                    });
-                });
-
-            } catch (error) {
-                dateListEl.innerHTML = '<span>Error loading dates</span>';
             }
         }
 
@@ -1095,21 +1032,16 @@
 
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
-            const today = formatDate(new Date());
-            document.getElementById('dateSelect').value = today;
+            const today = getTodayCanberra();
+            updateDateDisplay(today);
 
             // Event listeners
-            document.getElementById('dateSelect').addEventListener('change', (e) => {
-                loadData(e.target.value);
-            });
-
             document.getElementById('prevDay').addEventListener('click', () => changeDay(-1));
             document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
-            document.getElementById('today').addEventListener('click', () => loadData(formatDate(new Date())));
+            document.getElementById('today').addEventListener('click', () => loadData(getTodayCanberra()));
 
-            // Load forecast, available dates, and initial data
+            // Load forecast and initial data
             loadForecast(); // Don't await - let it load in parallel
-            await updateDateList();
             await loadData(today);
         });
     </script>
