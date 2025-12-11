@@ -3,9 +3,36 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lake Burkey Griffin Wind</title>
+    <title>Lake Burley Griffin Wind</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <script>
+        // Check if Chart.js and adapter loaded - ad blockers may block CDN requests
+        (function() {
+            window.chartLibraryBlocked = false;
+            if (typeof Chart === 'undefined') {
+                window.chartLibraryBlocked = true;
+            } else {
+                // Check if date adapter is available
+                try {
+                    var adapter = new Chart._adapters._date({});
+                    adapter.format(new Date(), 'yyyy');
+                } catch (e) {
+                    window.chartLibraryBlocked = true;
+                }
+            }
+            if (window.chartLibraryBlocked) {
+                document.addEventListener('DOMContentLoaded', function() {
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('error').innerHTML =
+                        '<strong>Unable to load charting library</strong><br><br>' +
+                        'This may be caused by an ad-blocker or browser extension blocking CDN requests.<br><br>' +
+                        'Please try whitelisting this site or disabling your ad-blocker for anusc.tridgell.net';
+                });
+            }
+        })();
+    </script>
     <style>
         * {
             box-sizing: border-box;
@@ -106,6 +133,11 @@
         .chart-wrapper {
             position: relative;
             height: 300px;
+            width: 100%;
+        }
+        .chart-wrapper canvas {
+            width: 100% !important;
+            height: 100% !important;
         }
         .wind-rose-container {
             display: flex;
@@ -1032,6 +1064,9 @@
 
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
+            // Don't initialize if charting library was blocked
+            if (window.chartLibraryBlocked) return;
+
             const today = getTodayCanberra();
             updateDateDisplay(today);
 
