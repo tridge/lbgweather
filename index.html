@@ -236,6 +236,41 @@
             color: #7f8c8d;
             margin-top: 8px;
         }
+        .model-selector {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .model-selector label {
+            font-weight: 500;
+            color: #555;
+            margin-right: 10px;
+        }
+        .model-checkbox {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            border: 2px solid transparent;
+        }
+        .model-checkbox input {
+            cursor: pointer;
+        }
+        .model-checkbox.bom { border-color: #9b59b6; }
+        .model-checkbox.gfs { border-color: #27ae60; }
+        .model-checkbox.icon { border-color: #e67e22; }
+        .model-checkbox.gem { border-color: #17a2b8; }
+        .model-checkbox.jma { border-color: #e91e63; }
+        .model-checkbox input:checked + span { font-weight: bold; }
         @media (max-width: 600px) {
             .controls {
                 flex-direction: column;
@@ -259,6 +294,36 @@
         </div>
         <button id="today">Today</button>
         <input type="date" id="dateSelect" style="display: none;">
+    </div>
+
+    <div class="model-selector">
+        <label>Forecast Models:</label>
+        <label class="model-checkbox bom">
+            <input type="checkbox" id="model-bom" checked>
+            <span>BOM</span>
+        </label>
+        <label class="model-checkbox gfs">
+            <input type="checkbox" id="model-gfs">
+            <span>GFS</span>
+        </label>
+        <label class="model-checkbox icon">
+            <input type="checkbox" id="model-icon">
+            <span>ICON</span>
+        </label>
+        <label class="model-checkbox gem">
+            <input type="checkbox" id="model-gem">
+            <span>GEM</span>
+        </label>
+        <label class="model-checkbox jma">
+            <input type="checkbox" id="model-jma">
+            <span>JMA</span>
+        </label>
+        <span style="margin-left: 15px; border-left: 1px solid #ddd; padding-left: 15px;">
+            <label style="cursor: pointer;">
+                <input type="checkbox" id="show-gusts" checked>
+                <span>Show Gusts</span>
+            </label>
+        </span>
     </div>
 
     <div id="error" class="error" style="display: none;"></div>
@@ -351,16 +416,37 @@
     </div>
 
     <footer style="text-align: center; margin-top: 30px; padding: 20px; color: #7f8c8d; font-size: 0.9em;">
-        With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather data
-        and <a href="http://www.bom.gov.au/" style="color: #3498db;">Bureau of Meteorology</a> for forecasts
+        <p>With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather station data</p>
+        <p style="margin-top: 10px; font-size: 0.85em;">
+            Forecast models:
+            <a href="http://www.bom.gov.au/" style="color: #3498db;">BOM</a> (Australia),
+            <a href="https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast" style="color: #3498db;">GFS</a> (NOAA),
+            <a href="https://www.dwd.de/" style="color: #3498db;">ICON</a> (DWD),
+            <a href="https://weather.gc.ca/" style="color: #3498db;">GEM</a> (ECCC),
+            <a href="https://www.jma.go.jp/" style="color: #3498db;">JMA</a> (Japan)
+            via <a href="https://open-meteo.com/" style="color: #3498db;">Open-Meteo</a>
+        </p>
     </footer>
 
     <script>
         const BASE_URL = 'wind_logs';
         const BOM_HOURLY_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly';
+        const OPEN_METEO_API = 'https://api.open-meteo.com/v1/forecast';
+        const CANBERRA_LAT = -35.29;
+        const CANBERRA_LON = 149.10;
+
+        // Model configuration
+        const MODELS = {
+            bom: { name: 'BOM', color: '#9b59b6', gustColor: '#8e44ad' },
+            gfs: { name: 'GFS', color: '#27ae60', gustColor: '#1e8449', omKey: 'gfs_seamless' },
+            icon: { name: 'ICON', color: '#e67e22', gustColor: '#d35400', omKey: 'icon_seamless' },
+            gem: { name: 'GEM', color: '#17a2b8', gustColor: '#117a8b', omKey: 'gem_seamless' },
+            jma: { name: 'JMA', color: '#e91e63', gustColor: '#c2185b', omKey: 'jma_seamless' }
+        };
+
         let windChart, directionChart, windRoseChart, tempChart;
         let currentData = [];
-        let hourlyForecast = [];
+        let forecastData = {}; // { modelName: [forecast points] }
 
         // Direction labels
         const DIRECTIONS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
@@ -470,7 +556,75 @@
             }
         }
 
-        async function fetchHourlyForecast() {
+        function compassToDeg(dir) {
+            const map = {
+                'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
+                'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
+                'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
+                'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5
+            };
+            return map[dir] ?? null;
+        }
+
+        function kmhToKnots(kmh) {
+            if (kmh === null || kmh === undefined) return null;
+            return Math.round(kmh * 0.539957 * 10) / 10;
+        }
+
+        // Model selection management
+        function getSelectedModels() {
+            const saved = localStorage.getItem('selectedModels');
+            if (saved) {
+                try {
+                    return JSON.parse(saved);
+                } catch (e) {
+                    return ['bom'];
+                }
+            }
+            return ['bom']; // Default to BOM only
+        }
+
+        function saveSelectedModels(models) {
+            localStorage.setItem('selectedModels', JSON.stringify(models));
+        }
+
+        function getShowGusts() {
+            const saved = localStorage.getItem('showGusts');
+            return saved === null ? true : saved === 'true';
+        }
+
+        function saveShowGusts(show) {
+            localStorage.setItem('showGusts', show);
+        }
+
+        function initModelCheckboxes() {
+            const selected = getSelectedModels();
+            Object.keys(MODELS).forEach(model => {
+                const checkbox = document.getElementById(`model-${model}`);
+                if (checkbox) {
+                    checkbox.checked = selected.includes(model);
+                    checkbox.addEventListener('change', async () => {
+                        const newSelected = Object.keys(MODELS).filter(m =>
+                            document.getElementById(`model-${m}`)?.checked
+                        );
+                        saveSelectedModels(newSelected);
+                        await refreshForecasts();
+                    });
+                }
+            });
+
+            // Initialize gust checkbox
+            const gustCheckbox = document.getElementById('show-gusts');
+            if (gustCheckbox) {
+                gustCheckbox.checked = getShowGusts();
+                gustCheckbox.addEventListener('change', async () => {
+                    saveShowGusts(gustCheckbox.checked);
+                    await refreshForecasts();
+                });
+            }
+        }
+
+        async function fetchBomForecast() {
             try {
                 const response = await fetch(BOM_HOURLY_API);
                 if (!response.ok) return [];
@@ -480,22 +634,97 @@
                     time: new Date(h.time),
                     wind_kt: h.wind?.speed_knot ?? null,
                     gust_kt: h.wind?.gust_speed_knot ?? null,
-                    direction: h.wind?.direction ?? null
+                    wind_dir: compassToDeg(h.wind?.direction)
                 }));
             } catch (e) {
-                console.error('Failed to fetch hourly forecast:', e);
+                console.error('Failed to fetch BOM forecast:', e);
                 return [];
             }
         }
 
-        function compassToDeg(dir) {
-            const map = {
-                'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
-                'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
-                'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
-                'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5
-            };
-            return map[dir] ?? null;
+        async function fetchOpenMeteoForecasts(models) {
+            if (models.length === 0) return {};
+
+            const omModels = models
+                .filter(m => MODELS[m]?.omKey)
+                .map(m => MODELS[m].omKey);
+
+            if (omModels.length === 0) return {};
+
+            try {
+                const params = new URLSearchParams({
+                    latitude: CANBERRA_LAT,
+                    longitude: CANBERRA_LON,
+                    hourly: 'wind_speed_10m,wind_gusts_10m,wind_direction_10m',
+                    models: omModels.join(','),
+                    timezone: 'Australia/Sydney',
+                    forecast_days: 3
+                });
+
+                const response = await fetch(`${OPEN_METEO_API}?${params}`);
+                if (!response.ok) return {};
+
+                const data = await response.json();
+                const hourly = data.hourly || {};
+                const times = hourly.time || [];
+
+                const results = {};
+                const singleModel = omModels.length === 1;
+
+                models.forEach(model => {
+                    const omKey = MODELS[model]?.omKey;
+                    if (!omKey) return;
+
+                    // Single model: keys are "wind_speed_10m"
+                    // Multiple models: keys are "wind_speed_10m_gfs_seamless"
+                    const suffix = singleModel ? '' : `_${omKey}`;
+                    const winds = hourly[`wind_speed_10m${suffix}`] || [];
+                    const gusts = hourly[`wind_gusts_10m${suffix}`] || [];
+                    const dirs = hourly[`wind_direction_10m${suffix}`] || [];
+
+                    if (winds.length > 0) {
+                        results[model] = times.map((t, i) => ({
+                            time: new Date(t),
+                            wind_kt: kmhToKnots(winds[i]),
+                            gust_kt: kmhToKnots(gusts[i]),
+                            wind_dir: dirs[i] ?? null
+                        })).filter(f => f.wind_kt !== null);
+                    }
+                });
+
+                return results;
+            } catch (e) {
+                console.error('Failed to fetch Open-Meteo forecasts:', e);
+                return {};
+            }
+        }
+
+        async function fetchAllForecasts() {
+            const selected = getSelectedModels();
+            const results = {};
+
+            // Fetch BOM if selected
+            if (selected.includes('bom')) {
+                results.bom = await fetchBomForecast();
+            }
+
+            // Fetch Open-Meteo models
+            const omModels = selected.filter(m => m !== 'bom');
+            if (omModels.length > 0) {
+                const omResults = await fetchOpenMeteoForecasts(omModels);
+                Object.assign(results, omResults);
+            }
+
+            return results;
+        }
+
+        async function refreshForecasts() {
+            forecastData = await fetchAllForecasts();
+            const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
+            if (currentData.length > 0) {
+                createWindChart(currentData, forecastData, dateStr);
+                createDirectionChart(currentData, forecastData, dateStr);
+            }
         }
 
         function updateCurrentConditions(data) {
@@ -556,32 +785,15 @@
                 data[data.length-1].timestamp.split(' ')[1];
         }
 
-        function createWindChart(data, bomData, forecast, dateStr) {
+        function createWindChart(data, forecasts, dateStr) {
             const ctx = document.getElementById('windChart').getContext('2d');
 
             if (windChart) windChart.destroy();
 
-            // Filter forecast to selected date (for future hours)
+            // Filter forecast to selected date
             const selectedDate = parseDate(dateStr);
             const nextDate = new Date(selectedDate);
             nextDate.setDate(nextDate.getDate() + 1);
-
-            // Get last observation time to avoid overlap
-            const lastObsTime = data.length > 0 ? data[data.length - 1].time : new Date(0);
-
-            const dayForecast = forecast.filter(f =>
-                f.time >= selectedDate && f.time < nextDate && f.time > lastObsTime
-            );
-
-            // Combine stored BOM data with live forecast
-            let bomWindData = bomData.map(d => ({x: d.time, y: d.bom_wind_kt}));
-            let bomGustData = bomData.map(d => ({x: d.time, y: d.bom_gust_kt}));
-
-            // Append live forecast data for future hours
-            if (dayForecast.length > 0) {
-                bomWindData = bomWindData.concat(dayForecast.map(f => ({x: f.time, y: f.wind_kt})));
-                bomGustData = bomGustData.concat(dayForecast.map(f => ({x: f.time, y: f.gust_kt})));
-            }
 
             const datasets = [
                 {
@@ -603,29 +815,47 @@
                 }
             ];
 
-            // Add combined BOM forecast (stored + live)
-            if (bomWindData.length > 0) {
-                datasets.push({
-                    label: 'Forecast',
-                    data: bomWindData,
-                    isForecast: true,
-                    borderColor: '#9b59b6',
-                    backgroundColor: 'transparent',
-                    borderDash: [5, 5],
-                    tension: 0.3,
-                    pointRadius: 0
-                });
-                datasets.push({
-                    label: 'Forecast Gust',
-                    data: bomGustData,
-                    isForecast: true,
-                    borderColor: '#e67e22',
-                    backgroundColor: 'transparent',
-                    borderDash: [5, 5],
-                    tension: 0.3,
-                    pointRadius: 0
-                });
-            }
+            // Add forecast datasets for each selected model
+            const selectedModels = getSelectedModels();
+            selectedModels.forEach(modelKey => {
+                const modelData = forecasts[modelKey] || [];
+                if (modelData.length === 0) return;
+
+                const model = MODELS[modelKey];
+                const dayData = modelData.filter(f =>
+                    f.time >= selectedDate && f.time < nextDate
+                );
+
+                if (dayData.length > 0) {
+                    // Wind speed forecast
+                    datasets.push({
+                        label: `${model.name}`,
+                        data: dayData.map(f => ({x: f.time, y: f.wind_kt})),
+                        isForecast: true,
+                        borderColor: model.color,
+                        backgroundColor: 'transparent',
+                        borderDash: [5, 5],
+                        tension: 0.3,
+                        pointRadius: 0
+                    });
+                    // Gust forecast (if enabled and available - JMA doesn't have gusts)
+                    if (getShowGusts()) {
+                        const hasGusts = dayData.some(f => f.gust_kt !== null);
+                        if (hasGusts) {
+                            datasets.push({
+                                label: `${model.name} Gust`,
+                                data: dayData.map(f => ({x: f.time, y: f.gust_kt})),
+                                isForecast: true,
+                                borderColor: model.gustColor,
+                                backgroundColor: 'transparent',
+                                borderDash: [2, 2],
+                                tension: 0.3,
+                                pointRadius: 0
+                            });
+                        }
+                    }
+                }
+            });
 
             windChart = new Chart(ctx, {
                 type: 'line',
@@ -681,7 +911,7 @@
             });
         }
 
-        function createDirectionChart(data, bomData, forecast, dateStr) {
+        function createDirectionChart(data, forecasts, dateStr) {
             const ctx = document.getElementById('directionChart').getContext('2d');
 
             if (directionChart) directionChart.destroy();
@@ -690,19 +920,6 @@
             const selectedDate = parseDate(dateStr);
             const nextDate = new Date(selectedDate);
             nextDate.setDate(nextDate.getDate() + 1);
-
-            // Get last observation time to avoid overlap
-            const lastObsTime = data.length > 0 ? data[data.length - 1].time : new Date(0);
-
-            const dayForecast = forecast.filter(f =>
-                f.time >= selectedDate && f.time < nextDate && f.time > lastObsTime
-            );
-
-            // Combine stored BOM data with live forecast
-            let bomDirData = bomData.map(d => ({x: d.time, y: d.bom_wind_dir}));
-            if (dayForecast.length > 0) {
-                bomDirData = bomDirData.concat(dayForecast.map(f => ({x: f.time, y: compassToDeg(f.direction)})));
-            }
 
             const datasets = [{
                 label: 'Wind Direction',
@@ -714,19 +931,30 @@
                 pointRadius: 0
             }];
 
-            // Add combined BOM direction (stored + live)
-            if (bomDirData.length > 0) {
-                datasets.push({
-                    label: 'Forecast',
-                    data: bomDirData,
-                    isForecast: true,
-                    borderColor: '#9b59b6',
-                    backgroundColor: 'transparent',
-                    borderDash: [5, 5],
-                    tension: 0,
-                    pointRadius: 0
-                });
-            }
+            // Add forecast datasets for each selected model
+            const selectedModels = getSelectedModels();
+            selectedModels.forEach(modelKey => {
+                const modelData = forecasts[modelKey] || [];
+                if (modelData.length === 0) return;
+
+                const model = MODELS[modelKey];
+                const dayData = modelData.filter(f =>
+                    f.time >= selectedDate && f.time < nextDate
+                );
+
+                if (dayData.length > 0) {
+                    datasets.push({
+                        label: `${model.name}`,
+                        data: dayData.map(f => ({x: f.time, y: f.wind_dir})),
+                        isForecast: true,
+                        borderColor: model.color,
+                        backgroundColor: 'transparent',
+                        borderDash: [5, 5],
+                        tension: 0,
+                        pointRadius: 0
+                    });
+                }
+            });
 
             directionChart = new Chart(ctx, {
                 type: 'line',
@@ -959,15 +1187,14 @@
             document.getElementById('error').style.display = 'none';
 
             try {
-                // Fetch wind data, stored BOM data, and live forecast in parallel
-                const [windData, bomData, forecast] = await Promise.all([
+                // Fetch wind data and forecasts in parallel
+                const [windData, forecasts] = await Promise.all([
                     fetchWindData(dateStr),
-                    fetchBomData(dateStr),
-                    hourlyForecast.length > 0 ? Promise.resolve(hourlyForecast) : fetchHourlyForecast()
+                    Object.keys(forecastData).length > 0 ? Promise.resolve(forecastData) : fetchAllForecasts()
                 ]);
 
                 currentData = windData;
-                hourlyForecast = forecast;
+                forecastData = forecasts;
 
                 if (currentData.length === 0) {
                     showError('No data available for this date');
@@ -976,8 +1203,8 @@
 
                 updateCurrentConditions(currentData);
                 updateStats(currentData);
-                createWindChart(currentData, bomData, forecast, dateStr);
-                createDirectionChart(currentData, bomData, forecast, dateStr);
+                createWindChart(currentData, forecastData, dateStr);
+                createDirectionChart(currentData, forecastData, dateStr);
                 createWindRose(currentData);
                 createTempChart(currentData);
                 showContent();
@@ -998,21 +1225,18 @@
             loadData(formatDate(date));
         }
 
-        // BOM Forecast
+        // BOM Daily Forecast
         const BOM_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e0/forecasts/daily';
-
-        function kmhToKnots(kmh) {
-            return Math.round(kmh * 0.54);
-        }
 
         function convertWindToKnots(text) {
             // Convert wind speeds from km/h to knots in text
             if (!text) return null;
+            const toKnots = kmh => Math.round(kmh * 0.54);
             // Match patterns like "15 to 25 km/h" or "20 km/h"
             return text.replace(/(\d+)\s+to\s+(\d+)\s*km\/h/gi, (match, low, high) => {
-                return `${kmhToKnots(parseInt(low))} to ${kmhToKnots(parseInt(high))} kt`;
+                return `${toKnots(parseInt(low))} to ${toKnots(parseInt(high))} kt`;
             }).replace(/(\d+)\s*km\/h/gi, (match, speed) => {
-                return `${kmhToKnots(parseInt(speed))} kt`;
+                return `${toKnots(parseInt(speed))} kt`;
             });
         }
 
@@ -1070,12 +1294,15 @@
             const today = getTodayCanberra();
             updateDateDisplay(today);
 
+            // Initialize model checkboxes from localStorage
+            initModelCheckboxes();
+
             // Event listeners
             document.getElementById('prevDay').addEventListener('click', () => changeDay(-1));
             document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
             document.getElementById('today').addEventListener('click', () => loadData(getTodayCanberra()));
 
-            // Load forecast and initial data
+            // Load BOM daily forecast and initial data
             loadForecast(); // Don't await - let it load in parallel
             await loadData(today);
         });
