@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lake Burley Griffin Wind</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <script src="js/chart.js"></script>
+    <script src="js/chartjs-adapter-date-fns.js"></script>
     <script>
-        // Check if Chart.js and adapter loaded - ad blockers may block CDN requests
+        // Check if Chart.js and adapter loaded
         (function() {
             window.chartLibraryBlocked = false;
             if (typeof Chart === 'undefined') {
@@ -27,8 +27,8 @@
                     document.getElementById('error').style.display = 'block';
                     document.getElementById('error').innerHTML =
                         '<strong>Unable to load charting library</strong><br><br>' +
-                        'This may be caused by an ad-blocker or browser extension blocking CDN requests.<br><br>' +
-                        'Please try whitelisting this site or disabling your ad-blocker for anusc.tridgell.net';
+                        'The required JavaScript libraries could not be loaded. ' +
+                        'Please check that the js/ directory contains chart.js and chartjs-adapter-date-fns.js';
                 });
             }
         })();
