@@ -642,6 +642,47 @@
             }
         }
 
+        function isPastDate(dateStr) {
+            // Check if dateStr is before today (in Canberra timezone)
+            const today = getTodayCanberra();
+            return dateStr < today;
+        }
+
+        async function fetchArchivedForecasts(dateStr) {
+            // Fetch archived forecasts from JSONL files for a past date
+            const [year, month, day] = dateStr.split('-');
+            const results = {};
+
+            const models = ['bom', 'gfs', 'icon', 'gem', 'jma'];
+            const fetchPromises = models.map(async (model) => {
+                const url = `forecasts/archive/${year}/${month}/${day}_${model}.jsonl`;
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) return;
+
+                    const text = await response.text();
+                    const lines = text.trim().split('\n').filter(l => l);
+                    if (lines.length === 0) return;
+
+                    // Use the last forecast of the day (most recent issue time)
+                    const lastForecast = JSON.parse(lines[lines.length - 1]);
+                    const forecasts = lastForecast.forecasts || [];
+
+                    results[model] = forecasts.map(f => ({
+                        time: new Date(f.valid_time),
+                        wind_kt: f.wind_kt,
+                        gust_kt: f.gust_kt,
+                        wind_dir: f.wind_dir
+                    })).filter(f => f.wind_kt !== null);
+                } catch (e) {
+                    console.log(`No archived forecast for ${model} on ${dateStr}`);
+                }
+            });
+
+            await Promise.all(fetchPromises);
+            return results;
+        }
+
         async function fetchOpenMeteoForecasts(models) {
             if (models.length === 0) return {};
 
@@ -719,8 +760,9 @@
         }
 
         async function refreshForecasts() {
-            forecastData = await fetchAllForecasts();
             const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
+            const useLive = !isPastDate(dateStr);
+            forecastData = useLive ? await fetchAllForecasts() : await fetchArchivedForecasts(dateStr);
             if (currentData.length > 0) {
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
@@ -1187,10 +1229,13 @@
             document.getElementById('error').style.display = 'none';
 
             try {
+                // Determine whether to use live or archived forecasts
+                const useLive = !isPastDate(dateStr);
+
                 // Fetch wind data and forecasts in parallel
                 const [windData, forecasts] = await Promise.all([
                     fetchWindData(dateStr),
-                    Object.keys(forecastData).length > 0 ? Promise.resolve(forecastData) : fetchAllForecasts()
+                    useLive ? fetchAllForecasts() : fetchArchivedForecasts(dateStr)
                 ]);
 
                 currentData = windData;
