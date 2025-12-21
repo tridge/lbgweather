@@ -664,9 +664,11 @@
                     const lines = text.trim().split('\n').filter(l => l);
                     if (lines.length === 0) return;
 
-                    // Use the last forecast of the day (most recent issue time)
-                    const lastForecast = JSON.parse(lines[lines.length - 1]);
-                    const forecasts = lastForecast.forecasts || [];
+                    // BOM forecasts only cover from issue time onward, so use first of day
+                    // to get morning coverage. Other models include full day from midnight.
+                    const forecastLine = model === 'bom' ? lines[0] : lines[lines.length - 1];
+                    const forecast = JSON.parse(forecastLine);
+                    const forecasts = forecast.forecasts || [];
 
                     results[model] = forecasts.map(f => ({
                         time: new Date(f.valid_time),
@@ -743,13 +745,15 @@
         async function fetchAllForecasts() {
             const selected = getSelectedModels();
             const results = {};
+            const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
 
-            // Fetch BOM if selected
+            // Fetch BOM if selected - prefer archived (covers full day) over live (current hour onwards)
             if (selected.includes('bom')) {
-                results.bom = await fetchBomForecast();
+                const archivedBom = await fetchArchivedBom(dateStr);
+                results.bom = archivedBom.length > 0 ? archivedBom : await fetchBomForecast();
             }
 
-            // Fetch Open-Meteo models
+            // Fetch Open-Meteo models (live API covers from midnight)
             const omModels = selected.filter(m => m !== 'bom');
             if (omModels.length > 0) {
                 const omResults = await fetchOpenMeteoForecasts(omModels);
@@ -757,6 +761,31 @@
             }
 
             return results;
+        }
+
+        async function fetchArchivedBom(dateStr) {
+            // Fetch archived BOM forecast for a specific date
+            const [year, month, day] = dateStr.split('-');
+            const url = `forecasts/archive/${year}/${month}/${day}_bom.jsonl`;
+            try {
+                const response = await fetch(url);
+                if (!response.ok) return [];
+
+                const text = await response.text();
+                const lines = text.trim().split('\n').filter(l => l);
+                if (lines.length === 0) return [];
+
+                // Use first forecast of day (covers from morning onwards)
+                const forecast = JSON.parse(lines[0]);
+                return (forecast.forecasts || []).map(f => ({
+                    time: new Date(f.valid_time),
+                    wind_kt: f.wind_kt,
+                    gust_kt: f.gust_kt,
+                    wind_dir: f.wind_dir
+                })).filter(f => f.wind_kt !== null);
+            } catch (e) {
+                return [];
+            }
         }
 
         async function refreshForecasts() {
@@ -912,6 +941,8 @@
                     scales: {
                         x: {
                             type: 'time',
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1011,6 +1042,8 @@
                     scales: {
                         x: {
                             type: 'time',
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1127,10 +1160,12 @@
             });
         }
 
-        function createTempChart(data) {
+        function createTempChart(data, dateStr) {
             const ctx = document.getElementById('tempChart').getContext('2d');
 
             if (tempChart) tempChart.destroy();
+
+            const selectedDate = parseDate(dateStr);
 
             tempChart = new Chart(ctx, {
                 type: 'line',
@@ -1168,6 +1203,8 @@
                     scales: {
                         x: {
                             type: 'time',
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1251,7 +1288,7 @@
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
                 createWindRose(currentData);
-                createTempChart(currentData);
+                createTempChart(currentData, dateStr);
                 showContent();
 
                 // Update date display
