@@ -936,7 +936,8 @@
                     maintainAspectRatio: false,
                     interaction: {
                         intersect: false,
-                        mode: 'index'
+                        mode: 'nearest',
+                        axis: 'x'
                     },
                     scales: {
                         x: {
@@ -967,16 +968,18 @@
                             position: 'top'
                         },
                         tooltip: {
-                            filter: function(tooltipItem, index, tooltipItems) {
-                                if (!tooltipItem.raw || tooltipItem.raw.y === null) return false;
-                                const isForecast = tooltipItem.dataset.isForecast;
-                                // Check if we have real observation data at this time
-                                const hasObservation = tooltipItems.some(t =>
-                                    !t.dataset.isForecast && t.raw && t.raw.y !== null
-                                );
-                                // Show forecast only if no observation data
-                                if (isForecast && hasObservation) return false;
-                                return true;
+                            callbacks: {
+                                title: function(tooltipItems) {
+                                    if (tooltipItems.length > 0) {
+                                        const date = new Date(tooltipItems[0].raw.x);
+                                        return date.toLocaleTimeString('en-AU', {
+                                            hour: '2-digit',
+                                            minute: '2-digit',
+                                            timeZone: 'Australia/Sydney'
+                                        });
+                                    }
+                                    return '';
+                                }
                             }
                         }
                     }
@@ -1037,7 +1040,8 @@
                     maintainAspectRatio: false,
                     interaction: {
                         intersect: false,
-                        mode: 'index'
+                        mode: 'nearest',
+                        axis: 'x'
                     },
                     scales: {
                         x: {
@@ -1074,14 +1078,18 @@
                     },
                     plugins: {
                         tooltip: {
-                            filter: function(tooltipItem, index, tooltipItems) {
-                                if (!tooltipItem.raw || tooltipItem.raw.y === null) return false;
-                                const isForecast = tooltipItem.dataset.isForecast;
-                                const hasObservation = tooltipItems.some(t =>
-                                    !t.dataset.isForecast && t.raw && t.raw.y !== null
-                                );
-                                if (isForecast && hasObservation) return false;
-                                return true;
+                            callbacks: {
+                                title: function(tooltipItems) {
+                                    if (tooltipItems.length > 0) {
+                                        const date = new Date(tooltipItems[0].raw.x);
+                                        return date.toLocaleTimeString('en-AU', {
+                                            hour: '2-digit',
+                                            minute: '2-digit',
+                                            timeZone: 'Australia/Sydney'
+                                        });
+                                    }
+                                    return '';
+                                }
                             }
                         }
                     }
@@ -1198,7 +1206,8 @@
                     maintainAspectRatio: false,
                     interaction: {
                         intersect: false,
-                        mode: 'index'
+                        mode: 'nearest',
+                        axis: 'x'
                     },
                     scales: {
                         x: {
@@ -1241,6 +1250,21 @@
                     plugins: {
                         legend: {
                             position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(tooltipItems) {
+                                    if (tooltipItems.length > 0) {
+                                        const date = new Date(tooltipItems[0].label);
+                                        return date.toLocaleTimeString('en-AU', {
+                                            hour: '2-digit',
+                                            minute: '2-digit',
+                                            timeZone: 'Australia/Sydney'
+                                        });
+                                    }
+                                    return '';
+                                }
+                            }
                         }
                     }
                 }
