@@ -758,10 +758,12 @@
             }
         }
 
-        async function fetchAllForecasts() {
+        async function fetchAllForecasts(dateStr) {
+            if (!dateStr) {
+                dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
+            }
             const selected = getSelectedModels();
             const results = {};
-            const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
 
             // Fetch BOM if selected - prefer archived (covers full day) over live (current hour onwards)
             if (selected.includes('bom')) {
@@ -807,7 +809,7 @@
         async function refreshForecasts() {
             const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
             const useLive = !isPastDate(dateStr) && !isFutureDate(dateStr);
-            forecastData = useLive ? await fetchAllForecasts() : await fetchArchivedForecasts(dateStr);
+            forecastData = useLive ? await fetchAllForecasts(dateStr) : await fetchArchivedForecasts(dateStr);
             if (currentData.length > 0 || Object.keys(forecastData).length > 0) {
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
@@ -1324,7 +1326,7 @@
                     const useLive = !isPast;
                     [windData, forecasts] = await Promise.all([
                         fetchWindData(dateStr).catch(() => []),
-                        useLive ? fetchAllForecasts() : fetchArchivedForecasts(dateStr)
+                        useLive ? fetchAllForecasts(dateStr) : fetchArchivedForecasts(dateStr)
                     ]);
 
                     if (windData.length === 0 && Object.keys(forecasts).length === 0) {
