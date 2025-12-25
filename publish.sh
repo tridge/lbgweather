@@ -1,1 +1,1 @@
-rsync -Pavz index.html js *.py *.jpg fjall:wind/
+rsync -Pavz index.html js forecasts *.py *.jpg fjall:wind/

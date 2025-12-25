@@ -12,7 +12,8 @@ historical data for long-term model accuracy comparison.
 import requests
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # Configuration
 FORECASTS_DIR = "forecasts"
@@ -20,6 +21,8 @@ LATEST_DIR = os.path.join(FORECASTS_DIR, "latest")
 ARCHIVE_DIR = os.path.join(FORECASTS_DIR, "archive")
 CANBERRA_LAT = -35.29
 CANBERRA_LON = 149.10
+CANBERRA_TZ = ZoneInfo('Australia/Sydney')
+FORECAST_DAYS = 6  # Fetch up to 5 days ahead
 
 # Open-Meteo API for GFS, ICON, GEM, JMA
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -59,7 +62,7 @@ def fetch_open_meteo_forecasts():
         'hourly': 'wind_speed_10m,wind_gusts_10m,wind_direction_10m',
         'models': models_param,
         'timezone': 'Australia/Sydney',
-        'forecast_days': 3,
+        'forecast_days': FORECAST_DAYS,
     }
 
     resp = requests.get(OPEN_METEO_URL, params=params, timeout=30)
@@ -169,12 +172,13 @@ def get_latest_issue_time(model_name):
         return None
 
 
-def get_archive_path(model_name):
-    """Get today's archive file path: archive/YYYY/MM/DD_model.jsonl"""
-    now = datetime.now()
-    archive_dir = os.path.join(ARCHIVE_DIR, now.strftime('%Y'), now.strftime('%m'))
+def get_archive_path(model_name, date=None):
+    """Get archive file path for a date: archive/YYYY/MM/DD_model.jsonl"""
+    if date is None:
+        date = datetime.now(CANBERRA_TZ)
+    archive_dir = os.path.join(ARCHIVE_DIR, date.strftime('%Y'), date.strftime('%m'))
     os.makedirs(archive_dir, exist_ok=True)
-    return os.path.join(archive_dir, f"{now.strftime('%d')}_{model_name}.jsonl")
+    return os.path.join(archive_dir, f"{date.strftime('%d')}_{model_name}.jsonl")
 
 
 def is_already_archived(archive_path, issue_time):
@@ -195,8 +199,26 @@ def is_already_archived(archive_path, issue_time):
     return False
 
 
+def group_forecasts_by_date(forecasts):
+    """Group forecast points by their valid date in Canberra timezone"""
+    by_date = {}
+    for f in forecasts:
+        valid_time = f['valid_time']
+        # Parse the valid_time and convert to Canberra date
+        if valid_time.endswith('Z'):
+            dt = datetime.fromisoformat(valid_time.replace('Z', '+00:00'))
+        else:
+            dt = datetime.fromisoformat(valid_time)
+        canberra_dt = dt.astimezone(CANBERRA_TZ)
+        date_key = canberra_dt.date()
+        if date_key not in by_date:
+            by_date[date_key] = []
+        by_date[date_key].append(f)
+    return by_date
+
+
 def log_forecast(model_name, forecast_data):
-    """Save forecast to latest/ and archive to archive/YYYY/MM/DD_model.jsonl"""
+    """Save forecast to latest/ and archive to archive/YYYY/MM/DD_model.jsonl for each day"""
     os.makedirs(LATEST_DIR, exist_ok=True)
 
     issue_time = forecast_data['issue_time']
@@ -211,11 +233,17 @@ def log_forecast(model_name, forecast_data):
     with open(latest_path, 'w') as f:
         json.dump(forecast_data, f)
 
-    # Append to archive (if not already there)
-    archive_path = get_archive_path(model_name)
-    if not is_already_archived(archive_path, issue_time):
-        with open(archive_path, 'a') as f:
-            f.write(json.dumps(forecast_data) + '\n')
+    # Group forecasts by date and archive to each day's file
+    forecasts_by_date = group_forecasts_by_date(forecast_data['forecasts'])
+    for date, day_forecasts in forecasts_by_date.items():
+        day_data = {
+            'issue_time': issue_time,
+            'forecasts': day_forecasts,
+        }
+        archive_path = get_archive_path(model_name, datetime.combine(date, datetime.min.time()))
+        if not is_already_archived(archive_path, issue_time):
+            with open(archive_path, 'a') as f:
+                f.write(json.dumps(day_data) + '\n')
 
     return True
 

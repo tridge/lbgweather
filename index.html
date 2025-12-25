@@ -648,6 +648,19 @@
             return dateStr < today;
         }
 
+        function isFutureDate(dateStr) {
+            // Check if dateStr is after today (in Canberra timezone)
+            const today = getTodayCanberra();
+            return dateStr > today;
+        }
+
+        function getMaxFutureDate() {
+            // Get the date 5 days from now
+            const date = new Date();
+            date.setDate(date.getDate() + 5);
+            return formatDate(date);
+        }
+
         async function fetchArchivedForecasts(dateStr) {
             // Fetch archived forecasts from JSONL files for a past date
             const [year, month, day] = dateStr.split('-');
@@ -790,9 +803,9 @@
 
         async function refreshForecasts() {
             const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
-            const useLive = !isPastDate(dateStr);
+            const useLive = !isPastDate(dateStr) && !isFutureDate(dateStr);
             forecastData = useLive ? await fetchAllForecasts() : await fetchArchivedForecasts(dateStr);
-            if (currentData.length > 0) {
+            if (currentData.length > 0 || Object.keys(forecastData).length > 0) {
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
             }
@@ -1289,37 +1302,81 @@
             document.getElementById('content').style.display = 'none';
             document.getElementById('error').style.display = 'none';
 
-            try {
-                // Determine whether to use live or archived forecasts
-                const useLive = !isPastDate(dateStr);
+            const isFuture = isFutureDate(dateStr);
+            const isPast = isPastDate(dateStr);
 
-                // Fetch wind data and forecasts in parallel
-                const [windData, forecasts] = await Promise.all([
-                    fetchWindData(dateStr),
-                    useLive ? fetchAllForecasts() : fetchArchivedForecasts(dateStr)
-                ]);
+            try {
+                let windData = [];
+                let forecasts = {};
+
+                if (isFuture) {
+                    // Future date: only forecasts, no observations
+                    forecasts = await fetchArchivedForecasts(dateStr);
+                    if (Object.keys(forecasts).length === 0) {
+                        showError('No forecast data available for this date');
+                        return;
+                    }
+                } else {
+                    // Today or past: fetch observations and forecasts
+                    const useLive = !isPast;
+                    [windData, forecasts] = await Promise.all([
+                        fetchWindData(dateStr).catch(() => []),
+                        useLive ? fetchAllForecasts() : fetchArchivedForecasts(dateStr)
+                    ]);
+
+                    if (windData.length === 0 && Object.keys(forecasts).length === 0) {
+                        showError('No data available for this date');
+                        return;
+                    }
+                }
 
                 currentData = windData;
                 forecastData = forecasts;
 
-                if (currentData.length === 0) {
-                    showError('No data available for this date');
-                    return;
+                // Update UI based on available data
+                if (currentData.length > 0) {
+                    updateCurrentConditions(currentData);
+                    updateStats(currentData);
+                    createWindRose(currentData);
+                    createTempChart(currentData, dateStr);
+                } else {
+                    // Hide observation-dependent sections for future dates
+                    clearCurrentConditions();
+                    clearStats();
                 }
 
-                updateCurrentConditions(currentData);
-                updateStats(currentData);
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
-                createWindRose(currentData);
-                createTempChart(currentData, dateStr);
                 showContent();
 
-                // Update date display
+                // Update date display and nav buttons
                 updateDateDisplay(dateStr);
+                updateNavButtons(dateStr);
             } catch (error) {
                 showError(error.message);
             }
+        }
+
+        function clearCurrentConditions() {
+            document.getElementById('currentWind').innerHTML = '--<span class="unit"> kt</span>';
+            document.getElementById('avgWind').innerHTML = '--<span class="unit"> kt</span>';
+            document.getElementById('gustWind').innerHTML = '--<span class="unit"> kt</span>';
+            document.getElementById('windDir').innerHTML = '--<span class="unit">&deg;</span>';
+            document.getElementById('temp').innerHTML = '--<span class="unit">&deg;C</span>';
+            document.getElementById('humidity').innerHTML = '--<span class="unit">%</span>';
+        }
+
+        function clearStats() {
+            document.getElementById('maxWind').textContent = '--';
+            document.getElementById('maxGust').textContent = '--';
+            document.getElementById('dayAvgWind').textContent = '--';
+            document.getElementById('predominantDir').textContent = '--';
+            document.getElementById('maxTemp').textContent = '--';
+            document.getElementById('minTemp').textContent = '--';
+            document.getElementById('avgTemp').textContent = '--';
+            document.getElementById('recordCount').textContent = '--';
+            document.getElementById('firstRecord').textContent = '--';
+            document.getElementById('lastRecord').textContent = '--';
         }
 
         function changeDay(offset) {
@@ -1328,7 +1385,19 @@
 
             const date = parseDate(currentDate);
             date.setDate(date.getDate() + offset);
-            loadData(formatDate(date));
+            const newDateStr = formatDate(date);
+
+            // Limit to 5 days in the future
+            const maxDate = getMaxFutureDate();
+            if (newDateStr > maxDate) return;
+
+            loadData(newDateStr);
+            updateNavButtons(newDateStr);
+        }
+
+        function updateNavButtons(dateStr) {
+            const maxDate = getMaxFutureDate();
+            document.getElementById('nextDay').disabled = dateStr >= maxDate;
         }
 
         // BOM Daily Forecast
