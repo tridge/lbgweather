@@ -96,6 +96,30 @@
             background: #bdc3c7;
             cursor: not-allowed;
         }
+        .lake-closure-warning {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-size: 16px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+            animation: pulse 2s infinite;
+        }
+        .lake-closure-warning strong {
+            font-size: 18px;
+            display: block;
+            margin-bottom: 8px;
+        }
+        .lake-closure-warning a {
+            color: #fff;
+            text-decoration: underline;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.85; }
+        }
         .current-conditions {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -288,6 +312,8 @@
     </a>
     <h1>Lake Burley Griffin Wind</h1>
     <p class="subtitle">Canberra Yacht Club Weather Station Data</p>
+
+    <div id="lake-closure-container"></div>
 
     <div class="controls">
         <div class="control-group">
@@ -1466,6 +1492,19 @@
             }
         }
 
+        // Load lake closure status
+        async function loadLakeClosureStatus() {
+            try {
+                const response = await fetch('yarralumla_bay.html');
+                if (response.ok) {
+                    const html = await response.text();
+                    document.getElementById('lake-closure-container').innerHTML = html;
+                }
+            } catch (e) {
+                // Silently ignore - no closure warning shown
+            }
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
             // Don't initialize if charting library was blocked
@@ -1482,8 +1521,9 @@
             document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
             document.getElementById('today').addEventListener('click', () => loadData(getTodayCanberra()));
 
-            // Load BOM daily forecast and initial data
-            loadForecast(); // Don't await - let it load in parallel
+            // Load lake closure status, BOM daily forecast, and initial data in parallel
+            loadLakeClosureStatus();
+            loadForecast();
             await loadData(today);
         });
     </script>
