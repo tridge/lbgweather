@@ -691,9 +691,10 @@
         }
 
         async function fetchArchivedForecasts(dateStr) {
-            // Fetch archived forecasts from JSONL files for a past date
+            // Fetch archived forecasts from JSONL files for a past or future date
             const [year, month, day] = dateStr.split('-');
             const results = {};
+            const isPast = isPastDate(dateStr);
 
             const models = ['bom', 'gfs', 'icon', 'gem', 'jma'];
             const fetchPromises = models.map(async (model) => {
@@ -706,9 +707,10 @@
                     const lines = text.trim().split('\n').filter(l => l);
                     if (lines.length === 0) return;
 
-                    // BOM forecasts only cover from issue time onward, so use first of day
-                    // to get morning coverage. Other models include full day from midnight.
-                    const forecastLine = model === 'bom' ? lines[0] : lines[lines.length - 1];
+                    // For BOM: past dates use first line (best morning coverage from early forecast),
+                    // future dates use last line (most recent/accurate forecast).
+                    // Other models always use last line (they provide full day coverage).
+                    const forecastLine = (model === 'bom' && isPast) ? lines[0] : lines[lines.length - 1];
                     const forecast = JSON.parse(forecastLine);
                     const forecasts = forecast.forecasts || [];
 
@@ -819,8 +821,8 @@
                 const lines = text.trim().split('\n').filter(l => l);
                 if (lines.length === 0) return [];
 
-                // Use first forecast of day (covers from morning onwards)
-                const forecast = JSON.parse(lines[0]);
+                // Use latest forecast (most complete coverage for the day)
+                const forecast = JSON.parse(lines[lines.length - 1]);
                 return (forecast.forecasts || []).map(f => ({
                     time: new Date(f.valid_time),
                     wind_kt: f.wind_kt,
