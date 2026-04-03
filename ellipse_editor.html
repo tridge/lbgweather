@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Water Quality Ellipse Editor</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; }
+        .toolbar {
+            position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+            background: #16213e; padding: 8px 16px; display: flex; align-items: center; gap: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3); flex-wrap: wrap;
+        }
+        .toolbar button {
+            background: #0f3460; color: #eee; border: 1px solid #1a1a5e; border-radius: 4px;
+            padding: 6px 14px; cursor: pointer; font-size: 13px;
+        }
+        .toolbar button:hover { background: #1a4a8a; }
+        .toolbar button.active { background: #e94560; border-color: #e94560; }
+        .toolbar select {
+            background: #0f3460; color: #eee; border: 1px solid #1a1a5e; border-radius: 4px;
+            padding: 6px 8px; font-size: 13px;
+        }
+        .toolbar label { font-size: 13px; color: #aaa; }
+        .toolbar .info { font-size: 12px; color: #888; margin-left: auto; }
+        #map-container {
+            margin-top: 50px; position: relative; display: inline-block;
+        }
+        #map-container img { display: block; }
+        #map-container svg {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+        }
+        svg ellipse { cursor: grab; }
+        svg ellipse:hover { stroke-width: 3; }
+        svg ellipse.selected { stroke-dasharray: 6 3; stroke-width: 3; }
+        svg .handle { cursor: pointer; opacity: 0; }
+        svg .handle:hover { opacity: 1; }
+        svg .selected-handles .handle { opacity: 0.7; }
+        svg text {
+            font-size: 14px; fill: white; text-anchor: middle;
+            dominant-baseline: central; pointer-events: none;
+            paint-order: stroke; stroke: rgba(0,0,0,0.7); stroke-width: 3px;
+            font-weight: bold;
+        }
+        #output-panel {
+            display: none; position: fixed; top: 50px; right: 0; bottom: 0; width: 500px;
+            background: #0d1b2a; z-index: 150; padding: 16px; overflow-y: auto;
+            border-left: 2px solid #1a1a5e;
+        }
+        #output-panel h3 { margin-bottom: 12px; }
+        #output-panel textarea {
+            width: 100%; height: calc(100% - 80px); background: #1b2838; color: #7fdbca;
+            border: 1px solid #1a1a5e; border-radius: 4px; padding: 12px;
+            font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; resize: none;
+        }
+        #output-panel button { margin-top: 8px; }
+        .help-text {
+            position: fixed; bottom: 0; left: 0; right: 0; background: #16213e;
+            padding: 6px 16px; font-size: 12px; color: #888; z-index: 200;
+        }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <label>Area:</label>
+    <select id="area-select"></select>
+    <button id="btn-export">Export JS</button>
+    <button id="btn-import">Import JS</button>
+    <div class="info" id="status">Click an ellipse to select. Drag to move. Scroll to resize. Shift+scroll to rotate.</div>
+</div>
+
+<div id="map-container">
+    <img src="lbg_map.jpg" id="map-img" alt="Lake Burley Griffin">
+    <svg id="overlay" viewBox="0 0 1439 725" preserveAspectRatio="xMidYMid meet"></svg>
+</div>
+
+<div id="output-panel">
+    <h3>Ellipse Definitions (JS)</h3>
+    <textarea id="output-text" spellcheck="false"></textarea>
+    <button id="btn-copy">Copy to Clipboard</button>
+    <button id="btn-close-output">Close</button>
+</div>
+
+<div class="help-text">
+    Drag: move | Scroll: resize width | Ctrl+Scroll: resize height | Shift+Scroll: rotate | Arrow keys: nudge selected | Delete: reset to default
+</div>
+
+<script>
+    // Initial ellipse definitions: {cx, cy, rx, ry, angle}
+    const DEFAULT_ELLIPSES = {
+        'East Basin':                {cx: 1160, cy: 538, rx: 95, ry: 88, angle: -15},
+        'Central Basin':             {cx: 1017, cy: 332, rx: 135, ry: 92, angle: 36},
+        'West Basin (Ferry Terminal)':{cx: 820, cy: 247, rx: 70, ry: 74, angle: -5},
+        'Lotus Bay':                 {cx: 770, cy: 422, rx: 46, ry: 43, angle: 0},
+        'Acton West':                {cx: 693, cy: 223, rx: 52, ry: 42, angle: 56},
+        'Yarralumla Beach':          {cx: 554, cy: 406, rx: 35, ry: 32, angle: 15},
+        'Yarralumla Beach East':     {cx: 584, cy: 375, rx: 35, ry: 30, angle: 10},
+        'Yarralumla Bay':            {cx: 495, cy: 425, rx: 42, ry: 32, angle: 84},
+        'Black Mountain Beach':      {cx: 489, cy: 240, rx: 40, ry: 56, angle: 5},
+        'Weston Park East':          {cx: 408, cy: 285, rx: 76, ry: 26, angle: -65},
+        'Weston Park West':          {cx: 360, cy: 256, rx: 32, ry: 67, angle: 36},
+    };
+
+    // Working copy
+    let ellipses = {};
+    for (const [k, v] of Object.entries(DEFAULT_ELLIPSES)) {
+        ellipses[k] = {...v};
+    }
+
+    const svg = document.getElementById('overlay');
+    const areaSelect = document.getElementById('area-select');
+    const status = document.getElementById('status');
+    let selectedArea = null;
+    let dragging = false;
+    let dragStart = {x: 0, y: 0};
+    let dragOriginal = {cx: 0, cy: 0};
+
+    const COLORS = [
+        '#e74c3c', '#27ae60', '#3498db', '#f39c12', '#9b59b6',
+        '#1abc9c', '#e67e22', '#2ecc71', '#e91e63', '#00bcd4', '#ff5722'
+    ];
+
+    function getColor(idx) { return COLORS[idx % COLORS.length]; }
+
+    function svgPoint(e) {
+        const rect = svg.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) / rect.width * 1439,
+            y: (e.clientY - rect.top) / rect.height * 725
+        };
+    }
+
+    function render() {
+        svg.innerHTML = '';
+        const names = Object.keys(ellipses);
+
+        names.forEach((name, idx) => {
+            const el = ellipses[name];
+            const color = getColor(idx);
+            const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            g.setAttribute('transform', `rotate(${el.angle || 0}, ${el.cx}, ${el.cy})`);
+
+            const ellipse = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
+            ellipse.setAttribute('cx', el.cx);
+            ellipse.setAttribute('cy', el.cy);
+            ellipse.setAttribute('rx', el.rx);
+            ellipse.setAttribute('ry', el.ry);
+            ellipse.setAttribute('fill', color);
+            ellipse.setAttribute('fill-opacity', '0.25');
+            ellipse.setAttribute('stroke', color);
+            ellipse.setAttribute('stroke-width', selectedArea === name ? '3' : '2');
+            if (selectedArea === name) {
+                ellipse.setAttribute('stroke-dasharray', '8 4');
+                ellipse.setAttribute('fill-opacity', '0.35');
+            }
+            ellipse.dataset.area = name;
+            g.appendChild(ellipse);
+
+            // Resize handles for selected
+            if (selectedArea === name) {
+                const handles = [
+                    {x: el.cx + el.rx, y: el.cy, cursor: 'ew-resize', type: 'rx'},
+                    {x: el.cx - el.rx, y: el.cy, cursor: 'ew-resize', type: 'rx'},
+                    {x: el.cx, y: el.cy - el.ry, cursor: 'ns-resize', type: 'ry'},
+                    {x: el.cx, y: el.cy + el.ry, cursor: 'ns-resize', type: 'ry'},
+                ];
+                handles.forEach(h => {
+                    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                    circle.setAttribute('cx', h.x);
+                    circle.setAttribute('cy', h.y);
+                    circle.setAttribute('r', '6');
+                    circle.setAttribute('fill', 'white');
+                    circle.setAttribute('stroke', color);
+                    circle.setAttribute('stroke-width', '2');
+                    circle.style.cursor = h.cursor;
+                    circle.style.opacity = '0.8';
+                    g.appendChild(circle);
+                });
+            }
+
+            // Label
+            const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            text.setAttribute('x', el.cx);
+            text.setAttribute('y', el.cy);
+            text.setAttribute('font-size', Math.min(el.rx, el.ry) > 40 ? '13' : '10');
+            text.textContent = name.replace(' (Ferry Terminal)', '\n(Ferry)');
+            g.appendChild(text);
+
+            svg.appendChild(g);
+        });
+    }
+
+    // Populate select
+    Object.keys(ellipses).forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        areaSelect.appendChild(opt);
+    });
+
+    areaSelect.addEventListener('change', () => {
+        selectedArea = areaSelect.value;
+        render();
+    });
+
+    // Click to select
+    svg.addEventListener('mousedown', (e) => {
+        const pt = svgPoint(e);
+        // Check which ellipse was clicked (reverse order for z-index)
+        const names = Object.keys(ellipses).reverse();
+        let found = null;
+        for (const name of names) {
+            const el = ellipses[name];
+            const angle = -(el.angle || 0) * Math.PI / 180;
+            const dx = pt.x - el.cx;
+            const dy = pt.y - el.cy;
+            const rx2 = (dx * Math.cos(angle) - dy * Math.sin(angle)) / el.rx;
+            const ry2 = (dx * Math.sin(angle) + dy * Math.cos(angle)) / el.ry;
+            if (rx2 * rx2 + ry2 * ry2 <= 1) {
+                found = name;
+                break;
+            }
+        }
+        if (found) {
+            selectedArea = found;
+            areaSelect.value = found;
+            dragging = true;
+            dragStart = pt;
+            dragOriginal = {cx: ellipses[found].cx, cy: ellipses[found].cy};
+            render();
+            updateStatus();
+            e.preventDefault();
+        }
+    });
+
+    svg.addEventListener('mousemove', (e) => {
+        if (!dragging || !selectedArea) return;
+        const pt = svgPoint(e);
+        const el = ellipses[selectedArea];
+        el.cx = Math.round(dragOriginal.cx + (pt.x - dragStart.x));
+        el.cy = Math.round(dragOriginal.cy + (pt.y - dragStart.y));
+        render();
+        updateStatus();
+    });
+
+    window.addEventListener('mouseup', () => { dragging = false; });
+
+    // Scroll to resize/rotate
+    svg.addEventListener('wheel', (e) => {
+        if (!selectedArea) return;
+        e.preventDefault();
+        const el = ellipses[selectedArea];
+        const delta = e.deltaY > 0 ? -2 : 2;
+
+        if (e.shiftKey) {
+            // Rotate
+            el.angle = Math.round((el.angle || 0) + delta);
+        } else if (e.ctrlKey || e.metaKey) {
+            // Resize height
+            el.ry = Math.max(10, el.ry + delta);
+        } else {
+            // Resize width
+            el.rx = Math.max(10, el.rx + delta);
+        }
+        render();
+        updateStatus();
+    }, {passive: false});
+
+    // Arrow keys to nudge
+    window.addEventListener('keydown', (e) => {
+        if (!selectedArea) return;
+        const el = ellipses[selectedArea];
+        const step = e.shiftKey ? 10 : 1;
+        switch(e.key) {
+            case 'ArrowLeft':  el.cx -= step; break;
+            case 'ArrowRight': el.cx += step; break;
+            case 'ArrowUp':    el.cy -= step; break;
+            case 'ArrowDown':  el.cy += step; break;
+            case 'Delete':
+            case 'Backspace':
+                if (e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'INPUT') {
+                    const def = DEFAULT_ELLIPSES[selectedArea];
+                    if (def) Object.assign(el, {...def});
+                }
+                break;
+            default: return;
+        }
+        e.preventDefault();
+        render();
+        updateStatus();
+    });
+
+    function updateStatus() {
+        if (!selectedArea) {
+            status.textContent = 'Click an ellipse to select.';
+            return;
+        }
+        const el = ellipses[selectedArea];
+        status.textContent = `${selectedArea}: cx=${el.cx} cy=${el.cy} rx=${el.rx} ry=${el.ry} angle=${el.angle || 0}`;
+    }
+
+    // Export
+    document.getElementById('btn-export').addEventListener('click', () => {
+        const panel = document.getElementById('output-panel');
+        const textarea = document.getElementById('output-text');
+        let js = 'const WQ_ELLIPSES = {\n';
+        for (const [name, el] of Object.entries(ellipses)) {
+            const pad = ' '.repeat(Math.max(0, 36 - name.length - 3));
+            js += `    '${name}':${pad}{cx: ${el.cx}, cy: ${el.cy}, rx: ${el.rx}, ry: ${el.ry}, angle: ${el.angle || 0}},\n`;
+        }
+        js += '};\n';
+        textarea.value = js;
+        panel.style.display = 'block';
+    });
+
+    document.getElementById('btn-copy').addEventListener('click', () => {
+        const textarea = document.getElementById('output-text');
+        textarea.select();
+        navigator.clipboard.writeText(textarea.value);
+        document.getElementById('btn-copy').textContent = 'Copied!';
+        setTimeout(() => document.getElementById('btn-copy').textContent = 'Copy to Clipboard', 1500);
+    });
+
+    document.getElementById('btn-close-output').addEventListener('click', () => {
+        document.getElementById('output-panel').style.display = 'none';
+    });
+
+    // Import
+    document.getElementById('btn-import').addEventListener('click', () => {
+        const panel = document.getElementById('output-panel');
+        const textarea = document.getElementById('output-text');
+        if (panel.style.display === 'block' && textarea.value.includes('WQ_ELLIPSES')) {
+            // Parse and import
+            try {
+                const match = textarea.value.match(/\{[\s\S]*\}/);
+                if (match) {
+                    const parsed = eval('(' + match[0] + ')');
+                    for (const [name, el] of Object.entries(parsed)) {
+                        if (ellipses[name]) Object.assign(ellipses[name], el);
+                    }
+                    render();
+                    panel.style.display = 'none';
+                    status.textContent = 'Imported successfully.';
+                }
+            } catch(e) {
+                status.textContent = 'Import error: ' + e.message;
+            }
+        } else {
+            textarea.value = '// Paste WQ_ELLIPSES definition here and click Import again';
+            panel.style.display = 'block';
+        }
+    });
+
+    render();
+</script>
+</body>
+</html>

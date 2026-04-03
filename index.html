@@ -304,6 +304,67 @@
                 justify-content: space-between;
             }
         }
+
+        /* Water quality map */
+        .wq-map-container {
+            position: relative;
+            max-width: 1439px;
+            margin: 0 auto;
+        }
+        .wq-map-container img {
+            width: 100%;
+            height: auto;
+            display: block;
+            border-radius: 4px;
+        }
+        .wq-map-container svg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .wq-map-container svg ellipse {
+            cursor: pointer;
+            transition: fill-opacity 0.2s;
+        }
+        .wq-map-container svg ellipse:hover {
+            fill-opacity: 0.6;
+        }
+        #wq-tooltip {
+            display: none;
+            position: absolute;
+            background: white;
+            border-radius: 8px;
+            padding: 12px 16px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            font-size: 14px;
+            max-width: 350px;
+            pointer-events: none;
+            z-index: 100;
+            line-height: 1.4;
+        }
+        #wq-tooltip .wq-name {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+        #wq-tooltip .wq-status {
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+        #wq-tooltip .wq-comments {
+            color: #555;
+            font-size: 13px;
+        }
+        .wq-legend {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 0.85em;
+            color: #7f8c8d;
+        }
+        .wq-legend span {
+            margin: 0 12px;
+        }
     </style>
 </head>
 <body>
@@ -442,7 +503,27 @@
                 <span class="loading">Loading forecast...</span>
             </div>
         </div>
-    </div>
+
+        <div class="chart-container" id="water-quality-section">
+            <h3>Lake Water Quality
+                <small style="font-weight: normal; color: #7f8c8d; font-size: 0.6em;">
+                    <a href="https://www.nca.gov.au/environment/lake-burley-griffin/water-quality"
+                       target="_blank" style="color: #3498db;">NCA</a>
+                </small>
+            </h3>
+            <div class="wq-map-container" id="wq-map-container">
+                <img src="lbg_map.jpg" alt="Lake Burley Griffin Map">
+                <svg id="wq-overlay" viewBox="0 0 1439 725"
+                     preserveAspectRatio="xMidYMid meet">
+                </svg>
+                <div id="wq-tooltip"></div>
+            </div>
+            <div class="wq-legend">
+                <span><span style="color: #27ae60;">&#9632;</span> Open</span>
+                <span><span style="color: #e74c3c;">&#9632;</span> Closed</span>
+                <span><span style="color: #f39c12;">&#9632;</span> Warning</span>
+            </div>
+        </div>
 
     <footer style="text-align: center; margin-top: 30px; padding: 20px; color: #7f8c8d; font-size: 0.9em;">
         <p>With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather station data</p>
@@ -1534,6 +1615,113 @@
             }
         }
 
+        // Water quality map polygon definitions (coordinates in 1439x725 image space)
+        // Ellipse definitions in 1439x725 image space: {cx, cy, rx, ry, angle}
+        // Edit with ellipse_editor.html then paste exported values here.
+        const WQ_ELLIPSES = {
+            'East Basin':                {cx: 1160, cy: 538, rx: 95, ry: 88, angle: -15},
+            'Central Basin':             {cx: 1017, cy: 332, rx: 135, ry: 92, angle: 36},
+            'West Basin (Ferry Terminal)':{cx: 820, cy: 247, rx: 70, ry: 74, angle: -5},
+            'Lotus Bay':                 {cx: 770, cy: 422, rx: 46, ry: 43, angle: 0},
+            'Acton West':                {cx: 693, cy: 223, rx: 52, ry: 42, angle: 56},
+            'Yarralumla Beach':          {cx: 554, cy: 406, rx: 35, ry: 32, angle: 15},
+            'Yarralumla Beach East':     {cx: 584, cy: 375, rx: 35, ry: 30, angle: 10},
+            'Yarralumla Bay':            {cx: 495, cy: 425, rx: 42, ry: 32, angle: 84},
+            'Black Mountain Beach':      {cx: 489, cy: 240, rx: 40, ry: 56, angle: 5},
+            'Weston Park East':          {cx: 408, cy: 285, rx: 76, ry: 26, angle: -65},
+            'Weston Park West':          {cx: 360, cy: 256, rx: 32, ry: 67, angle: 36},
+        };
+
+        function getStatusColor(status) {
+            const s = status.toUpperCase();
+            if (s === 'CLOSED') return { fill: 'rgba(231, 76, 60, 0.4)', stroke: 'rgba(231, 76, 60, 0.8)' };
+            if (s === 'OPEN') return { fill: 'rgba(39, 174, 96, 0.3)', stroke: 'rgba(39, 174, 96, 0.7)' };
+            // Warning or other
+            return { fill: 'rgba(243, 156, 18, 0.35)', stroke: 'rgba(243, 156, 18, 0.8)' };
+        }
+
+        function showTooltip(tooltip, container, loc, e) {
+            const statusLabel = loc.status.toUpperCase() === 'OPEN' ? 'Open' :
+                               loc.status.toUpperCase() === 'CLOSED' ? 'Closed' : loc.status;
+            const statusColor = loc.status.toUpperCase() === 'OPEN' ? '#27ae60' :
+                               loc.status.toUpperCase() === 'CLOSED' ? '#e74c3c' : '#f39c12';
+            tooltip.innerHTML = `<div class="wq-name">${loc.name}</div>` +
+                `<div class="wq-status" style="color: ${statusColor};">${statusLabel}</div>` +
+                `<div class="wq-comments">${loc.comments}</div>`;
+            tooltip.style.display = 'block';
+        }
+
+        function moveTooltip(tooltip, container, e) {
+            const rect = container.getBoundingClientRect();
+            let x = e.clientX - rect.left + 15;
+            let y = e.clientY - rect.top + 15;
+            if (x + 350 > rect.width) x = e.clientX - rect.left - 365;
+            if (y + 150 > rect.height) y = e.clientY - rect.top - 160;
+            tooltip.style.left = x + 'px';
+            tooltip.style.top = y + 'px';
+        }
+
+        async function loadWaterQuality() {
+            try {
+                const response = await fetch('water_quality.json');
+                if (!response.ok) return;
+                const data = await response.json();
+
+                const svg = document.getElementById('wq-overlay');
+                const tooltip = document.getElementById('wq-tooltip');
+                const container = document.getElementById('wq-map-container');
+
+                data.locations.forEach(loc => {
+                    const el = WQ_ELLIPSES[loc.name];
+                    if (!el) return;
+
+                    const colors = getStatusColor(loc.status);
+
+                    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                    if (el.angle) g.setAttribute('transform', `rotate(${el.angle}, ${el.cx}, ${el.cy})`);
+
+                    const ellipse = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
+                    ellipse.setAttribute('cx', el.cx);
+                    ellipse.setAttribute('cy', el.cy);
+                    ellipse.setAttribute('rx', el.rx);
+                    ellipse.setAttribute('ry', el.ry);
+                    ellipse.setAttribute('fill', colors.fill);
+                    ellipse.setAttribute('stroke', colors.stroke);
+                    ellipse.setAttribute('stroke-width', '2');
+                    g.appendChild(ellipse);
+
+                    g.addEventListener('mouseenter', (e) => showTooltip(tooltip, container, loc, e));
+                    g.addEventListener('mousemove', (e) => moveTooltip(tooltip, container, e));
+                    g.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+
+                    // Touch support
+                    g.addEventListener('click', (e) => {
+                        if (tooltip.style.display === 'block' && tooltip._activeLoc === loc.name) {
+                            tooltip.style.display = 'none';
+                            tooltip._activeLoc = null;
+                        } else {
+                            showTooltip(tooltip, container, loc, e);
+                            moveTooltip(tooltip, container, e);
+                            tooltip._activeLoc = loc.name;
+                        }
+                    });
+
+                    svg.appendChild(g);
+                });
+
+                // Update timestamp
+                if (data.updated) {
+                    const date = new Date(data.updated);
+                    const opts = { timeZone: 'Australia/Sydney', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
+                    const legend = document.querySelector('.wq-legend');
+                    legend.innerHTML += `<br><span>Updated: ${date.toLocaleString('en-AU', opts)}</span>`;
+                }
+
+            } catch (e) {
+                console.error('Water quality load error:', e);
+            }
+        }
+
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
             // Don't initialize if charting library was blocked
@@ -1550,9 +1738,10 @@
             document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
             document.getElementById('today').addEventListener('click', () => loadData(getTodayCanberra()));
 
-            // Load lake closure status, BOM daily forecast, and initial data in parallel
+            // Load lake closure status, BOM daily forecast, water quality, and initial data in parallel
             loadLakeClosureStatus();
             loadForecast();
+            loadWaterQuality();
             await loadData(today);
         });
     </script>

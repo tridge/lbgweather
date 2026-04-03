@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fetch Lake Burley Griffin water quality status from NCA website.
 
-Extracts Yarralumla Bay status and writes to yarralumla_bay.html.
-If the bay is CLOSED, writes a warning div. If OPEN, writes empty file.
+Extracts all location statuses and writes:
+  - water_quality.json (all locations with status and comments)
+  - yarralumla_bay.html (warning div if Yarralumla Bay is closed)
 
 Run via cron hourly.
 """
@@ -10,9 +11,13 @@ Run via cron hourly.
 import requests
 import re
 import sys
+import json
+from datetime import datetime, timezone
+
 
 NCA_URL = "https://www.nca.gov.au/environment/lake-burley-griffin/water-quality"
-OUTPUT_FILE = "yarralumla_bay.html"
+JSON_OUTPUT = "water_quality.json"
+YARRALUMLA_OUTPUT = "yarralumla_bay.html"
 
 
 def fetch_water_quality():
@@ -26,68 +31,95 @@ def fetch_water_quality():
         return None
 
 
-def extract_yarralumla_bay_status(html):
-    """Extract Yarralumla Bay row from the water quality table.
+def clean_html(text):
+    """Strip HTML tags and clean up entities."""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&nbsp;', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-    Returns tuple of (status, description) or (None, None) if not found.
+
+def extract_all_locations(html):
+    """Extract all rows from the water quality table.
+
+    Returns list of dicts with name, status, comments.
     """
-    # Look for the Yarralumla Bay row in the table
-    # Pattern: <td>Yarralumla Bay</td>\n<td>STATUS</td>\n<td>...description...</td>
-    pattern = r'<td>\s*Yarralumla Bay\s*</td>\s*<td>\s*(OPEN|CLOSED)\s*</td>\s*<td>(.*?)</td>'
-    match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+    pattern = r'<td>\s*(.*?)\s*</td>\s*<td>\s*(.*?)\s*</td>\s*<td>(.*?)</td>'
+    matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
 
-    if match:
-        status = match.group(1).upper()
-        description = match.group(2).strip()
-        # Clean up HTML tags and entities in description
-        description = re.sub(r'<[^>]+>', '', description)
-        description = description.replace('&nbsp;', ' ').strip()
-        return status, description
+    locations = []
+    for name, status, comments in matches:
+        name = clean_html(name)
+        status = clean_html(status).upper()
+        comments = clean_html(comments)
+        # Filter to only water quality rows (skip header-like or unrelated rows)
+        if status in ('OPEN', 'CLOSED') or 'OPEN' in status or 'CLOSED' in status:
+            locations.append({
+                'name': name,
+                'status': status,
+                'comments': comments,
+            })
 
-    return None, None
+    return locations
 
 
-def write_output(status, description):
-    """Write the output HTML file.
+def write_json_output(locations):
+    """Write water_quality.json with all location data."""
+    data = {
+        'updated': datetime.now(timezone.utc).isoformat(),
+        'locations': locations,
+    }
+    with open(JSON_OUTPUT, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Wrote {len(locations)} locations to {JSON_OUTPUT}")
 
-    If CLOSED, write a warning div. If OPEN or unknown, write empty file.
-    """
-    if status == "CLOSED":
-        html = f'''<div class="lake-closure-warning">
+
+def write_yarralumla_output(locations):
+    """Write yarralumla_bay.html warning if Yarralumla Bay is closed."""
+    for loc in locations:
+        if loc['name'] == 'Yarralumla Bay':
+            if loc['status'] == 'CLOSED':
+                html = f'''<div class="lake-closure-warning">
     <strong>Yarralumla Bay CLOSED</strong><br>
-    {description}
+    {loc['comments']}
     <br><small><a href="{NCA_URL}" target="_blank">NCA Water Quality</a></small>
 </div>
 '''
-    else:
-        html = ""
+            else:
+                html = ""
+            with open(YARRALUMLA_OUTPUT, 'w') as f:
+                f.write(html)
+            return loc['status'] == 'CLOSED'
 
-    with open(OUTPUT_FILE, 'w') as f:
-        f.write(html)
-
-    return status == "CLOSED"
+    # Yarralumla Bay not found - write empty file
+    with open(YARRALUMLA_OUTPUT, 'w') as f:
+        f.write("")
+    return False
 
 
 def main():
     html = fetch_water_quality()
     if html is None:
-        # On error, don't change existing file
         print("Failed to fetch water quality data")
         return 1
 
-    status, description = extract_yarralumla_bay_status(html)
+    locations = extract_all_locations(html)
 
-    if status is None:
-        print("Could not find Yarralumla Bay status in page")
-        # Write empty file on parse error
-        with open(OUTPUT_FILE, 'w') as f:
+    if not locations:
+        print("Could not find any water quality locations in page")
+        with open(YARRALUMLA_OUTPUT, 'w') as f:
             f.write("")
         return 1
 
-    is_closed = write_output(status, description)
-    print(f"Yarralumla Bay: {status}")
+    write_json_output(locations)
+    is_closed = write_yarralumla_output(locations)
+
+    for loc in locations:
+        marker = " **" if loc['status'] == 'CLOSED' else ""
+        print(f"  {loc['name']}: {loc['status']}{marker}")
+
     if is_closed:
-        print(f"  {description}")
+        print("Yarralumla Bay is CLOSED")
 
     return 0
 
