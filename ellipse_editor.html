@@ -59,6 +59,26 @@
             position: fixed; bottom: 0; left: 0; right: 0; background: #16213e;
             padding: 6px 16px; font-size: 12px; color: #888; z-index: 200;
         }
+        #help-inset {
+            position: fixed; top: 58px; right: 12px; width: 280px; z-index: 150;
+            background: rgba(13, 27, 42, 0.92); border: 1px solid #1a1a5e;
+            border-radius: 8px; padding: 14px 16px; font-size: 12px;
+            line-height: 1.6; color: #aaa;
+        }
+        #help-inset h4 { color: #eee; margin-bottom: 8px; font-size: 13px; }
+        #help-inset .close-help {
+            position: absolute; top: 6px; right: 10px; background: none;
+            border: none; color: #666; font-size: 16px; cursor: pointer;
+        }
+        #help-inset .close-help:hover { color: #eee; }
+        #help-inset kbd {
+            background: #1a2940; border: 1px solid #2a3a5e; border-radius: 3px;
+            padding: 1px 5px; font-family: inherit; color: #ccc;
+        }
+        #help-inset table { width: 100%; border-collapse: collapse; }
+        #help-inset td { padding: 3px 0; }
+        #help-inset td:first-child { white-space: nowrap; padding-right: 12px; color: #ccc; }
+        #help-inset .section { margin-top: 10px; color: #7faacc; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
     </style>
 </head>
 <body>
@@ -68,7 +88,41 @@
     <select id="area-select"></select>
     <button id="btn-export">Export JS</button>
     <button id="btn-import">Import JS</button>
+    <button id="btn-help">?</button>
     <div class="info" id="status">Click an ellipse to select. Drag to move. Scroll to resize. Shift+scroll to rotate.</div>
+</div>
+
+<div id="help-inset">
+    <button class="close-help" id="close-help">&times;</button>
+    <h4>Ellipse Editor</h4>
+    <p>Position and size the water quality area ellipses on the map, then export the JS to paste into <code>index.html</code>.</p>
+
+    <div class="section">Selection</div>
+    <table>
+        <tr><td>Click ellipse</td><td>Select area</td></tr>
+        <tr><td>Dropdown</td><td>Select by name</td></tr>
+    </table>
+
+    <div class="section">Move</div>
+    <table>
+        <tr><td>Drag</td><td>Move selected ellipse</td></tr>
+        <tr><td><kbd>&larr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&rarr;</kbd></td><td>Nudge 1px</td></tr>
+        <tr><td><kbd>Shift</kbd> + arrows</td><td>Nudge 10px</td></tr>
+    </table>
+
+    <div class="section">Resize &amp; Rotate</div>
+    <table>
+        <tr><td>Scroll</td><td>Resize width</td></tr>
+        <tr><td><kbd>Ctrl</kbd> + scroll</td><td>Resize height</td></tr>
+        <tr><td><kbd>Shift</kbd> + scroll</td><td>Rotate</td></tr>
+    </table>
+
+    <div class="section">Other</div>
+    <table>
+        <tr><td><kbd>Delete</kbd></td><td>Reset to default</td></tr>
+        <tr><td>Export JS</td><td>Copy ellipse definitions</td></tr>
+        <tr><td>Import JS</td><td>Paste &amp; load definitions</td></tr>
+    </table>
 </div>
 
 <div id="map-container">
@@ -83,9 +137,6 @@
     <button id="btn-close-output">Close</button>
 </div>
 
-<div class="help-text">
-    Drag: move | Scroll: resize width | Ctrl+Scroll: resize height | Shift+Scroll: rotate | Arrow keys: nudge selected | Delete: reset to default
-</div>
 
 <script>
     // Initial ellipse definitions: {cx, cy, rx, ry, angle}
@@ -354,6 +405,15 @@
     });
 
     render();
+
+    // Help inset toggle
+    const helpInset = document.getElementById('help-inset');
+    document.getElementById('btn-help').addEventListener('click', () => {
+        helpInset.style.display = helpInset.style.display === 'none' ? 'block' : 'none';
+    });
+    document.getElementById('close-help').addEventListener('click', () => {
+        helpInset.style.display = 'none';
+    });
 </script>
 </body>
 </html>
