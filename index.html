@@ -365,6 +365,63 @@
         .wq-legend span {
             margin: 0 12px;
         }
+        /* Mobile bottom panel for water quality */
+        #wq-panel {
+            display: none;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: white;
+            border-radius: 12px 12px 0 0;
+            padding: 16px;
+            box-shadow: 0 -4px 20px rgba(0,0,0,0.2);
+            z-index: 200;
+            max-height: 45vh;
+            overflow-y: auto;
+            animation: wqSlideUp 0.2s ease-out;
+        }
+        @keyframes wqSlideUp {
+            from { transform: translateY(100%); }
+            to { transform: translateY(0); }
+        }
+        #wq-panel .wq-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+        #wq-panel .wq-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        #wq-panel .wq-status {
+            font-weight: 600;
+            font-size: 15px;
+            margin-left: 8px;
+        }
+        #wq-panel .wq-panel-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            color: #999;
+            cursor: pointer;
+            padding: 0 4px;
+            line-height: 1;
+        }
+        #wq-panel .wq-panel-comments {
+            color: #555;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        #wq-panel .wq-panel-expand {
+            display: inline-block;
+            margin-top: 6px;
+            color: #3498db;
+            font-size: 13px;
+            cursor: pointer;
+            text-decoration: none;
+        }
     </style>
 </head>
 <body>
@@ -517,6 +574,14 @@
                      preserveAspectRatio="xMidYMid meet">
                 </svg>
                 <div id="wq-tooltip"></div>
+            </div>
+            <div id="wq-panel">
+                <div class="wq-panel-header">
+                    <div><span class="wq-name"></span><span class="wq-status"></span></div>
+                    <button class="wq-panel-close">&times;</button>
+                </div>
+                <div class="wq-panel-comments"></div>
+                <a class="wq-panel-expand" href="#">Show more...</a>
             </div>
             <div class="wq-legend">
                 <span><span style="color: #27ae60;">&#9632;</span> Open</span>
@@ -1640,13 +1705,28 @@
             return { fill: 'rgba(243, 156, 18, 0.35)', stroke: 'rgba(243, 156, 18, 0.8)' };
         }
 
+        const isMobile = window.matchMedia('(hover: none)').matches;
+
+        function getStatusLabel(status) {
+            const s = status.toUpperCase();
+            return s === 'OPEN' ? 'Open' : s === 'CLOSED' ? 'Closed' : status;
+        }
+
+        function getStatusColorCSS(status) {
+            const s = status.toUpperCase();
+            return s === 'OPEN' ? '#27ae60' : s === 'CLOSED' ? '#e74c3c' : '#f39c12';
+        }
+
+        function truncateComments(text) {
+            // Split into sentences and return first two
+            const sentences = text.match(/[^.!]+[.!]+/g);
+            if (!sentences || sentences.length <= 2) return null; // no need to truncate
+            return sentences.slice(0, 2).join('').trim();
+        }
+
         function showTooltip(tooltip, container, loc, e) {
-            const statusLabel = loc.status.toUpperCase() === 'OPEN' ? 'Open' :
-                               loc.status.toUpperCase() === 'CLOSED' ? 'Closed' : loc.status;
-            const statusColor = loc.status.toUpperCase() === 'OPEN' ? '#27ae60' :
-                               loc.status.toUpperCase() === 'CLOSED' ? '#e74c3c' : '#f39c12';
             tooltip.innerHTML = `<div class="wq-name">${loc.name}</div>` +
-                `<div class="wq-status" style="color: ${statusColor};">${statusLabel}</div>` +
+                `<div class="wq-status" style="color: ${getStatusColorCSS(loc.status)};">${getStatusLabel(loc.status)}</div>` +
                 `<div class="wq-comments">${loc.comments}</div>`;
             tooltip.style.display = 'block';
         }
@@ -1661,6 +1741,39 @@
             tooltip.style.top = y + 'px';
         }
 
+        function showMobilePanel(loc) {
+            const panel = document.getElementById('wq-panel');
+            const nameEl = panel.querySelector('.wq-name');
+            const statusEl = panel.querySelector('.wq-status');
+            const commentsEl = panel.querySelector('.wq-panel-comments');
+            const expandEl = panel.querySelector('.wq-panel-expand');
+
+            nameEl.textContent = loc.name;
+            statusEl.textContent = getStatusLabel(loc.status);
+            statusEl.style.color = getStatusColorCSS(loc.status);
+
+            const truncated = truncateComments(loc.comments);
+            if (truncated) {
+                commentsEl.textContent = truncated;
+                commentsEl._fullText = loc.comments;
+                commentsEl._truncated = truncated;
+                commentsEl._expanded = false;
+                expandEl.textContent = 'Show more...';
+                expandEl.style.display = 'inline-block';
+            } else {
+                commentsEl.textContent = loc.comments;
+                expandEl.style.display = 'none';
+            }
+
+            panel.style.display = 'block';
+            panel._activeLoc = loc.name;
+        }
+
+        function hideMobilePanel() {
+            document.getElementById('wq-panel').style.display = 'none';
+            document.getElementById('wq-panel')._activeLoc = null;
+        }
+
         async function loadWaterQuality() {
             try {
                 const response = await fetch('water_quality.json');
@@ -1670,6 +1783,32 @@
                 const svg = document.getElementById('wq-overlay');
                 const tooltip = document.getElementById('wq-tooltip');
                 const container = document.getElementById('wq-map-container');
+
+                // Mobile panel setup
+                if (isMobile) {
+                    const panel = document.getElementById('wq-panel');
+                    panel.querySelector('.wq-panel-close').addEventListener('click', hideMobilePanel);
+                    panel.querySelector('.wq-panel-expand').addEventListener('click', (e) => {
+                        e.preventDefault();
+                        const commentsEl = panel.querySelector('.wq-panel-comments');
+                        const expandEl = panel.querySelector('.wq-panel-expand');
+                        if (commentsEl._expanded) {
+                            commentsEl.textContent = commentsEl._truncated;
+                            expandEl.textContent = 'Show more...';
+                            commentsEl._expanded = false;
+                        } else {
+                            commentsEl.textContent = commentsEl._fullText;
+                            expandEl.textContent = 'Show less';
+                            commentsEl._expanded = true;
+                        }
+                    });
+                    // Dismiss when tapping outside panel on the map
+                    document.addEventListener('click', (e) => {
+                        if (panel.style.display === 'block' && !panel.contains(e.target) && !svg.contains(e.target)) {
+                            hideMobilePanel();
+                        }
+                    });
+                }
 
                 data.locations.forEach(loc => {
                     const el = WQ_ELLIPSES[loc.name];
@@ -1690,21 +1829,31 @@
                     ellipse.setAttribute('stroke-width', '2');
                     g.appendChild(ellipse);
 
-                    g.addEventListener('mouseenter', (e) => showTooltip(tooltip, container, loc, e));
-                    g.addEventListener('mousemove', (e) => moveTooltip(tooltip, container, e));
-                    g.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
-
-                    // Touch support
-                    g.addEventListener('click', (e) => {
-                        if (tooltip.style.display === 'block' && tooltip._activeLoc === loc.name) {
-                            tooltip.style.display = 'none';
-                            tooltip._activeLoc = null;
-                        } else {
-                            showTooltip(tooltip, container, loc, e);
-                            moveTooltip(tooltip, container, e);
-                            tooltip._activeLoc = loc.name;
-                        }
-                    });
+                    if (isMobile) {
+                        g.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            const panel = document.getElementById('wq-panel');
+                            if (panel.style.display === 'block' && panel._activeLoc === loc.name) {
+                                hideMobilePanel();
+                            } else {
+                                showMobilePanel(loc);
+                            }
+                        });
+                    } else {
+                        g.addEventListener('mouseenter', (e) => showTooltip(tooltip, container, loc, e));
+                        g.addEventListener('mousemove', (e) => moveTooltip(tooltip, container, e));
+                        g.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+                        g.addEventListener('click', (e) => {
+                            if (tooltip.style.display === 'block' && tooltip._activeLoc === loc.name) {
+                                tooltip.style.display = 'none';
+                                tooltip._activeLoc = null;
+                            } else {
+                                showTooltip(tooltip, container, loc, e);
+                                moveTooltip(tooltip, container, e);
+                                tooltip._activeLoc = loc.name;
+                            }
+                        });
+                    }
 
                     svg.appendChild(g);
                 });
