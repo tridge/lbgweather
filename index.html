@@ -365,25 +365,16 @@
         .wq-legend span {
             margin: 0 12px;
         }
-        /* Mobile bottom panel for water quality */
+        /* Mobile inline panel for water quality */
         #wq-panel {
             display: none;
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: white;
-            border-radius: 12px 12px 0 0;
-            padding: 16px;
-            box-shadow: 0 -4px 20px rgba(0,0,0,0.2);
-            z-index: 200;
-            max-height: 45vh;
+            background: #f0f4f8;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 10px;
+            border-left: 4px solid #3498db;
+            max-height: 40vh;
             overflow-y: auto;
-            animation: wqSlideUp 0.2s ease-out;
-        }
-        @keyframes wqSlideUp {
-            from { transform: translateY(100%); }
-            to { transform: translateY(0); }
         }
         #wq-panel .wq-panel-header {
             display: flex;
@@ -568,13 +559,6 @@
                        target="_blank" style="color: #3498db;">NCA</a>
                 </small>
             </h3>
-            <div class="wq-map-container" id="wq-map-container">
-                <img src="lbg_map.jpg" alt="Lake Burley Griffin Map">
-                <svg id="wq-overlay" viewBox="0 0 1439 725"
-                     preserveAspectRatio="xMidYMid meet">
-                </svg>
-                <div id="wq-tooltip"></div>
-            </div>
             <div id="wq-panel">
                 <div class="wq-panel-header">
                     <div><span class="wq-name"></span><span class="wq-status"></span></div>
@@ -582,6 +566,13 @@
                 </div>
                 <div class="wq-panel-comments"></div>
                 <a class="wq-panel-expand" href="#">Show more...</a>
+            </div>
+            <div class="wq-map-container" id="wq-map-container">
+                <img src="lbg_map.jpg" alt="Lake Burley Griffin Map">
+                <svg id="wq-overlay" viewBox="0 0 1439 725"
+                     preserveAspectRatio="xMidYMid meet">
+                </svg>
+                <div id="wq-tooltip"></div>
             </div>
             <div class="wq-legend">
                 <span><span style="color: #27ae60;">&#9632;</span> Open</span>
@@ -1699,10 +1690,10 @@
 
         function getStatusColor(status) {
             const s = status.toUpperCase();
-            if (s === 'CLOSED') return { fill: 'rgba(231, 76, 60, 0.4)', stroke: 'rgba(231, 76, 60, 0.8)' };
-            if (s === 'OPEN') return { fill: 'rgba(39, 174, 96, 0.3)', stroke: 'rgba(39, 174, 96, 0.7)' };
+            if (s === 'CLOSED') return { fill: 'rgba(231, 76, 60, 0.35)', stroke: '#e74c3c' };
+            if (s === 'OPEN') return { fill: 'rgba(100, 255, 120, 0.25)', stroke: '#2ecc40' };
             // Warning or other
-            return { fill: 'rgba(243, 156, 18, 0.35)', stroke: 'rgba(243, 156, 18, 0.8)' };
+            return { fill: 'rgba(243, 156, 18, 0.3)', stroke: '#f39c12' };
         }
 
         const isMobile = window.matchMedia('(hover: none)').matches;
@@ -1824,9 +1815,20 @@
                     ellipse.setAttribute('cy', el.cy);
                     ellipse.setAttribute('rx', el.rx);
                     ellipse.setAttribute('ry', el.ry);
+                    // White outline behind for contrast on both lake and land
+                    const outline = document.createElementNS('http://www.w3.org/2000/svg', 'ellipse');
+                    outline.setAttribute('cx', el.cx);
+                    outline.setAttribute('cy', el.cy);
+                    outline.setAttribute('rx', el.rx);
+                    outline.setAttribute('ry', el.ry);
+                    outline.setAttribute('fill', 'none');
+                    outline.setAttribute('stroke', 'rgba(255,255,255,0.6)');
+                    outline.setAttribute('stroke-width', '5');
+                    g.appendChild(outline);
+
                     ellipse.setAttribute('fill', colors.fill);
                     ellipse.setAttribute('stroke', colors.stroke);
-                    ellipse.setAttribute('stroke-width', '2');
+                    ellipse.setAttribute('stroke-width', '3');
                     g.appendChild(ellipse);
 
                     if (isMobile) {
