@@ -1,1 +1,1 @@
-rsync -Pavz index.html js *.py *.jpg *.json lbgweather:wind/
+rsync -Pavz index.html js *.py *.jpg *.json *.html lbgweather:wind/
