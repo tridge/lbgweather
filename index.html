@@ -322,13 +322,30 @@
             font-size: 10px;
             color: #999;
         }
+        .chart-unit {
+            font-weight: normal;
+            color: #95a5a6;
+            font-size: 0.8em;
+        }
         @media (max-width: 600px) {
+            body {
+                padding: 8px;
+            }
             .controls {
                 flex-direction: column;
                 align-items: stretch;
             }
             .control-group {
                 justify-content: space-between;
+            }
+            .chart-container {
+                padding: 10px 6px;
+                border-radius: 6px;
+                margin-bottom: 12px;
+            }
+            .chart-container h3 {
+                margin-left: 4px;
+                font-size: 0.95em;
             }
         }
 
@@ -523,7 +540,7 @@
         </div>
 
         <div class="chart-container">
-            <h3>Wind Speed</h3>
+            <h3>Wind Speed <span class="chart-unit">(kt)</span></h3>
             <div id="weatherStrip" class="weather-strip"></div>
             <div class="chart-wrapper">
                 <canvas id="windChart"></canvas>
@@ -626,6 +643,7 @@
     </footer>
 
     <script>
+        const isCompact = () => window.innerWidth <= 600;
         const BASE_URL = 'wind_logs';
         const BOM_HOURLY_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly';
         const OPEN_METEO_API = 'https://api.open-meteo.com/v1/forecast';
@@ -1104,8 +1122,16 @@
             if (dayForecasts.length === 0) { strip.innerHTML = ''; return; }
 
             // Position each hour using the chart's x-axis scale
-            strip.innerHTML = dayForecasts.map(f => {
+            const compact = isCompact();
+            strip.innerHTML = dayForecasts.map((f, i) => {
                 const t = new Date(f.time);
+                // On compact screens, show every 2nd hour to reduce crowding
+                if (compact) {
+                    const localHour = parseInt(t.toLocaleTimeString('en-AU', {
+                        timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false
+                    }));
+                    if (localHour % 2 !== 0) return '';
+                }
                 const px = xScale.getPixelForValue(t.getTime());
                 // Skip if outside chart area
                 if (px < chartArea.left - 10 || px > chartArea.right + 10) return '';
@@ -1270,6 +1296,9 @@
                         mode: 'nearest',
                         axis: 'x'
                     },
+                    layout: {
+                        padding: isCompact() ? { left: 0, right: 4 } : {}
+                    },
                     scales: {
                         x: {
                             type: 'time',
@@ -1278,25 +1307,30 @@
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
-                                    hour: 'HH:mm'
+                                    hour: isCompact() ? 'H' : 'HH:mm'
                                 }
                             },
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Time'
                             }
                         },
                         y: {
                             beginAtZero: true,
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Wind Speed (kt)'
                             }
                         }
                     },
                     plugins: {
                         legend: {
-                            position: 'top'
+                            position: 'top',
+                            labels: {
+                                boxWidth: isCompact() ? 8 : 40,
+                                padding: isCompact() ? 6 : 10,
+                                font: { size: isCompact() ? 10 : 12 }
+                            }
                         },
                         tooltip: {
                             callbacks: {
@@ -1378,6 +1412,9 @@
                         mode: 'nearest',
                         axis: 'x'
                     },
+                    layout: {
+                        padding: isCompact() ? { left: 0, right: 4 } : {}
+                    },
                     scales: {
                         x: {
                             type: 'time',
@@ -1386,11 +1423,11 @@
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
-                                    hour: 'HH:mm'
+                                    hour: isCompact() ? 'H' : 'HH:mm'
                                 }
                             },
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Time'
                             }
                         },
@@ -1406,7 +1443,7 @@
                                 }
                             },
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Direction'
                             }
                         }
@@ -1544,6 +1581,9 @@
                         mode: 'nearest',
                         axis: 'x'
                     },
+                    layout: {
+                        padding: isCompact() ? { left: 0, right: 4 } : {}
+                    },
                     scales: {
                         x: {
                             type: 'time',
@@ -1552,11 +1592,11 @@
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
-                                    hour: 'HH:mm'
+                                    hour: isCompact() ? 'H' : 'HH:mm'
                                 }
                             },
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Time'
                             }
                         },
@@ -1564,7 +1604,7 @@
                             type: 'linear',
                             position: 'left',
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Temperature (\u00B0C)'
                             }
                         },
@@ -1574,7 +1614,7 @@
                             min: 0,
                             max: 100,
                             title: {
-                                display: true,
+                                display: !isCompact(),
                                 text: 'Humidity (%)'
                             },
                             grid: {
