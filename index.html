@@ -1082,7 +1082,7 @@
         }
 
         // Cache weather data so we can re-render on chart resize
-        let _weatherCache = { data: [], dateStr: '' };
+        let _weatherCache = { data: [], dateStr: '', observations: [] };
 
         async function fetchWeatherData(bomForecasts, dateStr) {
             let weatherData = [];
@@ -1102,7 +1102,7 @@
                     }
                 } catch (e) {}
             }
-            _weatherCache = { data: weatherData, dateStr };
+            _weatherCache = { data: weatherData, dateStr, observations: currentData || [] };
         }
 
         function renderWeatherStrip() {
@@ -1121,23 +1121,16 @@
             });
             if (dayForecasts.length === 0) { strip.innerHTML = ''; return; }
 
-            // Build hourly actual temps from CYC observations, keyed by local hour string
+            // Build hourly actual temps from CYC observations
+            // Key by hour in Canberra time, keep last observation for each hour
             const actualTemps = {};
-            if (currentData && currentData.length > 0) {
-                currentData.forEach(d => {
+            const obs = _weatherCache.observations;
+            if (obs && obs.length > 0) {
+                obs.forEach(d => {
                     if (d.temp_c == null) return;
-                    const t = new Date(d.time);
-                    const hourKey = t.toLocaleTimeString('en-AU', {
-                        timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false
-                    });
-                    const mins = parseInt(t.toLocaleTimeString('en-AU', {
-                        timeZone: 'Australia/Sydney', minute: 'numeric'
-                    }));
-                    // Keep observation closest to top of hour (within 30 mins)
-                    const dist = mins <= 30 ? mins : 60 - mins;
-                    if (!actualTemps[hourKey] || dist < actualTemps[hourKey].dist) {
-                        actualTemps[hourKey] = { temp: d.temp_c, dist };
-                    }
+                    // Get Canberra hour from the timestamp string (YYYY-MM-DD HH:MM:SS)
+                    const hour = parseInt(d.timestamp.split(' ')[1].split(':')[0]);
+                    actualTemps[hour] = d.temp_c;
                 });
             }
 
@@ -1161,11 +1154,11 @@
                 }).replace(' ', '');
                 const emoji = weatherEmoji(f.icon, f.is_night);
                 // Use actual CYC temp for past hours, forecast for future
-                const forecastHourKey = t.toLocaleTimeString('en-AU', {
+                const localHr = parseInt(t.toLocaleTimeString('en-AU', {
                     timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false
-                });
-                const actual = actualTemps[forecastHourKey];
-                const temp = actual ? `${Math.round(actual.temp)}°` :
+                }));
+                const actualTemp = actualTemps[localHr];
+                const temp = actualTemp != null ? `${Math.round(actualTemp)}°` :
                              f.temp != null ? `${Math.round(f.temp)}°` : '';
                 return `<div class="ws-hour" style="position:absolute;left:${px}px;transform:translateX(-50%)"><span class="ws-temp">${temp}</span><span class="ws-icon">${emoji}</span><span class="ws-time">${hour}</span></div>`;
             }).join('');
