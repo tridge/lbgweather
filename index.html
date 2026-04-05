@@ -295,6 +295,33 @@
         .model-checkbox.gem { border-color: #17a2b8; }
         .model-checkbox.jma { border-color: #e91e63; }
         .model-checkbox input:checked + span { font-weight: bold; }
+        /* Weather strip */
+        .weather-strip {
+            position: relative;
+            height: 52px;
+            overflow: hidden;
+        }
+        .weather-strip .ws-hour {
+            position: absolute;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-size: 11px;
+            color: #555;
+        }
+        .weather-strip .ws-temp {
+            font-weight: 600;
+            font-size: 12px;
+            color: #333;
+        }
+        .weather-strip .ws-icon {
+            font-size: 18px;
+            line-height: 1.2;
+        }
+        .weather-strip .ws-time {
+            font-size: 10px;
+            color: #999;
+        }
         @media (max-width: 600px) {
             .controls {
                 flex-direction: column;
@@ -497,6 +524,7 @@
 
         <div class="chart-container">
             <h3>Wind Speed</h3>
+            <div id="weatherStrip" class="weather-strip"></div>
             <div class="chart-wrapper">
                 <canvas id="windChart"></canvas>
             </div>
@@ -803,7 +831,11 @@
                     time: new Date(h.time),
                     wind_kt: h.wind?.speed_knot ?? null,
                     gust_kt: h.wind?.gust_speed_knot ?? null,
-                    wind_dir: compassToDeg(h.wind?.direction)
+                    wind_dir: compassToDeg(h.wind?.direction),
+                    temp: h.temp ?? null,
+                    icon: h.icon_descriptor ?? null,
+                    is_night: h.is_night ?? false,
+                    rain_chance: h.rain?.chance ?? null,
                 }));
             } catch (e) {
                 console.error('Failed to fetch BOM forecast:', e);
@@ -874,7 +906,11 @@
                         time: new Date(f.valid_time),
                         wind_kt: f.wind_kt,
                         gust_kt: f.gust_kt,
-                        wind_dir: f.wind_dir
+                        wind_dir: f.wind_dir,
+                        temp: f.temp ?? null,
+                        icon: f.icon ?? null,
+                        is_night: f.is_night ?? false,
+                        rain_chance: f.rain_chance ?? null,
                     })).filter(f => f.wind_kt !== null);
                 } catch (e) {
                     console.log(`No archived forecast for ${model} on ${dateStr}`);
@@ -994,11 +1030,92 @@
                     time: new Date(f.valid_time),
                     wind_kt: f.wind_kt,
                     gust_kt: f.gust_kt,
-                    wind_dir: f.wind_dir
+                    wind_dir: f.wind_dir,
+                    temp: f.temp ?? null,
+                    icon: f.icon ?? null,
+                    is_night: f.is_night ?? false,
+                    rain_chance: f.rain_chance ?? null,
                 })).filter(f => f.wind_kt !== null);
             } catch (e) {
                 return [];
             }
+        }
+
+        function weatherEmoji(icon, isNight) {
+            const map = {
+                'sunny': isNight ? '🌙' : '☀️',
+                'clear': isNight ? '🌙' : '☀️',
+                'mostly_sunny': isNight ? '🌙' : '🌤️',
+                'partly_cloudy': '⛅',
+                'cloudy': '☁️',
+                'overcast': '☁️',
+                'shower': '🌦️',
+                'rain': '🌧️',
+                'heavy_rain': '🌧️',
+                'storm': '⛈️',
+                'thunderstorm': '⛈️',
+                'fog': '🌫️',
+                'frost': '❄️',
+                'haze': '🌫️',
+                'wind': '💨',
+                'dust': '💨',
+            };
+            return map[icon] || '🌤️';
+        }
+
+        // Cache weather data so we can re-render on chart resize
+        let _weatherCache = { data: [], dateStr: '' };
+
+        async function fetchWeatherData(bomForecasts, dateStr) {
+            let weatherData = [];
+            if (bomForecasts && bomForecasts.length > 0 && bomForecasts[0].icon) {
+                weatherData = bomForecasts;
+            } else {
+                try {
+                    const resp = await fetch(BOM_HOURLY_API);
+                    if (resp.ok) {
+                        const data = await resp.json();
+                        weatherData = data.data.map(h => ({
+                            time: new Date(h.time),
+                            temp: h.temp ?? null,
+                            icon: h.icon_descriptor ?? null,
+                            is_night: h.is_night ?? false,
+                        }));
+                    }
+                } catch (e) {}
+            }
+            _weatherCache = { data: weatherData, dateStr };
+        }
+
+        function renderWeatherStrip() {
+            const strip = document.getElementById('weatherStrip');
+            if (!windChart || !_weatherCache.data.length) {
+                strip.innerHTML = '';
+                return;
+            }
+            const xScale = windChart.scales.x;
+            const chartArea = windChart.chartArea;
+            if (!chartArea) { strip.innerHTML = ''; return; }
+
+            const dayForecasts = _weatherCache.data.filter(f => {
+                const fDate = formatDate(new Date(f.time));
+                return fDate === _weatherCache.dateStr;
+            });
+            if (dayForecasts.length === 0) { strip.innerHTML = ''; return; }
+
+            // Position each hour using the chart's x-axis scale
+            strip.innerHTML = dayForecasts.map(f => {
+                const t = new Date(f.time);
+                const px = xScale.getPixelForValue(t.getTime());
+                // Skip if outside chart area
+                if (px < chartArea.left - 10 || px > chartArea.right + 10) return '';
+                const hour = t.toLocaleTimeString('en-AU', {
+                    timeZone: 'Australia/Sydney', hour: 'numeric', hour12: true
+                }).replace(' ', '');
+                const emoji = weatherEmoji(f.icon, f.is_night);
+                const temp = f.temp != null ? `${Math.round(f.temp)}°` : '';
+                return `<div class="ws-hour" style="position:absolute;left:${px}px;transform:translateX(-50%)"><span class="ws-temp">${temp}</span><span class="ws-icon">${emoji}</span><span class="ws-time">${hour}</span></div>`;
+            }).join('');
         }
 
         async function refreshForecasts() {
@@ -1006,6 +1123,7 @@
             const useLive = !isPastDate(dateStr) && !isFutureDate(dateStr);
             forecastData = useLive ? await fetchAllForecasts(dateStr) : await fetchArchivedForecasts(dateStr);
             if (currentData.length > 0 || Object.keys(forecastData).length > 0) {
+                await fetchWeatherData(forecastData.bom || [], dateStr);
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
             }
@@ -1195,7 +1313,11 @@
                                 }
                             }
                         }
-                    }
+                    },
+                    animation: {
+                        onComplete: () => renderWeatherStrip()
+                    },
+                    onResize: () => renderWeatherStrip()
                 }
             });
         }
@@ -1545,6 +1667,7 @@
                     clearStats();
                 }
 
+                await fetchWeatherData(forecastData.bom || [], dateStr);
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
                 showContent();

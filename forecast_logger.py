@@ -148,6 +148,10 @@ def fetch_bom_forecast():
             'wind_kt': wind.get('speed_knot'),
             'gust_kt': wind.get('gust_speed_knot'),
             'wind_dir': COMPASS_TO_DEG.get(direction) if direction else None,
+            'temp': entry.get('temp'),
+            'icon': entry.get('icon_descriptor'),
+            'is_night': entry.get('is_night', False),
+            'rain_chance': entry.get('rain', {}).get('chance'),
         })
 
     if forecasts:
