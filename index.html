@@ -1082,7 +1082,7 @@
         }
 
         // Cache weather data so we can re-render on chart resize
-        let _weatherCache = { data: [], dateStr: '', observations: [] };
+        let _weatherCache = { data: [], dateStr: '' };
 
         async function fetchWeatherData(bomForecasts, dateStr) {
             let weatherData = [];
@@ -1102,7 +1102,7 @@
                     }
                 } catch (e) {}
             }
-            _weatherCache = { data: weatherData, dateStr, observations: currentData || [] };
+            _weatherCache = { data: weatherData, dateStr };
         }
 
         function renderWeatherStrip() {
@@ -1124,14 +1124,14 @@
             // Build hourly actual temps from CYC observations
             // Key by hour in Canberra time, keep last observation for each hour
             const actualTemps = {};
-            const obs = _weatherCache.observations;
-            if (obs && obs.length > 0) {
-                obs.forEach(d => {
-                    if (d.temp_c == null) return;
-                    // Get Canberra hour from the timestamp string (YYYY-MM-DD HH:MM:SS)
-                    const hour = parseInt(d.timestamp.split(' ')[1].split(':')[0]);
-                    actualTemps[hour] = d.temp_c;
-                });
+            if (currentData && currentData.length > 0) {
+                for (const d of currentData) {
+                    if (d.temp_c == null || !d.timestamp) continue;
+                    const timePart = d.timestamp.split(' ')[1];
+                    if (!timePart) continue;
+                    const hour = parseInt(timePart.split(':')[0]);
+                    if (!isNaN(hour)) actualTemps[hour] = d.temp_c;
+                }
             }
 
             // Position each hour using the chart's x-axis scale
@@ -1158,9 +1158,11 @@
                     timeZone: 'Australia/Sydney', hour: 'numeric', hour12: false
                 }));
                 const actualTemp = actualTemps[localHr];
-                const temp = actualTemp != null ? `${Math.round(actualTemp)}°` :
-                             f.temp != null ? `${Math.round(f.temp)}°` : '';
-                return `<div class="ws-hour" style="position:absolute;left:${px}px;transform:translateX(-50%)"><span class="ws-temp">${temp}</span><span class="ws-icon">${emoji}</span><span class="ws-time">${hour}</span></div>`;
+                const isActual = actualTemp != null;
+                const tempVal = isActual ? Math.round(actualTemp) : (f.temp != null ? Math.round(f.temp) : null);
+                const temp = tempVal != null ? `${tempVal}°` : '';
+                const tempStyle = isActual ? 'color:#2c3e50' : 'color:#b0b0b0;font-style:italic';
+                return `<div class="ws-hour" style="position:absolute;left:${px}px;transform:translateX(-50%)"><span class="ws-temp" style="${tempStyle}">${temp}</span><span class="ws-icon">${emoji}</span><span class="ws-time">${hour}</span></div>`;
             }).join('');
         }
 
