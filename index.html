@@ -291,6 +291,7 @@
         .model-checkbox input {
             cursor: pointer;
         }
+        .model-checkbox.ecmwf { border-color: #0066cc; }
         .model-checkbox.bom { border-color: #9b59b6; }
         .model-checkbox.gfs { border-color: #27ae60; }
         .model-checkbox.icon { border-color: #e67e22; }
@@ -482,6 +483,10 @@
 
     <div class="model-selector">
         <label>Forecast Models:</label>
+        <label class="model-checkbox ecmwf">
+            <input type="checkbox" id="model-ecmwf">
+            <span>ECMWF</span>
+        </label>
         <label class="model-checkbox bom">
             <input type="checkbox" id="model-bom" checked>
             <span>BOM</span>
@@ -632,6 +637,7 @@
         <p>With thanks to <a href="https://canberrayc.com/weather.php" style="color: #3498db;">Canberra Yacht Club</a> for weather station data</p>
         <p style="margin-top: 10px; font-size: 0.85em;">
             Forecast models:
+            <a href="https://www.ecmwf.int/" style="color: #3498db;">ECMWF</a>,
             <a href="http://www.bom.gov.au/" style="color: #3498db;">BOM</a> (Australia),
             <a href="https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast" style="color: #3498db;">GFS</a> (NOAA),
             <a href="https://www.dwd.de/" style="color: #3498db;">ICON</a> (DWD),
@@ -654,6 +660,7 @@
 
         // Model configuration
         const MODELS = {
+            ecmwf: { name: 'ECMWF', color: '#0066cc', gustColor: '#004d99', omKey: 'ecmwf_ifs025' },
             bom: { name: 'BOM', color: '#9b59b6', gustColor: '#8e44ad' },
             gfs: { name: 'GFS', color: '#27ae60', gustColor: '#1e8449', omKey: 'gfs_seamless' },
             icon: { name: 'ICON', color: '#e67e22', gustColor: '#d35400', omKey: 'icon_seamless' },
@@ -888,7 +895,7 @@
             const results = {};
             const isPast = isPastDate(dateStr);
 
-            const models = ['bom', 'gfs', 'icon', 'gem', 'jma'];
+            const models = ['ecmwf', 'bom', 'gfs', 'icon', 'gem', 'jma'];
             const fetchPromises = models.map(async (model) => {
                 const url = `forecasts/archive/${year}/${month}/${day}_${model}.jsonl`;
                 try {

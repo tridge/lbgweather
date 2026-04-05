@@ -27,6 +27,7 @@ FORECAST_DAYS = 6  # Fetch up to 5 days ahead
 # Open-Meteo API for GFS, ICON, GEM, JMA
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_MODELS = {
+    'ecmwf': 'ecmwf_ifs025',
     'gfs': 'gfs_seamless',
     'icon': 'icon_seamless',
     'gem': 'gem_seamless',
