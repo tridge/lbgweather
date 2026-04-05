@@ -1121,8 +1121,26 @@
             });
             if (dayForecasts.length === 0) { strip.innerHTML = ''; return; }
 
+            // Build hourly actual temps from CYC observations (nearest to each hour)
+            const actualTemps = {};
+            if (currentData && currentData.length > 0) {
+                currentData.forEach(d => {
+                    if (d.temp_c == null) return;
+                    // Round to nearest hour
+                    const t = new Date(d.time);
+                    const rounded = new Date(t);
+                    rounded.setMinutes(t.getMinutes() >= 30 ? 60 : 0, 0, 0);
+                    const key = rounded.getTime();
+                    // Keep the observation closest to the hour
+                    if (!actualTemps[key] || Math.abs(t - rounded) < Math.abs(actualTemps[key].diff)) {
+                        actualTemps[key] = { temp: d.temp_c, diff: t - rounded };
+                    }
+                });
+            }
+
             // Position each hour using the chart's x-axis scale
             const compact = isCompact();
+            const now = new Date();
             strip.innerHTML = dayForecasts.map((f, i) => {
                 const t = new Date(f.time);
                 // On compact screens, show every 2nd hour to reduce crowding
@@ -1139,7 +1157,10 @@
                     timeZone: 'Australia/Sydney', hour: 'numeric', hour12: true
                 }).replace(' ', '');
                 const emoji = weatherEmoji(f.icon, f.is_night);
-                const temp = f.temp != null ? `${Math.round(f.temp)}°` : '';
+                // Use actual CYC temp for past hours, forecast for future
+                const actual = actualTemps[t.getTime()];
+                const temp = actual ? `${Math.round(actual.temp)}°` :
+                             f.temp != null ? `${Math.round(f.temp)}°` : '';
                 return `<div class="ws-hour" style="position:absolute;left:${px}px;transform:translateX(-50%)"><span class="ws-temp">${temp}</span><span class="ws-icon">${emoji}</span><span class="ws-time">${hour}</span></div>`;
             }).join('');
         }
