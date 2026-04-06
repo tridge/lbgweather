@@ -1259,24 +1259,31 @@
                 const { left, right, top, bottom } = chartArea;
 
                 const yZero = yScale.getPixelForValue(0);
-                const y30 = yScale.getPixelForValue(30);
-                const gradTop = Math.max(top, y30);
+                const yTop = top;
+                const range = yZero - yTop; // pixels from top to bottom of chart
 
-                const grad = ctx.createLinearGradient(0, yZero, 0, gradTop);
-                const stops = [
-                    [0,    'rgba(255, 255, 255, 0)'],
-                    [0.17, 'rgba(130, 200, 255, 0.30)'],
-                    [0.33, 'rgba(80, 200, 120, 0.35)'],
-                    [0.50, 'rgba(200, 220, 50, 0.35)'],
-                    [0.67, 'rgba(255, 180, 40, 0.40)'],
-                    [0.83, 'rgba(255, 120, 30, 0.40)'],
-                    [1.0,  'rgba(230, 50, 30, 0.45)'],
+                // Map kt values to gradient stop positions (0=bottom, 1=top of chart)
+                const yMax = yScale.max; // chart's actual Y maximum
+                function ktToStop(kt) { return Math.min(kt / yMax, 1); }
+
+                const grad = ctx.createLinearGradient(0, yZero, 0, yTop);
+                const colors = [
+                    [0,  'rgba(255, 255, 255, 0)'],
+                    [5,  'rgba(130, 200, 255, 0.30)'],
+                    [10, 'rgba(80, 200, 120, 0.35)'],
+                    [15, 'rgba(200, 220, 50, 0.35)'],
+                    [20, 'rgba(255, 180, 40, 0.40)'],
+                    [25, 'rgba(255, 120, 30, 0.40)'],
+                    [30, 'rgba(230, 50, 30, 0.45)'],
                 ];
-                stops.forEach(([pos, color]) => grad.addColorStop(pos, color));
+                colors.forEach(([kt, color]) => {
+                    const stop = ktToStop(kt);
+                    if (stop <= 1) grad.addColorStop(stop, color);
+                });
 
                 ctx.save();
                 ctx.fillStyle = grad;
-                ctx.fillRect(left, gradTop, right - left, yZero - gradTop);
+                ctx.fillRect(left, yTop, right - left, range);
                 ctx.restore();
             }
         };
