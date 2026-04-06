@@ -229,9 +229,13 @@ def check_and_notify(locations):
     """Compare with previous data, email if changed."""
     old_by_name = load_previous()
     if not old_by_name:
-        # First run, just save
+        # First run - send initial status report
         save_as_last(locations)
-        print("First run, saving baseline (no email)")
+        subject = "LBG Water Quality: Initial Status Report"
+        changes = [('new', loc['name'], None, loc) for loc in locations]
+        html = format_email_html(changes, locations)
+        send_email(subject, html)
+        print("First run, sent initial status report")
         return
 
     changes = find_changes(old_by_name, locations)
