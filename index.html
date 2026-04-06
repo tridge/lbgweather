@@ -263,40 +263,70 @@
             margin-top: 8px;
         }
         .model-selector {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            justify-content: center;
-            margin-bottom: 20px;
-            padding: 15px;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .model-picker {
+            position: relative;
+            display: inline-block;
+        }
+        .model-picker-label {
+            cursor: pointer;
+            font-size: 14px;
+            color: #555;
+            padding: 6px 12px;
+            background: white;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+            display: inline-block;
+            user-select: none;
+        }
+        .model-picker-label:hover {
+            border-color: #999;
+        }
+        .model-picker-label #modelPickerText {
+            font-weight: 600;
+            color: #333;
+        }
+        .model-picker-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            margin-top: 4px;
             background: white;
             border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+            padding: 8px 4px;
+            z-index: 50;
+            min-width: 160px;
         }
-        .model-selector label {
-            font-weight: 500;
-            color: #555;
-            margin-right: 10px;
+        .model-picker-dropdown.open {
+            display: block;
         }
         .model-checkbox {
-            display: inline-flex;
+            display: flex;
             align-items: center;
-            gap: 5px;
-            padding: 5px 10px;
+            gap: 6px;
+            padding: 6px 12px;
             border-radius: 4px;
             cursor: pointer;
             font-size: 14px;
-            border: 2px solid transparent;
+            border-left: 3px solid transparent;
+            white-space: nowrap;
+        }
+        .model-checkbox:hover {
+            background: #f5f5f5;
         }
         .model-checkbox input {
             cursor: pointer;
         }
-        .model-checkbox.ecmwf { border-color: #0066cc; }
-        .model-checkbox.bom { border-color: #9b59b6; }
-        .model-checkbox.gfs { border-color: #27ae60; }
-        .model-checkbox.icon { border-color: #e67e22; }
-        .model-checkbox.gem { border-color: #17a2b8; }
-        .model-checkbox.jma { border-color: #e91e63; }
+        .model-checkbox.ecmwf { border-left-color: #0066cc; }
+        .model-checkbox.bom { border-left-color: #9b59b6; }
+        .model-checkbox.gfs { border-left-color: #27ae60; }
+        .model-checkbox.icon { border-left-color: #e67e22; }
+        .model-checkbox.gem { border-left-color: #17a2b8; }
+        .model-checkbox.jma { border-left-color: #e91e63; }
         .model-checkbox input:checked + span { font-weight: bold; }
         /* Weather strip */
         .weather-strip {
@@ -482,37 +512,40 @@
     </div>
 
     <div class="model-selector">
-        <label>Forecast Models:</label>
-        <label class="model-checkbox ecmwf">
-            <input type="checkbox" id="model-ecmwf" checked>
-            <span>ECMWF</span>
-        </label>
-        <label class="model-checkbox bom">
-            <input type="checkbox" id="model-bom" checked>
-            <span>BOM</span>
-        </label>
-        <label class="model-checkbox gfs">
-            <input type="checkbox" id="model-gfs">
-            <span>GFS</span>
-        </label>
-        <label class="model-checkbox icon">
-            <input type="checkbox" id="model-icon">
-            <span>ICON</span>
-        </label>
-        <label class="model-checkbox gem">
-            <input type="checkbox" id="model-gem">
-            <span>GEM</span>
-        </label>
-        <label class="model-checkbox jma">
-            <input type="checkbox" id="model-jma">
-            <span>JMA</span>
-        </label>
-        <span style="margin-left: 15px; border-left: 1px solid #ddd; padding-left: 15px;">
-            <label style="cursor: pointer;">
-                <input type="checkbox" id="show-gusts" checked>
-                <span>Show Gusts</span>
-            </label>
-        </span>
+        <div class="model-picker">
+            <span class="model-picker-label" id="modelPickerLabel">Forecast: <span id="modelPickerText">BOM, ECMWF</span></span>
+            <div class="model-picker-dropdown" id="modelPickerDropdown">
+                <label class="model-checkbox ecmwf">
+                    <input type="checkbox" id="model-ecmwf" checked>
+                    <span>ECMWF</span>
+                </label>
+                <label class="model-checkbox bom">
+                    <input type="checkbox" id="model-bom" checked>
+                    <span>BOM</span>
+                </label>
+                <label class="model-checkbox gfs">
+                    <input type="checkbox" id="model-gfs">
+                    <span>GFS</span>
+                </label>
+                <label class="model-checkbox icon">
+                    <input type="checkbox" id="model-icon">
+                    <span>ICON</span>
+                </label>
+                <label class="model-checkbox gem">
+                    <input type="checkbox" id="model-gem">
+                    <span>GEM</span>
+                </label>
+                <label class="model-checkbox jma">
+                    <input type="checkbox" id="model-jma">
+                    <span>JMA</span>
+                </label>
+                <hr style="margin: 4px 0; border: none; border-top: 1px solid #eee;">
+                <label class="model-checkbox" style="border-color: transparent;">
+                    <input type="checkbox" id="show-gusts" checked>
+                    <span>Show Gusts</span>
+                </label>
+            </div>
+        </div>
     </div>
 
     <div id="error" class="error" style="display: none;"></div>
@@ -805,7 +838,7 @@
                     return ['bom'];
                 }
             }
-            return ['bom']; // Default to BOM only
+            return ['ecmwf', 'bom']; // Default
         }
 
         function saveSelectedModels(models) {
@@ -821,6 +854,16 @@
             localStorage.setItem('showGusts', show);
         }
 
+        function updateModelPickerText() {
+            const selected = Object.keys(MODELS).filter(m =>
+                document.getElementById(`model-${m}`)?.checked
+            );
+            const text = selected.length > 0
+                ? selected.map(m => MODELS[m].name).join(', ')
+                : 'None';
+            document.getElementById('modelPickerText').textContent = text;
+        }
+
         function initModelCheckboxes() {
             const selected = getSelectedModels();
             Object.keys(MODELS).forEach(model => {
@@ -832,10 +875,29 @@
                             document.getElementById(`model-${m}`)?.checked
                         );
                         saveSelectedModels(newSelected);
+                        updateModelPickerText();
                         await refreshForecasts();
                     });
                 }
             });
+
+            // Dropdown toggle
+            const label = document.getElementById('modelPickerLabel');
+            const dropdown = document.getElementById('modelPickerDropdown');
+            label.addEventListener('click', (e) => {
+                dropdown.classList.toggle('open');
+                e.stopPropagation();
+            });
+            // Close on click outside
+            document.addEventListener('click', (e) => {
+                if (!dropdown.contains(e.target)) {
+                    dropdown.classList.remove('open');
+                }
+            });
+            // Prevent dropdown from closing when clicking checkboxes
+            dropdown.addEventListener('click', (e) => e.stopPropagation());
+
+            updateModelPickerText();
 
             // Initialize gust checkbox
             const gustCheckbox = document.getElementById('show-gusts');
