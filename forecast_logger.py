@@ -101,8 +101,12 @@ def fetch_open_meteo_forecasts():
             wind_dir = dirs[i] if i < len(dirs) else None
 
             if wind_kt is not None:
+                # Convert Canberra local time to UTC
+                local_dt = datetime.strptime(t, '%Y-%m-%dT%H:%M').replace(tzinfo=CANBERRA_TZ)
+                utc_dt = local_dt.astimezone(timezone.utc)
+                valid_time_utc = utc_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
                 forecasts.append({
-                    'valid_time': t,
+                    'valid_time': valid_time_utc,
                     'wind_kt': wind_kt,
                     'gust_kt': gust_kt,
                     'wind_dir': wind_dir,
