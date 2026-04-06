@@ -1249,6 +1249,7 @@
         }
 
         // Plugin to draw a white-to-red gradient background on the wind chart
+        // Gradient intensity is based on absolute wind speed (30 kt = full red)
         const windGradientBg = {
             id: 'windGradientBg',
             beforeDraw(chart) {
@@ -1256,22 +1257,32 @@
                 if (!chartArea || !scales.y) return;
                 const yScale = scales.y;
                 const { left, right, top, bottom } = chartArea;
-
-                // Draw gradient from bottom (0 kt = white) to top (30 kt = red)
-                const maxKt = 30;
-                const yMax = yScale.getPixelForValue(maxKt);
                 const yZero = yScale.getPixelForValue(0);
-                const gradTop = Math.max(top, yMax);
 
-                const grad = ctx.createLinearGradient(0, yZero, 0, gradTop);
-                grad.addColorStop(0, 'rgba(255, 255, 255, 0)');
-                grad.addColorStop(0.3, 'rgba(255, 200, 150, 0.08)');
-                grad.addColorStop(0.6, 'rgba(255, 130, 80, 0.12)');
-                grad.addColorStop(1, 'rgba(230, 50, 20, 0.18)');
+                // Draw bands at fixed kt thresholds
+                const bands = [
+                    { kt: 5,  color: 'rgba(255, 220, 180, 0.06)' },
+                    { kt: 10, color: 'rgba(255, 180, 120, 0.08)' },
+                    { kt: 15, color: 'rgba(255, 140, 80, 0.10)' },
+                    { kt: 20, color: 'rgba(240, 100, 50, 0.13)' },
+                    { kt: 25, color: 'rgba(230, 70, 30, 0.16)' },
+                    { kt: 30, color: 'rgba(220, 40, 20, 0.19)' },
+                ];
 
                 ctx.save();
-                ctx.fillStyle = grad;
-                ctx.fillRect(left, gradTop, right - left, yZero - gradTop);
+                let prevY = yZero;
+                for (const band of bands) {
+                    const bandY = yScale.getPixelForValue(band.kt);
+                    if (bandY >= bottom) continue; // below chart
+                    const clampedY = Math.max(bandY, top);
+                    const clampedPrev = Math.min(prevY, bottom);
+                    if (clampedY < clampedPrev) {
+                        ctx.fillStyle = band.color;
+                        ctx.fillRect(left, clampedY, right - left, clampedPrev - clampedY);
+                    }
+                    prevY = bandY;
+                    if (bandY <= top) break; // above chart
+                }
                 ctx.restore();
             }
         };
