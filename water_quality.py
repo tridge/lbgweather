@@ -15,7 +15,7 @@ import re
 import sys
 import json
 import os
-import smtplib
+import subprocess
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
@@ -211,16 +211,22 @@ def format_email_html(changes, all_locations):
 
 
 def send_email(subject, html_body):
-    """Send an HTML email via local sendmail."""
+    """Send an HTML email via sendmail."""
     msg = MIMEText(html_body, 'html')
     msg['Subject'] = subject
-    msg['From'] = 'water-quality@lbgweather.au'
+    msg['From'] = 'water-quality@wstracker.org'
     msg['To'] = NOTIFY_EMAIL
 
     try:
-        with smtplib.SMTP('localhost') as smtp:
-            smtp.send_message(msg)
-        print(f"Email sent to {NOTIFY_EMAIL}")
+        proc = subprocess.run(
+            ['/usr/sbin/sendmail', '-t'],
+            input=msg.as_string(),
+            capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode == 0:
+            print(f"Email sent to {NOTIFY_EMAIL}")
+        else:
+            print(f"sendmail failed: {proc.stderr}", file=sys.stderr)
     except Exception as e:
         print(f"Failed to send email: {e}", file=sys.stderr)
 
