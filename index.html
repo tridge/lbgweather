@@ -637,7 +637,7 @@
             </div>
         </div>
 
-        <div class="chart-container" id="water-quality-section">
+        <div class="chart-container" id="water-quality">
             <h3>Lake Water Quality
                 <small style="font-weight: normal; color: #7f8c8d; font-size: 0.6em;">
                     <a href="https://www.nca.gov.au/environment/lake-burley-griffin/water-quality"
@@ -1976,17 +1976,17 @@
         // Ellipse definitions in 1439x725 image space: {cx, cy, rx, ry, angle}
         // Edit with ellipse_editor.html then paste exported values here.
         const WQ_ELLIPSES = {
-            'East Basin':                {cx: 1160, cy: 538, rx: 95, ry: 88, angle: -15},
-            'Central Basin':             {cx: 1017, cy: 332, rx: 135, ry: 92, angle: 36},
-            'West Basin (Ferry Terminal)':{cx: 820, cy: 247, rx: 70, ry: 74, angle: -5},
-            'Lotus Bay':                 {cx: 770, cy: 422, rx: 46, ry: 43, angle: 0},
-            'Acton West':                {cx: 693, cy: 223, rx: 52, ry: 42, angle: 56},
-            'Yarralumla Beach':          {cx: 554, cy: 406, rx: 35, ry: 32, angle: 15},
-            'Yarralumla Beach East':     {cx: 584, cy: 375, rx: 35, ry: 30, angle: 10},
-            'Yarralumla Bay':            {cx: 495, cy: 425, rx: 42, ry: 32, angle: 84},
-            'Black Mountain Beach':      {cx: 489, cy: 240, rx: 40, ry: 56, angle: 5},
-            'Weston Park East':          {cx: 408, cy: 285, rx: 76, ry: 26, angle: -65},
-            'Weston Park West':          {cx: 360, cy: 256, rx: 32, ry: 67, angle: 36},
+            'East Basin':                       {cx: 1160, cy: 538, rx: 95, ry: 88, angle: -15},
+            'Central Basin':                    {cx: 1017, cy: 332, rx: 131, ry: 74, angle: 36},
+            'West Basin (Ferry Terminal)':      {cx: 820, cy: 247, rx: 64, ry: 64, angle: -5},
+            'Lotus Bay':                        {cx: 770, cy: 422, rx: 32, ry: 33, angle: 0},
+            'Acton West':                       {cx: 693, cy: 223, rx: 50, ry: 32, angle: 56},
+            'Yarralumla Beach':                 {cx: 558, cy: 411, rx: 17, ry: 30, angle: 61},
+            'Yarralumla Beach East':            {cx: 584, cy: 375, rx: 17, ry: 20, angle: 10},
+            'Yarralumla Bay':                   {cx: 499, cy: 435, rx: 28, ry: 22, angle: 84},
+            'Black Mountain Beach':             {cx: 481, cy: 255, rx: 24, ry: 46, angle: 5},
+            'Weston Park East':                 {cx: 407, cy: 279, rx: 72, ry: 20, angle: -65},
+            'Weston Park West':                 {cx: 361, cy: 255, rx: 26, ry: 67, angle: 36},
         };
 
         function getStatusColor(status) {
@@ -2195,6 +2195,12 @@
             loadForecast();
             loadWaterQuality();
             await loadData(today);
+
+            // Scroll to hash target after async content has loaded
+            if (window.location.hash) {
+                const el = document.querySelector(window.location.hash);
+                if (el) el.scrollIntoView({ behavior: 'smooth' });
+            }
         });
     </script>
 </body>
