@@ -24,7 +24,18 @@ NCA_URL = "https://www.nca.gov.au/environment/lake-burley-griffin/water-quality"
 JSON_OUTPUT = "water_quality.json"
 LAST_OUTPUT = "last_water_quality.json"
 YARRALUMLA_OUTPUT = "yarralumla_bay.html"
-NOTIFY_EMAIL = "tridge60@gmail.com"
+EMAIL_LIST_FILE = "notify_emails.txt"
+
+
+def load_notify_emails():
+    """Load notification addresses from EMAIL_LIST_FILE, one per line."""
+    try:
+        with open(EMAIL_LIST_FILE) as f:
+            return [line.strip() for line in f
+                    if line.strip() and not line.startswith('#')]
+    except FileNotFoundError:
+        print(f"{EMAIL_LIST_FILE} not found, no email sent", file=sys.stderr)
+        return []
 
 
 def fetch_water_quality():
@@ -212,10 +223,13 @@ def format_email_html(changes, all_locations):
 
 def send_email(subject, html_body):
     """Send an HTML email via sendmail."""
+    recipients = load_notify_emails()
+    if not recipients:
+        return
     msg = MIMEText(html_body, 'html')
     msg['Subject'] = subject
     msg['From'] = 'water-quality@wstracker.org'
-    msg['To'] = NOTIFY_EMAIL
+    msg['To'] = ', '.join(recipients)
 
     try:
         proc = subprocess.run(
@@ -224,7 +238,7 @@ def send_email(subject, html_body):
             capture_output=True, text=True, timeout=30
         )
         if proc.returncode == 0:
-            print(f"Email sent to {NOTIFY_EMAIL}")
+            print(f"Email sent to {msg['To']}")
         else:
             print(f"sendmail failed: {proc.stderr}", file=sys.stderr)
     except Exception as e:
