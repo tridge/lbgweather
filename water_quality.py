@@ -31,8 +31,9 @@ def load_notify_emails():
     """Load notification addresses from EMAIL_LIST_FILE, one per line."""
     try:
         with open(EMAIL_LIST_FILE) as f:
-            return [line.strip() for line in f
-                    if line.strip() and not line.startswith('#')]
+            lines = [line.strip() for line in f]
+            return [line for line in lines
+                    if line and not line.startswith('#')]
     except FileNotFoundError:
         print(f"{EMAIL_LIST_FILE} not found, no email sent", file=sys.stderr)
         return []
@@ -222,10 +223,10 @@ def format_email_html(changes, all_locations):
 
 
 def send_email(subject, html_body):
-    """Send an HTML email via sendmail."""
+    """Send an HTML email via sendmail. Returns True on success."""
     recipients = load_notify_emails()
     if not recipients:
-        return
+        return False
     msg = MIMEText(html_body, 'html')
     msg['Subject'] = subject
     msg['From'] = 'water-quality@wstracker.org'
@@ -239,10 +240,11 @@ def send_email(subject, html_body):
         )
         if proc.returncode == 0:
             print(f"Email sent to {msg['To']}")
-        else:
-            print(f"sendmail failed: {proc.stderr}", file=sys.stderr)
+            return True
+        print(f"sendmail failed: {proc.stderr}", file=sys.stderr)
     except Exception as e:
         print(f"Failed to send email: {e}", file=sys.stderr)
+    return False
 
 
 def check_and_notify(locations):
@@ -250,12 +252,13 @@ def check_and_notify(locations):
     old_by_name = load_previous()
     if not old_by_name:
         # First run - send initial status report
-        save_as_last(locations)
         subject = "LBG Water Quality: Initial Status Report"
         changes = [('new', loc['name'], None, loc) for loc in locations]
         html = format_email_html(changes, locations)
-        send_email(subject, html)
-        print("First run, sent initial status report")
+        # only save state if the email went out, so failures retry next run
+        if send_email(subject, html):
+            save_as_last(locations)
+            print("First run, sent initial status report")
         return
 
     changes = find_changes(old_by_name, locations)
@@ -283,8 +286,9 @@ def check_and_notify(locations):
         subject = f"LBG Water Quality: {len(changes)} update(s)"
 
     html = format_email_html(changes, locations)
-    send_email(subject, html)
-    save_as_last(locations)
+    # only save state if the email went out, so failures retry next run
+    if send_email(subject, html):
+        save_as_last(locations)
 
 
 def main():
