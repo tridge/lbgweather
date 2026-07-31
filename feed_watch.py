@@ -110,8 +110,14 @@ def fmt_age(seconds):
     return '%dh %dm' % (seconds // 3600, (seconds % 3600) // 60)
 
 
-def evaluate(status, now):
-    """Return (severity, [problems]). severity in 'ok' | 'warn' | 'alarm'."""
+def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S):
+    """Return (severity, [problems]). severity in 'ok' | 'warn' | 'alarm'.
+
+    Thresholds are arguments because the right values depend on the feed's
+    cadence: the cloud path updates roughly every 15 minutes, the direct serial
+    collector every minute. A threshold tighter than the cadence leaves the
+    watchdog permanently in 'warn', which trains everyone to ignore it.
+    """
     problems = []
     severity = 'ok'
 
@@ -120,14 +126,14 @@ def evaluate(status, now):
         return 'alarm', ['no observation has ever been recorded']
 
     age = now - last_obs
-    if age > ALARM_AGE_S:
+    if age > alarm_age:
         severity = 'alarm'
         problems.append('feed is %s old (alarm above %s)'
-                        % (fmt_age(age), fmt_age(ALARM_AGE_S)))
-    elif age > WARN_AGE_S:
+                        % (fmt_age(age), fmt_age(alarm_age)))
+    elif age > warn_age:
         severity = 'warn'
         problems.append('feed is %s old (warn above %s)'
-                        % (fmt_age(age), fmt_age(WARN_AGE_S)))
+                        % (fmt_age(age), fmt_age(warn_age)))
 
     skew = status.get('clock_skew_s')
     if isinstance(skew, int) and abs(skew) > SKEW_WARN_S:
@@ -203,6 +209,12 @@ def main(argv=None):
                    help='status document written by the producer')
     p.add_argument('--state', default='feedwatch_state.json',
                    help='episode state, so alerts have hysteresis')
+    p.add_argument('--warn-age', type=int, default=WARN_AGE_S,
+                   help='seconds of observation age before warning '
+                        '(default %d; use ~1200 for the 15-min cloud feed, '
+                        '~180 for the 1-min direct collector)' % WARN_AGE_S)
+    p.add_argument('--alarm-age', type=int, default=ALARM_AGE_S,
+                   help='seconds before alarming (default %d)' % ALARM_AGE_S)
     p.add_argument('--no-mail', action='store_true',
                    help='evaluate and print, send nothing (for testing)')
     p.add_argument('--quiet', action='store_true')
@@ -224,7 +236,7 @@ def main(argv=None):
         status['age_refreshed_at_epoch'] = int(now)
         save_json_atomic(args.status, status)
 
-    severity, problems = evaluate(status, now)
+    severity, problems = evaluate(status, now, args.warn_age, args.alarm_age)
     state = load_json(args.state, {}) or {}
     in_episode = bool(state.get('in_episode'))
     last_mail = state.get('last_mail_epoch', 0)
