@@ -6,9 +6,12 @@ manufactures a CSV row every minute whether or not the station is alive -- it
 stamps rows with datetime.now() and discards the feed's own timestamp, so a dead
 station and a healthy one produce identical-looking files.
 
-This watches the observation's *real* age and shouts. It also refreshes the
-status document's obs_age_s each run, so a dead producer shows a growing age
-rather than a frozen one.
+This watches the observation's *real* age and shouts. It does NOT write to the
+status document: that file belongs to whoever produces it, and a read-modify-
+write from here would race the producer and could republish a stale snapshot.
+Freshness is the producer's job -- cyc_ingest heartbeats its own status, and
+wind_logger rewrites its own every minute. What this writes is its own verdict,
+alongside the status file, for anything that wants the health view.
 
 Run from wind.cron every minute:
 
@@ -157,7 +160,9 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
         severity = 'alarm' if severity == 'alarm' else 'warn'
         problems.append('%d observations lost in transit (sequence gaps)' % gaps)
 
-    auth = status.get('auth_failures_1h')
+    # Key name must track the receiver's. It was renamed on one side only
+    # once, and authentication failures became invisible here.
+    auth = status.get('auth_failures_recent')
     if isinstance(auth, int) and auth > AUTH_FAIL_WARN:
         severity = 'alarm' if severity == 'alarm' else 'warn'
         problems.append('%d authentication failures in the last hour '
@@ -229,14 +234,38 @@ def main(argv=None):
                    help='seconds between observation and receipt before '
                         'warning (default %d; the cloud shadow path runs ~900s '
                         'so use a high value there)' % LAG_WARN_S)
+    p.add_argument('--marker', default=None,
+                   help='armed marker; defaults to <state>.armed. Once written, '
+                        'a missing status document is an alarm even if the '
+                        'state file is lost')
+    p.add_argument('--armed', action='store_true',
+                   help='force armed, regardless of the marker')
+    p.add_argument('--health-out', default=None,
+                   help='write the health verdict here (default '
+                        '<status dir>/feed_health.json); the status document '
+                        'itself is never modified')
     p.add_argument('--no-mail', action='store_true',
                    help='evaluate and print, send nothing (for testing)')
     p.add_argument('--quiet', action='store_true')
     args = p.parse_args(argv)
+    if args.marker is None:
+        args.marker = args.state + '.armed'
+    if args.health_out is None:
+        args.health_out = os.path.join(os.path.dirname(args.status) or '.',
+                                       'feed_health.json')
 
     now = time.time()
     state = load_json(args.state, {}) or {}
     status = load_json(args.status)
+
+    # Losing the state file must not disarm the watchdog. The marker is a
+    # separate, never-rewritten file: if the state JSON is deleted or corrupted
+    # while the marker stands, we are still armed and a missing status document
+    # is still an alarm. Otherwise the two files that prove a fault -- status
+    # and state -- could vanish together and buy permanent silence.
+    armed = args.armed or os.path.exists(args.marker)
+    if armed:
+        state['ever_seen_status'] = True
 
     if status is None:
         # Before first deployment this is normal and silence is right. Once we
@@ -253,15 +282,21 @@ def main(argv=None):
             'status document %s has disappeared or is unreadable' % args.status]
     else:
         state['ever_seen_status'] = True
+        if not os.path.exists(args.marker):
+            try:
+                fd = os.open(args.marker,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'w') as f:
+                    f.write('armed %s\n' % datetime.fromtimestamp(now, TZ)
+                            .isoformat(timespec='seconds'))
+            except FileExistsError:
+                pass          # another instance armed first; fine
+            except OSError as e:
+                print('could not write armed marker: %s' % e, file=sys.stderr)
         severity = None
         problems = None
 
-    # Refresh the derived age so a dead producer shows a growing number.
     last_obs = status.get('last_obs_epoch')
-    if last_obs is not None:
-        status['obs_age_s'] = int(now - last_obs)
-        status['age_refreshed_at_epoch'] = int(now)
-        save_json_atomic(args.status, status)
 
     if severity is None:
         severity, problems = evaluate(status, now, args.warn_age,
@@ -327,6 +362,20 @@ def main(argv=None):
     state['last_severity'] = severity
     state['last_check_epoch'] = int(now)
     save_json_atomic(args.state, state, mode=0o600)
+
+    # Our own verdict, in our own file. Consumers that want a live age read
+    # obs_age_s here; the producer's status document is left untouched.
+    save_json_atomic(args.health_out, {
+        'checked_at': datetime.fromtimestamp(now, TZ)
+                              .isoformat(timespec='seconds'),
+        'checked_at_epoch': int(now),
+        'severity': severity,
+        'problems': problems or [],
+        'obs_age_s': None if last_obs is None else int(now - last_obs),
+        'last_obs_epoch': last_obs,
+        'status_source': args.status,
+        'in_episode': bool(state.get('in_episode')),
+    })
 
     return 0
 

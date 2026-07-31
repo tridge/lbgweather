@@ -51,13 +51,25 @@ class Watch:
         if os.path.exists(self.status):
             os.unlink(self.status)
 
-    def run(self, *args):
+    def run(self, *args, expect_rc=0):
         r = subprocess.run(
             [sys.executable, 'feed_watch.py', '--status', self.status,
              '--state', self.state, '--no-mail', '--warn-age', '600',
              '--alarm-age', '1800'] + list(args),
             cwd=self.d, capture_output=True, text=True, timeout=30)
+        # A crashed watchdog prints nothing and every "did it mail?" assertion
+        # then passes for the wrong reason. Fail loudly on a bad exit instead.
+        if r.returncode != expect_rc:
+            check(False, 'feed_watch exited %d (want %d): %s'
+                  % (r.returncode, expect_rc, r.stderr.strip()[:400]))
         return r.stdout
+
+    def health(self):
+        try:
+            with open(os.path.join(self.d, 'feed_health.json')) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
 
     def mailed(self, out):
         return 'would mail' in out
@@ -163,11 +175,71 @@ def test_lag_threshold_is_per_source():
               'same lag is ok when the threshold suits the source')
 
 
+
+def test_auth_failure_key_matches_the_receiver():
+    print('\n== the auth-failure field name tracks the receiver ==')
+    import cyc_ingest  # noqa: F401  - just to assert the module is importable
+    with Watch() as w:
+        w.set_age(60, auth_failures_recent=50)
+        out = w.run()
+        check('authentication failures' in out,
+              'auth_failures_recent is read (the receiver writes this name)')
+        w.set_age(60, auth_failures_1h=50)
+        out = w.run()
+        check('authentication failures' not in out,
+              'the old name is not silently accepted as an alias')
+
+
+def test_status_document_is_never_modified():
+    print('\n== the producer owns the status document ==')
+    with Watch() as w:
+        w.set_age(60)
+        before = open(w.status, 'rb').read()
+        w.run()
+        after = open(w.status, 'rb').read()
+        check(before == after,
+              'status.json is byte-identical after a check - no read-modify-'
+              'write race with the producer')
+        h = w.health()
+        check(h.get('obs_age_s') is not None and h.get('severity') == 'ok',
+              'the live age is published in our own file instead')
+
+
+def test_losing_the_state_file_does_not_disarm():
+    print('\n== losing the state file must not buy silence ==')
+    with Watch() as w:
+        w.set_age(60)
+        w.run()                                  # arms
+        check(os.path.exists(w.state + '.armed'), 'armed marker written')
+
+        # Both files that prove a fault vanish together: the producer dies and
+        # takes status.json with it, and the state file is lost too.
+        w.remove_status()
+        os.unlink(w.state)
+        out = w.run()
+        check(w.mailed(out),
+              'still alarms on a missing status document after the state file '
+              'was lost')
+
+
+def test_marker_absent_means_never_deployed():
+    print('\n== a genuinely fresh install stays quiet ==')
+    with Watch() as w:
+        out = w.run()
+        check(not w.mailed(out), 'no status, no marker -> silence')
+        check(not os.path.exists(w.state + '.armed'),
+              'and we do not arm ourselves without ever seeing a status')
+
+
 def main():
     for fn in [test_episode_lifecycle, test_episode_survives_a_dip_to_warn,
                test_undelivered_alarm_is_not_discarded,
                test_future_dated_is_an_alarm, test_missing_status,
-               test_lag_threshold_is_per_source]:
+               test_lag_threshold_is_per_source,
+               test_auth_failure_key_matches_the_receiver,
+               test_status_document_is_never_modified,
+               test_losing_the_state_file_does_not_disarm,
+               test_marker_absent_means_never_deployed]:
         fn()
     print()
     if FAILURES:
