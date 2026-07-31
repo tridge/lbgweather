@@ -15,8 +15,9 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, DayFiles, StoreError, CorruptionError,  # noqa: E402
-                       parse_obs_ts, utc_key, CSV_FIELDS)
+                       LockTimeout, parse_obs_ts, utc_key, CSV_FIELDS)
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 FAILURES = []
 
 
@@ -214,8 +215,12 @@ def test_legacy_adoption_dst_fold():
     with Tmp() as t:
         f = DayFiles(t.logs, 2026, 4, 5)
         f.ensure_dir()
+        # Like the real file, this starts well before the fold, so the fold
+        # IS resolvable by order. A file that *begins* inside the repeated
+        # hour is refused instead -- see the impossible-local-times test.
         body = ('timestamp,wind_kt,wind_avg_kt,wind_dir,wind_gust_kt,'
                 'temp_c,humidity\r\n'
+                '2026-04-05 01:59:03,1.0,0.0,150,1.0,10.7,84\r\n'
                 '2026-04-05 02:00:03,0.9,0.0,153,0.9,10.5,85\r\n'
                 '2026-04-05 02:00:03,0.0,0.0,157,0.9,9.7,87\r\n')
         with open(f.csv, 'w', newline='') as fh:
@@ -223,12 +228,15 @@ def test_legacy_adoption_dst_fold():
         s = t.store()
         n = 0
         with s._DayLock(t.state, f.key):
-            n = s.adopt_legacy_csv(f)
-        check(n == 2, 'both fold rows adopted')
+            n = s.adopt_legacy_csv(f, 2026, 4, 5)
+        check(n == 3, 'all rows adopted including both folds')
         recs = s._read_jsonl(f)
         keys = sorted(int(r['utc']) for r in recs)
-        check(len(set(keys)) == 2, 'distinct UTC instants derived')
-        check(keys[1] - keys[0] == 3600, 'exactly one hour apart')
+        check(len(set(keys)) == 3, 'distinct UTC instants derived')
+        fold_keys = [k for k, r in zip(keys, sorted(recs, key=lambda x: x['utc']))
+                     if r['local'].endswith('02:00:03')]
+        check(len(fold_keys) == 2 and fold_keys[1] - fold_keys[0] == 3600,
+              'the two 02:00:03 rows are exactly one hour apart')
 
 
 def test_torn_tail():
@@ -329,8 +337,9 @@ def test_reconcile_all_at_startup():
         s.put([obs('2026-07-31T10:00:03+10:00')])
         old = DayFiles(t.logs, 2026, 7, 29)
         os.unlink(old.csv)                       # crash after JSONL, before CSV
-        repaired = t.store().reconcile_all()
+        repaired, errors = t.store().reconcile_all()
         check('2026-07-29' in repaired, 'stale day repaired at startup')
+        check(not errors, 'no errors reported')
         check(os.path.exists(old.csv), 'CSV rebuilt')
 
 
@@ -346,15 +355,268 @@ def test_last_observation_after_backfill():
 
 
 def test_stale_index_across_processes():
-    print('\n== a second Store sees the first one writes ==')
+    print('\n== a second Store sees the first one\'s writes ==')
     with Tmp() as t:
         a1 = t.store()
         b1 = t.store()
-        a1.put([obs('2026-07-31T10:00:03+10:00')])
-        b1.put([obs('2026-07-31T10:00:03+10:00')])   # b has a stale cache
         f = DayFiles(t.logs, 2026, 7, 31)
-        check(len(t.store()._read_jsonl(f)) == 1,
-              'no duplicate written despite the second cache being cold')
+
+        # WARM b's cache first. With a cold cache b would read the file anyway
+        # and the test would pass without the signature check existing at all.
+        b1.put([obs('2026-07-31T09:00:00+10:00')])
+        check(len(b1._load_index(f)) == 1, 'b holds a real cached index')
+
+        a1.put([obs('2026-07-31T10:00:03+10:00')])   # b's cache is now STALE
+        b1.put([obs('2026-07-31T10:00:03+10:00')])
+        recs = t.store()._read_jsonl(f)
+        check(len(recs) == 2,
+              'no duplicate written despite b holding a stale cached index '
+              '(got %d records)' % len(recs))
+
+        # And the reverse direction: a must see b's earlier write too.
+        a1.put([obs('2026-07-31T09:00:00+10:00')])
+        check(len(t.store()._read_jsonl(f)) == 2,
+              'a does not re-add the record b wrote before it')
+
+
+
+def write_csv(f, rows, header=True):
+    f.ensure_dir()
+    body = ''
+    if header:
+        body += ','.join(CSV_FIELDS) + '\r\n'
+    body += ''.join(rows)
+    with open(f.csv, 'w', newline='') as fh:
+        fh.write(body)
+
+
+def legacy_row(stamp, wind='1.7'):
+    return '%s,%s,1.7,44,3.4,12.0,60\r\n' % (stamp, wind)
+
+
+def test_adoption_is_atomic():
+    print('\n== an interrupted adoption does not lose the legacy CSV ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        write_csv(f, [legacy_row('2026-07-31 09:%02d:00' % i) for i in range(5)])
+        original = read(f.csv)
+
+        s = t.store()
+        real = s._parse_legacy_csv
+
+        def boom(files, y, m, d):
+            recs = real(files, y, m, d)
+            raise OSError(28, 'No space left on device')
+
+        s._parse_legacy_csv = boom
+        try:
+            s.put([obs('2026-07-31T10:00:03+10:00')])
+        except OSError:
+            pass
+        check(not os.path.exists(f.jsonl),
+              'no partial JSONL left behind by the failed adoption')
+        check(read(f.csv) == original, 'legacy CSV untouched')
+
+        # The retry must adopt the WHOLE file, not a prefix.
+        s2 = t.store()
+        a, _, _, _, _ = s2.put([obs('2026-07-31T10:00:03+10:00')])
+        check(a == 1, 'retry accepted the new observation')
+        rows = lines(f.csv)[1:]
+        check(len(rows) == 6, 'all 5 legacy rows survived plus the new one (%d)'
+              % len(rows))
+
+
+def test_adoption_rejects_damaged_input():
+    print('\n== damaged legacy CSV is refused, never partially imported ==')
+    cases = [
+        ([], True, 'header only, no rows'),
+        ([legacy_row('2026-07-31 09:00:00')], False, 'missing header'),
+        (['2026-07-31 09:00:00,1.7,1.7\r\n'], True, 'short row'),
+        ([',1.7,1.7,44,3.4,12.0,60\r\n'], True, 'blank timestamp'),
+        ([legacy_row('not a time')], True, 'unparseable timestamp'),
+        ([legacy_row('2026-07-30 09:00:00')], True, 'row from another day'),
+        ([legacy_row('2026-07-31 09:05:00'),
+          legacy_row('2026-07-31 09:00:00')], True, 'non-monotonic rows'),
+    ]
+    for rows, header, label in cases:
+        with Tmp() as t:
+            f = DayFiles(t.logs, 2026, 7, 31)
+            write_csv(f, rows, header=header)
+            before = read(f.csv)
+            s = t.store()
+            raised = False
+            try:
+                s.put([obs('2026-07-31T10:00:03+10:00')])
+            except CorruptionError:
+                raised = True
+            check(raised, '%s -> CorruptionError' % label)
+            check(read(f.csv) == before, '  %s: CSV untouched' % label)
+            check(not os.path.exists(f.jsonl), '  %s: no JSONL written' % label)
+
+
+def test_adoption_rejects_impossible_local_times():
+    print('\n== spring-forward gap and an unresolvable leading fold ==')
+    with Tmp() as t:
+        # 2025-10-05 02:30 never happened.
+        f = DayFiles(t.logs, 2025, 10, 5)
+        write_csv(f, [legacy_row('2025-10-05 02:30:00')])
+        raised = False
+        try:
+            with t.store()._DayLock(t.state, f.key):
+                t.store().adopt_legacy_csv(f, 2025, 10, 5)
+        except CorruptionError as e:
+            raised = 'never occurred' in str(e)
+        check(raised, 'a spring-forward-gap timestamp is refused')
+
+    with Tmp() as t:
+        # A file that BEGINS inside the repeated hour cannot have its fold
+        # inferred from order.
+        f = DayFiles(t.logs, 2026, 4, 5)
+        write_csv(f, [legacy_row('2026-04-05 02:30:00'),
+                      legacy_row('2026-04-05 03:00:00')])
+        raised = False
+        try:
+            with t.store()._DayLock(t.state, f.key):
+                t.store().adopt_legacy_csv(f, 2026, 4, 5)
+        except CorruptionError as e:
+            raised = 'ambiguous' in str(e)
+        check(raised, 'an ambiguous FIRST row is refused rather than guessed')
+
+
+def test_nested_nan_rejected():
+    print('\n== NaN nested inside a sub-object is rejected ==')
+    with Tmp() as t:
+        s = t.store()
+        rec = obs('2026-07-31T10:00:03+10:00')
+        rec['extra'] = {'inner': [1.0, float('inf')]}
+        a, _, r, _, _ = s.put([rec])
+        check(r == 1 and a == 0, 'nested Infinity rejected')
+
+
+def test_corruption_is_memoised():
+    print('\n== a known-bad day fails fast and is reported ==')
+    with Tmp() as t:
+        s = t.store()
+        s.put([obs('2026-07-31T10:00:03+10:00')])
+        f = DayFiles(t.logs, 2026, 7, 31)
+        with open(f.jsonl, 'w') as fh:
+            fh.write('{"not": "a record"}\n')
+        for _ in range(2):
+            try:
+                s._read_jsonl(f)
+            except CorruptionError:
+                pass
+        check(f.key in s.degraded(), 'day reported as degraded')
+        check('not a valid record' in s.degraded()[f.key], 'with the reason')
+
+
+def test_last_observation_prefers_latest_date():
+    print('\n== last_observation picks the latest DATE, not the latest mtime ==')
+    with Tmp() as t:
+        s = t.store()
+        s.put([obs('2026-07-31T12:00:00+10:00')])
+        # Touch three older days afterwards, so mtime order is misleading.
+        for day in (28, 29, 30):
+            s.put([obs('2026-07-%dT06:00:00+10:00' % day)])
+        last = t.store().last_observation()
+        check(last is not None and last['local'] == '2026-07-31 12:00:00',
+              'newest instant found despite older days written later (%s)'
+              % (last or {}).get('local'))
+
+
+def test_day_lock_times_out():
+    print('\n== a contended day lock fails bounded, not forever ==')
+    with Tmp() as t:
+        s = t.store()
+        f = DayFiles(t.logs, 2026, 7, 31)
+        held = Store._DayLock(t.state, f.key)
+        held.__enter__()
+        try:
+            start = __import__('time').monotonic()
+            raised = False
+            try:
+                with Store._DayLock(t.state, f.key, timeout=1):
+                    pass
+            except LockTimeout:
+                raised = True
+            waited = __import__('time').monotonic() - start
+            check(raised, 'LockTimeout raised')
+            check(waited < 3, 'gave up promptly (%.1fs)' % waited)
+        finally:
+            held.__exit__()
+
+
+
+CRASH_CHILD = """
+import os, sys
+sys.path.insert(0, %r)
+from cyc_store import Store
+s = Store(sys.argv[1], sys.argv[2], station='cyc1')
+s.put([{'obs_ts': '2026-07-31T10:%s:03+10:00', 'seq': int(sys.argv[3]),
+        'src': 'loop', 'wind_kt': 1.0, 'wind_avg_kt': 0.9, 'wind_dir': 270,
+        'wind_gust_kt': 2.0, 'temp_c': 13.0, 'humidity': 50}
+       for _ in [0]])
+print('completed')
+"""
+
+
+def _crash_run(t, at, minute, seq):
+    """Run a put in a child process that dies at an exact point."""
+    import subprocess
+    src = CRASH_CHILD % (HERE, minute)
+    env = dict(os.environ)
+    if at:
+        env['CYC_STORE_CRASH_AT'] = at
+    else:
+        env.pop('CYC_STORE_CRASH_AT', None)
+    return subprocess.run([sys.executable, '-c', src, t.logs, t.state,
+                           str(seq)], env=env, capture_output=True, text=True)
+
+
+def test_crash_between_jsonl_and_csv_is_repaired():
+    print('\n== crash at an EXACT point, not wherever a sleep landed ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+
+        r = _crash_run(t, None, '00', 1)
+        check(r.returncode == 0, 'baseline put completed')
+        good_csv = open(f.csv, 'rb').read()
+
+        # Crash AFTER the JSONL fsync, BEFORE the CSV is rendered. The record
+        # is durable but the projection is a row short -- the interleaving the
+        # old sleep-then-SIGKILL test could only hit by luck.
+        r = _crash_run(t, 'after-jsonl', '01', 2)
+        check(r.returncode == -9 or r.returncode == 97,
+              'child died at the injected point (rc=%s)' % r.returncode)
+        check(len(t.store()._read_jsonl(f)) == 2,
+              'the observation IS durable in the JSONL')
+        check(open(f.csv, 'rb').read() == good_csv,
+              'and the CSV is provably stale - one row short')
+
+        # A retry of the same observation is a pure duplicate. It must still
+        # repair the projection rather than short-circuit on "nothing new".
+        s = t.store()
+        a, dup, rej, _, _ = s.put([obs('2026-07-31T10:01:03+10:00')])
+        check((a, dup, rej) == (0, 1, 0), 'the retry is a duplicate')
+        rendered = s.render_csv(s._read_jsonl(f))
+        check(open(f.csv, 'rb').read() == rendered,
+              'the duplicate retry reconciled the CSV back to the JSONL')
+        check(len(open(f.csv, 'rb').read().rstrip(b'\r\n').split(b'\r\n'))
+              == 3, 'CSV now has header + 2 rows')
+
+
+def test_crash_after_csv_leaves_nothing_to_do():
+    print('\n== crash after the CSV write is already consistent ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        _crash_run(t, None, '00', 1)
+        r = _crash_run(t, 'after-csv', '01', 2)
+        check(r.returncode in (-9, 97), 'child died after the CSV write')
+        s = t.store()
+        check(open(f.csv, 'rb').read() == s.render_csv(s._read_jsonl(f)),
+              'JSONL and CSV already agree - no repair needed')
+        check(s.reconcile(f) is False,
+              'reconcile reports nothing to repair')
 
 
 def main():
@@ -367,7 +629,15 @@ def main():
                test_reconcile_detects_content_not_just_count,
                test_reconcile_all_at_startup,
                test_last_observation_after_backfill,
-               test_stale_index_across_processes]:
+               test_stale_index_across_processes,
+               test_crash_between_jsonl_and_csv_is_repaired,
+               test_crash_after_csv_leaves_nothing_to_do,
+               test_adoption_is_atomic,
+               test_adoption_rejects_damaged_input,
+               test_adoption_rejects_impossible_local_times,
+               test_nested_nan_rejected, test_corruption_is_memoised,
+               test_last_observation_prefers_latest_date,
+               test_day_lock_times_out]:
         fn()
 
     print()

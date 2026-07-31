@@ -32,6 +32,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -48,6 +49,9 @@ CSV_NEWLINE = '\r\n'
 # is exactly the blindness this whole project exists to remove.
 MAX_FUTURE_S = 300
 
+# Bounded wait for a day lock, so contention degrades rather than deadlocks.
+LOCK_TIMEOUT_S = 10
+
 
 class StoreError(Exception):
     """Bad input. Caller should reject the record, not retry it."""
@@ -55,6 +59,10 @@ class StoreError(Exception):
 
 class CorruptionError(Exception):
     """On-disk state is not what we wrote. Never silently repaired."""
+
+
+class LockTimeout(Exception):
+    """A day lock stayed busy. Retryable; the caller should shed load."""
 
 
 def parse_obs_ts(value):
@@ -97,10 +105,36 @@ def local_stamp(dt):
     return dt.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')
 
 
-def check_value(key, v):
-    """Reject values that JSON permits but CSV and consumers cannot carry."""
+def is_ambiguous(naive):
+    """True if this wall-clock time occurs twice (autumn fall-back hour)."""
+    return (naive.replace(tzinfo=TZ, fold=0).utcoffset()
+            != naive.replace(tzinfo=TZ, fold=1).utcoffset())
+
+
+def is_nonexistent(naive):
+    """True if this wall-clock time never occurs (spring-forward gap)."""
+    aware = naive.replace(tzinfo=TZ)
+    # A time inside the gap does not survive a round trip through UTC.
+    return aware.astimezone(ZoneInfo('UTC')).astimezone(TZ).replace(
+        tzinfo=None) != naive
+
+
+def check_value(key, v, _depth=0):
+    """Reject values that JSON permits but CSV and consumers cannot carry.
+
+    Recursive: a NaN nested inside a dict or list is just as unrepresentable as
+    a top-level one, and json.dumps would happily emit the non-standard literal.
+    """
+    if _depth > 8:
+        raise StoreError('%s nests too deeply' % key)
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         raise StoreError('%s is %r, which cannot be represented' % (key, v))
+    if isinstance(v, dict):
+        for k2, v2 in v.items():
+            check_value('%s.%s' % (key, k2), v2, _depth + 1)
+    elif isinstance(v, (list, tuple)):
+        for i, v2 in enumerate(v):
+            check_value('%s[%d]' % (key, i), v2, _depth + 1)
     return v
 
 
@@ -123,6 +157,19 @@ class DayFiles:
         os.makedirs(self.dir, exist_ok=True)
 
 
+def _crash_point(name):
+    """Die instantly at a named point, if CYC_STORE_CRASH_AT says so.
+
+    Crash-safety was previously tested by sleeping a few milliseconds and
+    sending SIGKILL, which lands wherever it lands -- so a passing run proved
+    nothing in particular. This makes each interleaving exact. It is inert
+    unless the environment variable is set, and os._exit skips every handler
+    and buffer flush, which is the point.
+    """
+    if os.environ.get('CYC_STORE_CRASH_AT') == name:
+        os._exit(97)
+
+
 class Store:
     def __init__(self, logdir, statedir, station='cyc1', min_obs_ts=None,
                  max_future_s=MAX_FUTURE_S, jsonl_mode=0o640):
@@ -143,18 +190,39 @@ class Store:
         # us notice another process having written and reload rather than
         # trusting a stale set.
         self._index = {}
+        # day key -> (signature, message) for days known to be corrupt
+        self._corrupt = {}
 
     # ---------------------------------------------------------------- locking
 
     class _DayLock:
-        def __init__(self, statedir, daykey):
+        """Exclusive per-day lock with a bounded wait.
+
+        Blocking forever would let requests queued on one busy day consume every
+        handler slot and starve every other day and station, turning contention
+        into a total outage.
+        """
+
+        def __init__(self, statedir, daykey, timeout=LOCK_TIMEOUT_S):
             self.path = os.path.join(statedir, 'day-%s.lock' % daykey)
+            self.timeout = timeout
             self.fd = None
 
         def __enter__(self):
             self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
-            return self
+            deadline = time.monotonic() + self.timeout
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        os.close(self.fd)
+                        self.fd = None
+                        raise LockTimeout('day %s busy for more than %ds'
+                                          % (os.path.basename(self.path),
+                                             self.timeout))
+                    time.sleep(0.05)
 
         def __exit__(self, *exc):
             fcntl.flock(self.fd, fcntl.LOCK_UN)
@@ -199,7 +267,18 @@ class Store:
         return True
 
     def _read_jsonl(self, files, strict=True):
-        """Parse a day's JSONL. Malformed lines are corruption, not noise."""
+        """Parse a day's JSONL. Malformed lines are corruption, not noise.
+
+        A known-bad day is remembered by file signature so we fail fast instead
+        of re-reading and re-logging the whole file on every request. The
+        degraded set is exposed so health can report it rather than silently
+        serving 500s.
+        """
+        sig = self._sig(files.jsonl)
+        bad = self._corrupt.get(files.key)
+        if bad is not None and bad[0] == sig:
+            raise CorruptionError(bad[1])
+
         out = []
         if not os.path.exists(files.jsonl):
             return out
@@ -213,11 +292,13 @@ class Store:
                     int(rec['utc'])
                 except (ValueError, KeyError, TypeError) as e:
                     if strict:
-                        raise CorruptionError(
-                            '%s line %d is not a valid record: %s'
-                            % (files.jsonl, n, e))
+                        msg = ('%s line %d is not a valid record: %s'
+                               % (files.jsonl, n, e))
+                        self._corrupt[files.key] = (sig, msg)
+                        raise CorruptionError(msg)
                     continue
                 out.append(rec)
+        self._corrupt.pop(files.key, None)
         return out
 
     def _load_index(self, files):
@@ -309,8 +390,13 @@ class Store:
         Without this, a crash between the JSONL and CSV writes for a day that no
         later request happens to touch -- yesterday's backfill, say -- is never
         noticed.
+
+        Returns (repaired, errors). One unreadable day must not abort the rest,
+        and the caller is expected to surface `errors` rather than serve as if
+        healthy.
         """
         repaired = []
+        errors = []
         days = []
         for root, _dirs, names in os.walk(self.logdir):
             for name in names:
@@ -330,48 +416,79 @@ class Store:
             except ValueError:
                 continue
             files = DayFiles(self.logdir, y, m, d)
-            with self._DayLock(self.statedir, files.key):
-                self._repair_torn_tail(files)
-                if self.reconcile(files):
-                    repaired.append(files.key)
-        return repaired
+            try:
+                with self._DayLock(self.statedir, files.key):
+                    self._repair_torn_tail(files)
+                    if self.reconcile(files):
+                        repaired.append(files.key)
+            except (CorruptionError, LockTimeout, OSError) as e:
+                errors.append((files.key, str(e)))
+        return repaired, errors
+
+    def degraded(self):
+        """Days currently known to be unreadable."""
+        return {k: v[1] for k, v in self._corrupt.items()}
 
     # -------------------------------------------------------- legacy adoption
 
-    def adopt_legacy_csv(self, files):
-        """Import pre-existing CSV rows into the JSONL before we ever rewrite it.
-
-        Production days have a CSV written by wind_logger.py but no JSONL. The
-        first new observation would otherwise cause a rewrite from a JSONL
-        holding only that one record -- erasing the whole pre-cutover part of
-        the day. Caller must hold the day lock.
+    def _parse_legacy_csv(self, files, y, m, d):
+        """Validate and convert an entire legacy CSV. All-or-nothing.
 
         Local timestamps are ambiguous for one hour each April. The file is in
         chronological order, so the fold is resolved by requiring each row to be
-        strictly later than the previous one: the first 02:00:03 takes fold 0
-        (AEDT), the second fold 1 (AEST).
+        strictly later than the previous one. Anything that cannot be resolved
+        that way is corruption and stops the import rather than guessing --
+        guessing here silently rewrites the club's history.
         """
-        if not os.path.exists(files.csv):
-            return 0
-        if self._read_jsonl(files):
-            return 0                      # already has truth; nothing to adopt
-
         with open(files.csv, 'r', encoding='utf-8', newline='') as f:
-            rows = list(csv.DictReader(f))
-        if not rows:
-            return 0
+            raw = f.read()
+        if not raw.strip():
+            raise CorruptionError('%s is empty' % files.csv)
 
-        adopted = []
+        rdr = csv.reader(io.StringIO(raw))
+        try:
+            header = next(rdr)
+        except StopIteration:
+            raise CorruptionError('%s has no header' % files.csv)
+        if [h.strip() for h in header] != CSV_FIELDS:
+            raise CorruptionError('%s header is %r, expected %r'
+                                  % (files.csv, header, CSV_FIELDS))
+
+        expect_day = '%04d-%02d-%02d' % (y, m, d)
+        out = []
         last = None
-        for row in rows:
-            stamp = (row.get('timestamp') or '').strip()
-            if not stamp:
+        for n, row in enumerate(rdr, 2):
+            if not row or not any(c.strip() for c in row):
                 continue
+            if len(row) != len(CSV_FIELDS):
+                raise CorruptionError('%s line %d has %d columns, expected %d'
+                                      % (files.csv, n, len(row),
+                                         len(CSV_FIELDS)))
+            stamp = row[0].strip()
+            if not stamp:
+                raise CorruptionError('%s line %d has a blank timestamp'
+                                      % (files.csv, n))
             try:
                 naive = datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S')
             except ValueError:
-                raise CorruptionError('%s: unparseable legacy timestamp %r'
-                                      % (files.csv, stamp))
+                raise CorruptionError('%s line %d: unparseable timestamp %r'
+                                      % (files.csv, n, stamp))
+            if stamp[:10] != expect_day:
+                raise CorruptionError('%s line %d: %s is not on day %s'
+                                      % (files.csv, n, stamp, expect_day))
+            if is_nonexistent(naive):
+                raise CorruptionError(
+                    '%s line %d: %s never occurred (spring-forward gap)'
+                    % (files.csv, n, stamp))
+
+            if last is None and is_ambiguous(naive):
+                # We cannot tell which side of the fold a file's FIRST row is
+                # on. Refuse rather than be silently an hour out.
+                raise CorruptionError(
+                    '%s line %d: %s is ambiguous (DST fold) and is the first '
+                    'row, so its fold cannot be inferred from order'
+                    % (files.csv, n, stamp))
+
             chosen = None
             for fold in (0, 1):
                 cand = naive.replace(tzinfo=TZ, fold=fold)
@@ -380,31 +497,71 @@ class Store:
                     chosen = (cand, key)
                     break
             if chosen is None:
-                # Non-monotonic legacy data; keep it rather than drop it, but do
-                # not let it corrupt ordering.
-                cand = naive.replace(tzinfo=TZ, fold=1)
-                chosen = (cand, utc_key(cand))
+                raise CorruptionError(
+                    '%s line %d: %s is not after the previous row; the file is '
+                    'not in chronological order and the fold cannot be resolved'
+                    % (files.csv, n, stamp))
             cand, key = chosen
             last = key
 
             rec = {'utc': key, 'local': local_stamp(cand),
                    'obs_ts': cand.isoformat(timespec='seconds'),
                    'src': 'legacy', 'station': self.station}
-            for col in CSV_FIELDS[1:]:
-                raw = (row.get(col) or '').strip()
-                if raw == '':
+            for col, val in zip(CSV_FIELDS[1:], row[1:]):
+                val = val.strip()
+                if val == '':
                     rec[col] = None
                 else:
                     try:
-                        rec[col] = int(raw) if '.' not in raw else float(raw)
+                        rec[col] = int(val) if '.' not in val else float(val)
                     except ValueError:
-                        rec[col] = raw
-            adopted.append(rec)
+                        rec[col] = val
+                check_value(col, rec[col])
+            out.append(rec)
 
-        if not adopted:
+        if not out:
+            raise CorruptionError('%s has a header but no rows' % files.csv)
+        return out
+
+    def adopt_legacy_csv(self, files, y, m, d):
+        """Import a pre-existing CSV into JSONL as one atomic transaction.
+
+        Production days have a CSV written by wind_logger.py but no JSONL. The
+        first new observation would otherwise cause a rewrite from a JSONL
+        holding only that record, erasing the whole pre-cutover part of the day.
+
+        The import is atomic: the complete JSONL is built in a temp file,
+        fsynced, then installed with os.replace. An interrupted adoption leaves
+        the JSONL absent, so the retry re-adopts from scratch. Appending
+        incrementally would leave a partial prefix that the next run mistakes
+        for a completed adoption -- and then projects over the real CSV.
+
+        Caller must hold the day lock.
+        """
+        if not os.path.exists(files.csv):
             return 0
-        self._append_jsonl(files, adopted)
-        return len(adopted)
+        if os.path.exists(files.jsonl):
+            return 0                      # already has truth; nothing to adopt
+
+        recs = self._parse_legacy_csv(files, y, m, d)
+
+        fd, tmp = tempfile.mkstemp(dir=files.dir, prefix='.', suffix='.adopting')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                for rec in sorted(recs, key=lambda r: r['utc']):
+                    f.write(json.dumps(rec, sort_keys=True,
+                                       allow_nan=False) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, self.jsonl_mode)
+            os.replace(tmp, files.jsonl)
+            _fsync_dir(files.dir)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        self._index.pop(files.key, None)
+        return len(recs)
 
     # ------------------------------------------------------------------ write
 
@@ -412,7 +569,7 @@ class Store:
         """Durable append. Returns only after fsync succeeds."""
         with open(files.jsonl, 'a', encoding='utf-8') as f:
             for rec in sorted(recs, key=lambda r: int(r['utc'])):
-                f.write(json.dumps(rec, sort_keys=True) + '\n')
+                f.write(json.dumps(rec, sort_keys=True, allow_nan=False) + '\n')
             f.flush()
             os.fsync(f.fileno())
         try:
@@ -474,18 +631,18 @@ class Store:
             files = DayFiles(self.logdir, y, m, d)
             files.ensure_dir()
             with self._DayLock(self.statedir, files.key):
-                a, dup, keys = self._put_day(files, recs)
+                a, dup, keys = self._put_day(files, recs, (y, m, d))
                 accepted += a
                 duplicates += dup
                 durable |= keys
 
         return accepted, duplicates, rejected, details, durable
 
-    def _put_day(self, files, recs):
+    def _put_day(self, files, recs, daydate):
         self._repair_torn_tail(files)
         # Adopt any pre-existing CSV before it can be rewritten from a JSONL
         # that does not yet describe it.
-        self.adopt_legacy_csv(files)
+        self.adopt_legacy_csv(files, *daydate)
 
         seen = self._load_index(files)
 
@@ -510,6 +667,7 @@ class Store:
         #    must remain unknown so a retry stores them rather than being
         #    dismissed as duplicates.
         self._append_jsonl(files, fresh)
+        _crash_point('after-jsonl')
 
         # 2. Project. Always rebuild from the JSONL so the CSV can never drift.
         existing = self._read_jsonl(files)
@@ -521,29 +679,38 @@ class Store:
             have = None
         if have != want:
             self._write_csv_atomic(files, want)
+        _crash_point('after-csv')
 
         return len(fresh), len(dup_keys), fresh_keys | dup_keys
 
     # ----------------------------------------------------------------- status
 
     def last_observation(self):
-        """The newest observation by UTC instant across all days.
+        """The newest observation by UTC instant.
 
-        Scans rather than taking the last line: the JSONL is append-ordered, not
-        UTC-ordered, so after an out-of-order backfill the final line is an old
-        record and seeding from it would understate freshness.
+        Files are selected by DATE, not mtime: an observation's instant
+        determines which day file it lands in, so the newest instant is in the
+        latest-dated file regardless of which file was written most recently.
+        Selecting by mtime meant a backfill touching three old days could seed a
+        stale observation after a restart.
         """
-        newest = None
-        days = []
+        dated = []
         for root, _dirs, names in os.walk(self.logdir):
             for name in names:
-                if name.endswith('.jsonl'):
-                    p = os.path.join(root, name)
-                    try:
-                        days.append((os.path.getmtime(p), p))
-                    except OSError:
-                        pass
-        for _mtime, path in sorted(days, reverse=True)[:3]:
+                if not name.endswith('.jsonl'):
+                    continue
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, self.logdir).split(os.sep)
+                if len(rel) != 3:
+                    continue
+                try:
+                    dated.append(((int(rel[0]), int(rel[1]), int(rel[2][:2])),
+                                  path))
+                except ValueError:
+                    continue
+
+        newest = None
+        for _key, path in sorted(dated, reverse=True)[:2]:
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     for line in f:
@@ -559,4 +726,6 @@ class Store:
                             newest = rec
             except OSError:
                 continue
+            if newest is not None:
+                break        # the latest-dated file with any record wins
         return newest
