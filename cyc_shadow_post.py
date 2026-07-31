@@ -51,11 +51,25 @@ def f_to_c(f):
 
 
 def load_key(path, station):
+    """Return the RAW key bytes.
+
+    The file stores hex; the HMAC is over the decoded bytes. Using the ASCII
+    hex here instead silently produces a valid-looking signature that the
+    server rejects -- which is exactly what happened when the server switched
+    to bytes.fromhex() and this was left behind.
+    """
     with open(path) as f:
-        for line in f:
+        for n, line in enumerate(f, 1):
             parts = line.split()
             if len(parts) == 2 and parts[0] == station:
-                return parts[1].encode('ascii')
+                try:
+                    raw = bytes.fromhex(parts[1])
+                except ValueError:
+                    raise SystemExit('%s line %d: key is not hex' % (path, n))
+                if len(raw) != 32:
+                    raise SystemExit('%s line %d: key is %d bytes, want 32'
+                                     % (path, n, len(raw)))
+                return raw
     raise SystemExit('no key for station %r in %s' % (station, path))
 
 
