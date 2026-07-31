@@ -371,15 +371,20 @@ class Server(ThreadingHTTPServer):
             'last_post_epoch': int(st.last_post) if st.last_post else None,
             'post_age_s': (None if not st.last_post
                            else int(now - st.last_post)),
-            'clock_skew_s': (None if st.last_obs_utc is None or not st.last_post
-                             else int(st.last_post - st.last_obs_utc)),
+            # Time between the observation being made and us receiving it.
+            # For the direct collector this should be a second or two, so growth
+            # means either a wrong collector clock or a spool backlog. For the
+            # cloud shadow path it is dominated by the ~15 min feed latency, so
+            # thresholds must be set per source.
+            'recv_lag_s': (None if st.last_obs_utc is None or not st.last_post
+                           else int(st.last_post - st.last_obs_utc)),
             'seq': st.last_seq,
             'seq_gaps': st.seq_gaps,
             'accepted': st.accepted,
             'duplicates': st.duplicates,
             'rejected': st.rejected,
             'auth_failures_1h': self.guard.failures_1h(now),
-            'source': 'serial',
+            'source': (st.collector or {}).get('source', 'unknown'),
             'collector': st.collector,
         }
         path = self.cfg['status']
@@ -417,6 +422,23 @@ def main(argv=None):
     store = Store(args.logdir, args.statedir, min_obs_ts=args.min_obs_ts)
 
     srv = Server((args.host, args.port), cfg, store)
+
+    # Seed from storage before serving. Stats are in-memory, so without this a
+    # restart makes status.json report "no observation has ever been recorded"
+    # until the next one arrives -- which feed_watch correctly treats as an
+    # alarm. Every deploy would then fire a false alert.
+    try:
+        last = store.last_observation()
+    except OSError:
+        last = None
+    if last:
+        srv.stats.last_obs_utc = int(last['utc'])
+        if isinstance(last.get('seq'), int):
+            srv.stats.last_seq = last['seq']
+        sys.stderr.write('seeded from storage: last observation %s\n'
+                         % datetime.fromtimestamp(srv.stats.last_obs_utc, TZ)
+                         .isoformat(timespec='seconds'))
+
     srv.write_status()
     sys.stderr.write('cyc-ingest listening on %s:%d, %d key(s)\n'
                      % (args.host, args.port, len(cfg['keys'])))

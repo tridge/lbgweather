@@ -35,7 +35,7 @@ FROM_ADDR = 'lbgweather@wstracker.org'
 
 WARN_AGE_S = 600
 ALARM_AGE_S = 1800
-SKEW_WARN_S = 120
+LAG_WARN_S = 120
 SEQ_GAP_WARN = 5
 AUTH_FAIL_WARN = 20
 BACKLOG_WARN = 60
@@ -110,7 +110,8 @@ def fmt_age(seconds):
     return '%dh %dm' % (seconds // 3600, (seconds % 3600) // 60)
 
 
-def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S):
+def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
+             lag_warn=LAG_WARN_S):
     """Return (severity, [problems]). severity in 'ok' | 'warn' | 'alarm'.
 
     Thresholds are arguments because the right values depend on the feed's
@@ -135,12 +136,13 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S):
         problems.append('feed is %s old (warn above %s)'
                         % (fmt_age(age), fmt_age(warn_age)))
 
-    skew = status.get('clock_skew_s')
-    if isinstance(skew, int) and abs(skew) > SKEW_WARN_S:
+    lag = status.get('recv_lag_s')
+    if isinstance(lag, int) and lag > lag_warn:
         severity = 'alarm' if severity == 'alarm' else 'warn'
-        problems.append('clock skew %+ds between observation and receipt '
+        problems.append('%ds between observation and receipt (warn above %ds) '
                         '- the collector clock may be wrong, which silently '
-                        'mis-stamps the historical record' % skew)
+                        'mis-stamps the historical record, or it is backlogged'
+                        % (lag, lag_warn))
 
     gaps = status.get('seq_gaps')
     if isinstance(gaps, int) and gaps > SEQ_GAP_WARN:
@@ -215,6 +217,10 @@ def main(argv=None):
                         '~180 for the 1-min direct collector)' % WARN_AGE_S)
     p.add_argument('--alarm-age', type=int, default=ALARM_AGE_S,
                    help='seconds before alarming (default %d)' % ALARM_AGE_S)
+    p.add_argument('--lag-warn', type=int, default=LAG_WARN_S,
+                   help='seconds between observation and receipt before '
+                        'warning (default %d; the cloud shadow path runs ~900s '
+                        'so use a high value there)' % LAG_WARN_S)
     p.add_argument('--no-mail', action='store_true',
                    help='evaluate and print, send nothing (for testing)')
     p.add_argument('--quiet', action='store_true')
@@ -236,7 +242,8 @@ def main(argv=None):
         status['age_refreshed_at_epoch'] = int(now)
         save_json_atomic(args.status, status)
 
-    severity, problems = evaluate(status, now, args.warn_age, args.alarm_age)
+    severity, problems = evaluate(status, now, args.warn_age, args.alarm_age,
+                                  args.lag_warn)
     state = load_json(args.state, {}) or {}
     in_episode = bool(state.get('in_episode'))
     last_mail = state.get('last_mail_epoch', 0)

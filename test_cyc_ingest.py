@@ -222,11 +222,41 @@ def test_status_document():
         with open(h.status) as f:
             st = json.load(f)
         for k in ('last_obs_epoch', 'written_at_epoch', 'obs_age_s',
-                  'clock_skew_s', 'seq', 'auth_failures_1h'):
+                  'recv_lag_s', 'seq', 'auth_failures_1h'):
             check(k in st, 'status has %s' % k)
         check(st['seq'] == 5, 'seq recorded')
         check(isinstance(st['last_obs_epoch'], int),
               'absolute epoch stored, not just a relative age')
+
+
+def test_restart_seeding():
+    print('\n== stats survive a restart ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 7)]))
+        # Restart the service against the same storage, as a deploy does.
+        h.srv.shutdown(); h.srv.server_close()
+        cfg = {'keys': load_keys(h.keyfile), 'status': h.status,
+               'enable_echo': True}
+        store = Store(h.logs, h.state)
+        h.srv = Server(('127.0.0.1', 0), cfg, store)
+        h.port = h.srv.server_address[1]
+        last = store.last_observation()
+        if last:
+            h.srv.stats.last_obs_utc = int(last['utc'])
+            if isinstance(last.get('seq'), int):
+                h.srv.stats.last_seq = last['seq']
+        h.srv.write_status()
+        h.t = threading.Thread(target=h.srv.serve_forever, daemon=True)
+        h.t.start()
+
+        code, body = h.get('/ingest/health')
+        check(body.get('age_s') is not None,
+              'health reports an age after restart, not null')
+        with open(h.status) as f:
+            st = json.load(f)
+        check(st.get('last_obs_epoch') is not None,
+              'status.json still knows the last observation after restart')
+        check(st.get('seq') == 7, 'sequence recovered from storage')
 
 
 def main():
@@ -237,6 +267,7 @@ def main():
     test_schema_and_size()
     test_health_and_echo()
     test_status_document()
+    test_restart_seeding()
 
     print()
     if FAILURES:
