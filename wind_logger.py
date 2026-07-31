@@ -3,11 +3,15 @@
 
 import requests
 import csv
+import json
 import os
+import sys
+import time
 from datetime import datetime
 
 WEATHER_URL = "https://canberrayc.com/admin/php/cyc/getWeather.php"
 LOG_BASE_DIR = "wind_logs"
+STATUS_FILE = "status.json"
 
 # Conversion factors
 MPH_TO_KNOTS = 0.868976
@@ -66,10 +70,57 @@ def log_data(data):
             writer.writeheader()
         writer.writerow(data)
 
+def write_status(weather_json):
+    """Record the feed's OWN timestamp so staleness is detectable.
+
+    The CSV deliberately keeps its datetime.now() timestamp - changing it would
+    put a discontinuity in years of history. But that is also why a dead station
+    is invisible here: this logger appends a plausible-looking row every minute
+    regardless, so frozen data and live data produce identical files. The July
+    2026 outage went unnoticed for three weeks for exactly that reason.
+
+    The feed carries its own 'ts' (when the station actually reported) alongside
+    'generated_at' (when the PHP proxy built the response). The gap between them
+    is the real staleness. Written here for feed_watch.py to alarm on.
+    """
+    try:
+        data = weather_json['sensors'][0]['data'][0]
+        obs_ts = int(data['ts'])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return
+    generated = weather_json.get('generated_at')
+    now = time.time()
+
+    doc = {
+        'station': 'cyc1',
+        'source': 'cloud',
+        'last_obs_epoch': obs_ts,
+        'last_obs_ts': datetime.fromtimestamp(obs_ts).isoformat(timespec='seconds'),
+        'last_fetch_epoch': int(now),
+        'written_at_epoch': int(now),
+        'written_at': datetime.fromtimestamp(now).isoformat(timespec='seconds'),
+        'obs_age_s': int(now - obs_ts),
+        # How stale the feed was when the proxy generated it - non-zero here
+        # means the station stopped reporting, independent of our own clock.
+        'feed_lag_s': (int(generated - obs_ts)
+                       if isinstance(generated, (int, float)) else None),
+    }
+    tmp = STATUS_FILE + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(doc, f, indent=1, sort_keys=True)
+            f.write('\n')
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATUS_FILE)
+    except OSError as e:
+        print(f"status write failed: {e}", file=sys.stderr)
+
+
 def main():
     weather = fetch_weather()
     data = extract_wind_data(weather)
     log_data(data)
+    write_status(weather)
     print(f"{data['timestamp']}: {data['wind_kt']} kt, "
           f"avg {data['wind_avg_kt']} kt, "
           f"gust {data['wind_gust_kt']} kt, "
