@@ -25,6 +25,7 @@ autumn fall-back produces two distinct observations that render identically
 readings), so a string key would delete an hour of history every April.
 """
 
+import collections
 import csv
 import fcntl
 import io
@@ -32,6 +33,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -51,6 +53,14 @@ MAX_FUTURE_S = 300
 
 # Bounded wait for a day lock, so contention degrades rather than deadlocks.
 LOCK_TIMEOUT_S = 10
+
+
+# Per-input outcomes returned by put(). Strings so they survive JSON and read
+# clearly in logs.
+STORED = 'stored'
+DUPLICATE = 'duplicate'
+REJECTED = 'rejected'
+DURABLE = (STORED, DUPLICATE)
 
 
 class StoreError(Exception):
@@ -192,6 +202,7 @@ class Store:
         self._index = {}
         # day key -> (signature, message) for days known to be corrupt
         self._corrupt = {}
+        self._corrupt_lock = threading.Lock()
 
     # ---------------------------------------------------------------- locking
 
@@ -275,7 +286,8 @@ class Store:
         serving 500s.
         """
         sig = self._sig(files.jsonl)
-        bad = self._corrupt.get(files.key)
+        with self._corrupt_lock:
+            bad = self._corrupt.get(files.key)
         if bad is not None and bad[0] == sig:
             raise CorruptionError(bad[1])
 
@@ -294,11 +306,13 @@ class Store:
                     if strict:
                         msg = ('%s line %d is not a valid record: %s'
                                % (files.jsonl, n, e))
-                        self._corrupt[files.key] = (sig, msg)
+                        with self._corrupt_lock:
+                            self._corrupt[files.key] = (sig, msg)
                         raise CorruptionError(msg)
                     continue
                 out.append(rec)
-        self._corrupt.pop(files.key, None)
+        with self._corrupt_lock:
+            self._corrupt.pop(files.key, None)
         return out
 
     def _load_index(self, files):
@@ -381,6 +395,16 @@ class Store:
             have = None
         if have == want:
             return False
+        foreign = self._foreign_rows(have, want)
+        if foreign:
+            # Same rule as the write path: never delete rows we cannot account
+            # for. At startup this is the signal that the legacy writer is
+            # still running against a day we have adopted.
+            raise CorruptionError(
+                '%s holds %d row(s) that are not in the JSONL (%s%s): another '
+                'process is writing it. Refusing to reconcile over them.'
+                % (files.csv, len(foreign), ', '.join(foreign[:3]),
+                   ' ...' if len(foreign) > 3 else ''))
         self._write_csv_atomic(files, want)
         return True
 
@@ -426,8 +450,14 @@ class Store:
         return repaired, errors
 
     def degraded(self):
-        """Days currently known to be unreadable."""
-        return {k: v[1] for k, v in self._corrupt.items()}
+        """Days currently known to be unreadable.
+
+        Snapshotted under the lock: day threads add and remove entries while
+        the status writer iterates, and an unlocked read raises 'dictionary
+        changed size during iteration' from inside health reporting.
+        """
+        with self._corrupt_lock:
+            return {k: v[1] for k, v in self._corrupt.items()}
 
     # -------------------------------------------------------- legacy adoption
 
@@ -455,8 +485,9 @@ class Store:
                                   % (files.csv, header, CSV_FIELDS))
 
         expect_day = '%04d-%02d-%02d' % (y, m, d)
-        out = []
-        last = None
+
+        # Pass 1: parse and validate the wall-clock stamps, nothing more.
+        rows = []
         for n, row in enumerate(rdr, 2):
             if not row or not any(c.strip() for c in row):
                 continue
@@ -480,28 +511,59 @@ class Store:
                 raise CorruptionError(
                     '%s line %d: %s never occurred (spring-forward gap)'
                     % (files.csv, n, stamp))
+            rows.append((n, stamp, naive, row))
 
-            if last is None and is_ambiguous(naive):
-                # We cannot tell which side of the fold a file's FIRST row is
-                # on. Refuse rather than be silently an hour out.
-                raise CorruptionError(
-                    '%s line %d: %s is ambiguous (DST fold) and is the first '
-                    'row, so its fold cannot be inferred from order'
-                    % (files.csv, n, stamp))
+        # Pass 2: locate the wall-clock rollback, THEN assign folds.
+        #
+        # Resolving each row against only its predecessor is wrong when the
+        # logger has a gap across the repeated hour: with 02:30 AEDT followed
+        # by 02:45 AEST, both folds of 02:45 are later than 02:30, the first
+        # candidate wins, and the row lands an hour early. The rollback is a
+        # property of the whole file, so find it first.
+        rollback = None                 # index of the first post-rollback row
+        for i in range(1, len(rows)):
+            # A repeated stamp inside the fold is the rollback too: the club's
+            # 1-minute logger can land on the same wall-clock second either
+            # side of it, so the clock need not visibly go backwards.
+            back = (rows[i][2] < rows[i - 1][2]
+                    or (rows[i][2] == rows[i - 1][2]
+                        and is_ambiguous(rows[i][2])))
+            if back:
+                if rollback is not None:
+                    raise CorruptionError(
+                        '%s line %d: the wall clock goes backwards twice; a '
+                        'day has at most one DST fold'
+                        % (files.csv, rows[i][0]))
+                rollback = i
+        if (rollback is not None
+                and not is_ambiguous(rows[rollback][2])):
+            raise CorruptionError(
+                '%s line %d: %s is earlier than the previous row but is not in '
+                'a DST fold, so the file is simply out of order'
+                % (files.csv, rows[rollback][0], rows[rollback][1]))
 
-            chosen = None
-            for fold in (0, 1):
-                cand = naive.replace(tzinfo=TZ, fold=fold)
-                key = utc_key(cand)
-                if last is None or key > last:
-                    chosen = (cand, key)
-                    break
-            if chosen is None:
+        ambiguous = [i for i, r in enumerate(rows) if is_ambiguous(r[2])]
+        if ambiguous and rollback is None:
+            # Every row in the repeated hour could be either side of it and
+            # nothing in the file says which. Guessing rewrites the club's
+            # history by an hour; refuse and let an operator decide.
+            raise CorruptionError(
+                '%s line %d: %s is in the DST fold but the file never shows '
+                'the wall clock going back, so its fold cannot be determined '
+                '(a logger gap across the repeated hour). Resolve by hand.'
+                % (files.csv, rows[ambiguous[0]][0], rows[ambiguous[0]][1]))
+
+        out = []
+        last = None
+        for i, (n, stamp, naive, row) in enumerate(rows):
+            fold = 1 if (rollback is not None and i >= rollback) else 0
+            cand = naive.replace(tzinfo=TZ, fold=fold)
+            key = utc_key(cand)
+            if last is not None and key <= last:
                 raise CorruptionError(
                     '%s line %d: %s is not after the previous row; the file is '
-                    'not in chronological order and the fold cannot be resolved'
+                    'not in chronological order'
                     % (files.csv, n, stamp))
-            cand, key = chosen
             last = key
 
             rec = {'utc': key, 'local': local_stamp(cand),
@@ -536,12 +598,26 @@ class Store:
         incrementally would leave a partial prefix that the next run mistakes
         for a completed adoption -- and then projects over the real CSV.
 
+        wind_logger.py does NOT take the day lock, so the source can change
+        underneath us. The CSV's identity is captured before the parse and
+        rechecked immediately before the JSONL is installed; if it moved, the
+        import describes a stale snapshot and installing it would erase
+        whatever was appended in between. Abort and let the retry re-read.
+
         Caller must hold the day lock.
         """
-        if not os.path.exists(files.csv):
+        before = self._sig(files.csv)
+        if before is None:
             return 0
         if os.path.exists(files.jsonl):
-            return 0                      # already has truth; nothing to adopt
+            # There is already truth for this day. Only trust it if it was
+            # written by a completed adoption or by us; an unexplained JSONL
+            # beside a legacy CSV means the CSV is about to be projected away.
+            if os.path.getsize(files.jsonl) == 0:
+                raise CorruptionError(
+                    '%s is empty but %s exists: refusing to project an empty '
+                    'JSONL over a legacy CSV' % (files.jsonl, files.csv))
+            return 0
 
         recs = self._parse_legacy_csv(files, y, m, d)
 
@@ -554,6 +630,12 @@ class Store:
                 f.flush()
                 os.fsync(f.fileno())
             os.chmod(tmp, self.jsonl_mode)
+            after = self._sig(files.csv)
+            if after != before:
+                raise CorruptionError(
+                    '%s changed during adoption (%s -> %s): another writer is '
+                    'still appending to it. Stop the legacy writer first.'
+                    % (files.csv, before, after))
             os.replace(tmp, files.jsonl)
             _fsync_dir(files.dir)
         except BaseException:
@@ -562,6 +644,26 @@ class Store:
             raise
         self._index.pop(files.key, None)
         return len(recs)
+
+    @staticmethod
+    def _foreign_rows(have, want):
+        """Timestamps present in the on-disk CSV but not in what we would write.
+
+        The day lock does not bind wind_logger.py, so it can create or extend a
+        CSV that adoption has already looked past. Rewriting the projection
+        would then delete those rows silently. A stale CSV (a crash between the
+        JSONL append and the projection) has FEWER rows, never extra ones, so
+        anything extra means a second writer.
+        """
+        def stamps(blob):
+            if not blob:
+                return collections.Counter()
+            rows = blob.decode('utf-8', 'replace').replace('\r\n', '\n').split('\n')
+            return collections.Counter(
+                r.split(',', 1)[0] for r in rows[1:] if r.strip())
+
+        extra = stamps(have) - stamps(want)
+        return sorted(extra.elements())
 
     # ------------------------------------------------------------------ write
 
@@ -580,8 +682,13 @@ class Store:
 
     def put(self, observations):
         """Store observations. Returns (accepted, duplicates, rejected, details,
-        durable_keys) where durable_keys are the UTC keys now known to be on
-        disk -- either newly written or already present.
+        dispositions).
+
+        `dispositions` has one entry per INPUT observation, in input order,
+        each STORED, DUPLICATE or REJECTED. A UTC key set is not good enough:
+        two inputs can share an instant, and then a rejected one is
+        indistinguishable from the durable one that happens to occupy its
+        slot -- which let a caller acknowledge a record that was never stored.
 
         Idempotent: first write wins, so replay, retry-after-lost-ACK and
         overlapping backfill are no-ops. That also means an `archive` record (an
@@ -591,8 +698,9 @@ class Store:
         rejected = 0
         details = []
         now = datetime.now(TZ).timestamp()
+        disp = [REJECTED] * len(observations)
 
-        for obs in observations:
+        for i, obs in enumerate(observations):
             if not isinstance(obs, dict):
                 rejected += 1
                 details.append('observation is %s, not an object'
@@ -621,24 +729,26 @@ class Store:
             rec['local'] = local_stamp(dt)
             rec['station'] = self.station
             y, m, d = local_date(dt)
-            by_day.setdefault((y, m, d), []).append(rec)
+            # Carry the input index so the outcome can be reported per input
+            # even when several inputs share one instant.
+            by_day.setdefault((y, m, d), []).append((i, rec))
 
         accepted = 0
         duplicates = 0
-        durable = set()
 
-        for (y, m, d), recs in sorted(by_day.items()):
+        for (y, m, d), pairs in sorted(by_day.items()):
             files = DayFiles(self.logdir, y, m, d)
             files.ensure_dir()
             with self._DayLock(self.statedir, files.key):
-                a, dup, keys = self._put_day(files, recs, (y, m, d))
+                a, dup, outcomes = self._put_day(files, pairs, (y, m, d))
                 accepted += a
                 duplicates += dup
-                durable |= keys
+                for i, outcome in outcomes.items():
+                    disp[i] = outcome
 
-        return accepted, duplicates, rejected, details, durable
+        return accepted, duplicates, rejected, details, disp
 
-    def _put_day(self, files, recs, daydate):
+    def _put_day(self, files, pairs, daydate):
         self._repair_torn_tail(files)
         # Adopt any pre-existing CSV before it can be rewritten from a JSONL
         # that does not yet describe it.
@@ -648,19 +758,25 @@ class Store:
 
         fresh = []
         fresh_keys = set()
-        dup_keys = set()
-        for rec in recs:
+        outcomes = {}
+        for i, rec in pairs:
             if rec['utc'] in seen or rec['utc'] in fresh_keys:
-                dup_keys.add(rec['utc'])
+                # Either already on disk, or an earlier input in this same
+                # batch claimed the instant. Both are duplicates of something
+                # durable, but only the FIRST claimant is the record on disk.
+                outcomes[i] = DUPLICATE
                 continue
             fresh_keys.add(rec['utc'])
+            outcomes[i] = STORED
             fresh.append(rec)
+
+        dup_count = sum(1 for v in outcomes.values() if v is DUPLICATE)
 
         if not fresh:
             # Nothing new. If an earlier request died between the JSONL and CSV
             # writes, this is when we notice and repair.
             self.reconcile(files)
-            return 0, len(dup_keys), dup_keys
+            return 0, dup_count, outcomes
 
         # 1. Durable first. The index is NOT updated until this returns: if the
         #    append fails (ENOSPC is a live risk on these machines) the records
@@ -678,10 +794,17 @@ class Store:
         except FileNotFoundError:
             have = None
         if have != want:
+            foreign = self._foreign_rows(have, want)
+            if foreign:
+                raise CorruptionError(
+                    '%s holds %d row(s) we did not write (%s%s): another '
+                    'process is appending to it. Refusing to project over '
+                    'them.' % (files.csv, len(foreign), ', '.join(foreign[:3]),
+                               ' ...' if len(foreign) > 3 else ''))
             self._write_csv_atomic(files, want)
         _crash_point('after-csv')
 
-        return len(fresh), len(dup_keys), fresh_keys | dup_keys
+        return len(fresh), dup_count, outcomes
 
     # ----------------------------------------------------------------- status
 

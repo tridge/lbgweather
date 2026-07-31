@@ -469,8 +469,8 @@ def test_adoption_rejects_impossible_local_times():
         check(raised, 'a spring-forward-gap timestamp is refused')
 
     with Tmp() as t:
-        # A file that BEGINS inside the repeated hour cannot have its fold
-        # inferred from order.
+        # A file that BEGINS inside the repeated hour never shows the clock
+        # going back, so its fold is unknowable.
         f = DayFiles(t.logs, 2026, 4, 5)
         write_csv(f, [legacy_row('2026-04-05 02:30:00'),
                       legacy_row('2026-04-05 03:00:00')])
@@ -479,8 +479,51 @@ def test_adoption_rejects_impossible_local_times():
             with t.store()._DayLock(t.state, f.key):
                 t.store().adopt_legacy_csv(f, 2026, 4, 5)
         except CorruptionError as e:
-            raised = 'ambiguous' in str(e)
+            raised = 'fold cannot be determined' in str(e)
         check(raised, 'an ambiguous FIRST row is refused rather than guessed')
+
+    with Tmp() as t:
+        # THE GAP CASE. The logger stops at 02:30 AEDT and resumes at 02:45
+        # AEST. Both folds of 02:45 are later than 02:30, so resolving each row
+        # against only its predecessor picks fold 0 and dates the row an hour
+        # early. Nothing in the file distinguishes the two, so it must refuse.
+        f = DayFiles(t.logs, 2026, 4, 5)
+        write_csv(f, [legacy_row('2026-04-05 01:59:03'),
+                      legacy_row('2026-04-05 02:30:00'),
+                      legacy_row('2026-04-05 02:45:00'),
+                      legacy_row('2026-04-05 03:10:00')])
+        raised = ''
+        try:
+            with t.store()._DayLock(t.state, f.key):
+                t.store().adopt_legacy_csv(f, 2026, 4, 5)
+        except CorruptionError as e:
+            raised = str(e)
+        check('fold cannot be determined' in raised,
+              'a logger gap across the fold is refused, not silently dated an '
+              'hour early (got %r)' % raised[:90])
+
+    with Tmp() as t:
+        # And the same shape WITH the rollback visible resolves correctly:
+        # everything from the repeat onward is the second pass of the hour.
+        f = DayFiles(t.logs, 2026, 4, 5)
+        write_csv(f, [legacy_row('2026-04-05 01:59:03'),
+                      legacy_row('2026-04-05 02:30:00'),
+                      legacy_row('2026-04-05 02:10:00'),
+                      legacy_row('2026-04-05 02:45:00')])
+        with t.store()._DayLock(t.state, f.key):
+            n = t.store().adopt_legacy_csv(f, 2026, 4, 5)
+        recs = t.store()._read_jsonl(f)
+        keys = [int(r['utc']) for r in recs]
+        check(n == 4 and len(set(keys)) == 4, 'all four rows distinct')
+        check(keys == sorted(keys), 'and in increasing UTC order')
+        # 02:10 and 02:45 are after the rollback, so both are AEST (+10:00).
+        after = {r['local']: r['obs_ts'] for r in recs}
+        check(after['2026-04-05 02:45:00'].endswith('+10:00'),
+              'post-rollback row is AEST, not AEDT (got %s)'
+              % after['2026-04-05 02:45:00'])
+        check(after['2026-04-05 02:30:00'].endswith('+11:00'),
+              'pre-rollback row is still AEDT (got %s)'
+              % after['2026-04-05 02:30:00'])
 
 
 def test_nested_nan_rejected():
@@ -619,6 +662,117 @@ def test_crash_after_csv_leaves_nothing_to_do():
               'reconcile reports nothing to repair')
 
 
+
+def test_adoption_aborts_if_the_csv_moves_under_it():
+    print('\n== adoption refuses a source that changed mid-import ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        write_csv(f, [legacy_row('2026-07-31 09:00:00'),
+                      legacy_row('2026-07-31 09:01:00')])
+        s = t.store()
+
+        # Simulate wind_logger appending WHILE we build the temp JSONL: the
+        # append lands after the parse and before the rename. The day lock does
+        # not bind wind_logger, so this really can happen.
+        real_parse = s._parse_legacy_csv
+
+        def parse_then_append(files, y, m, d):
+            recs = real_parse(files, y, m, d)
+            with open(files.csv, 'a', newline='') as fh:
+                fh.write(legacy_row('2026-07-31 09:02:00'))
+            return recs
+        s._parse_legacy_csv = parse_then_append
+
+        raised = ''
+        try:
+            with s._DayLock(t.state, f.key):
+                s.adopt_legacy_csv(f, 2026, 7, 31)
+        except CorruptionError as e:
+            raised = str(e)
+        check('changed during adoption' in raised,
+              'the import is abandoned, not installed over the new row (%r)'
+              % raised[:80])
+        check(not os.path.exists(f.jsonl),
+              'and no JSONL was installed, so a retry re-reads the full CSV')
+        check(len(open(f.csv).read().strip().splitlines()) == 4,
+              'the CSV still holds all three rows plus the header')
+
+        # The retry, with nothing else writing, succeeds and covers all three.
+        s2 = t.store()
+        with s2._DayLock(t.state, f.key):
+            n = s2.adopt_legacy_csv(f, 2026, 7, 31)
+        check(n == 3, 'retry adopts all three rows (got %d)' % n)
+
+
+def test_foreign_csv_rows_are_never_projected_over():
+    print('\n== rows we did not write are not silently deleted ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        s = t.store()
+        s.put([obs('2026-07-31T09:00:00+10:00')])
+
+        # A second writer appends to OUR csv, as wind_logger would if it were
+        # still running after cutover.
+        with open(f.csv, 'a', newline='') as fh:
+            fh.write(legacy_row('2026-07-31 09:30:00'))
+
+        raised = ''
+        try:
+            s.put([obs('2026-07-31T10:00:00+10:00')])
+        except CorruptionError as e:
+            raised = str(e)
+        check('another process is appending' in raised,
+              'the projection refuses rather than erasing the foreign row '
+              '(%r)' % raised[:70])
+        body = open(f.csv).read()
+        check('09:30:00' in body, 'the foreign row is still there')
+
+        # reconcile() must refuse for the same reason.
+        raised = ''
+        try:
+            with s._DayLock(t.state, f.key):
+                s.reconcile(f)
+        except CorruptionError as e:
+            raised = str(e)
+        check('not in the JSONL' in raised, 'reconcile refuses too')
+
+
+def test_empty_jsonl_beside_a_legacy_csv():
+    print('\n== a zero-byte JSONL must not authorise erasing the CSV ==')
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        write_csv(f, [legacy_row('2026-07-31 09:00:00'),
+                      legacy_row('2026-07-31 09:01:00')])
+        open(f.jsonl, 'w').close()          # zero bytes
+        raised = ''
+        try:
+            with t.store()._DayLock(t.state, f.key):
+                t.store().adopt_legacy_csv(f, 2026, 7, 31)
+        except CorruptionError as e:
+            raised = str(e)
+        check('refusing to project an empty JSONL' in raised,
+              'an empty JSONL beside a legacy CSV is refused (%r)'
+              % raised[:70])
+
+
+def test_dispositions_are_per_input():
+    print('\n== put reports an outcome for every input ==')
+    from cyc_store import STORED, DUPLICATE, REJECTED
+    with Tmp() as t:
+        s = t.store()
+        ts = '2026-07-31T10:00:03+10:00'
+        a, d, r, _, disp = s.put([
+            obs(ts),                                   # stored
+            obs(ts),                                   # same instant -> dup
+            {'obs_ts': 'not a timestamp'},             # rejected
+            obs('2026-07-31T10:01:03+10:00'),          # stored
+        ])
+        check(disp == [STORED, DUPLICATE, REJECTED, STORED],
+              'one outcome per input, in input order (got %s)' % disp)
+        check((a, d, r) == (2, 1, 1), 'and the totals agree (%s)' % ((a, d, r),))
+        check(len(disp) == 4, 'length matches the input list')
+
+
 def main():
     for fn in [test_format_contract, test_replay_and_first_write_wins,
                test_out_of_order, test_dst_fold, test_spring_forward,
@@ -632,6 +786,10 @@ def main():
                test_stale_index_across_processes,
                test_crash_between_jsonl_and_csv_is_repaired,
                test_crash_after_csv_leaves_nothing_to_do,
+               test_adoption_aborts_if_the_csv_moves_under_it,
+               test_foreign_csv_rows_are_never_projected_over,
+               test_empty_jsonl_beside_a_legacy_csv,
+               test_dispositions_are_per_input,
                test_adoption_is_atomic,
                test_adoption_rejects_damaged_input,
                test_adoption_rejects_impossible_local_times,
