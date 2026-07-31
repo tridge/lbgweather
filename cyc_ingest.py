@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, TZ, parse_obs_ts, utc_key,  # noqa: E402
-                       StoreError, CorruptionError, LockTimeout)
+                       StoreError, CorruptionError, LockTimeout, DURABLE)
 
 SCHEME = 'v1'
 MAX_BODY = 2 * 1024 * 1024
@@ -219,19 +219,23 @@ class Handler(BaseHTTPRequestHandler):
             return xff.split(',')[-1].strip()
         return self.client_address[0]
 
-    def respond(self, code, payload):
+    def respond(self, code, payload, retry_after=None):
         body = json.dumps(payload).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        if retry_after is not None:
+            # Tell a transiently-refused caller when to come back rather than
+            # leaving it to guess or to give up.
+            self.send_header('Retry-After', str(retry_after))
         self.end_headers()
         self.wfile.write(body)
 
-    def fail(self, code, error, **extra):
+    def fail(self, code, error, retry_after=None, **extra):
         payload = {'ok': False, 'error': error, 'server_time': now_iso()}
         payload.update(extra)
-        self.respond(code, payload)
+        self.respond(code, payload, retry_after=retry_after)
 
     # ----------------------------------------------------------------- auth
 
@@ -418,10 +422,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(403, 'station_not_configured')
 
         try:
-            accepted, dup, rejected, details, durable = store.put(obs)
+            accepted, dup, rejected, details, disp = store.put(obs)
         except LockTimeout as e:
             self.log_message('day lock busy: %s', e)
-            return self.fail(503, 'busy')
+            return self.fail(503, 'busy', retry_after=5)
         except CorruptionError as e:
             self.log_message('CORRUPTION: %s', e)
             return self.fail(500, 'storage_corrupt')
@@ -431,27 +435,9 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message('storage error: %s', e)
             return self.fail(500, 'storage_error')
 
-        # ack_seq is the highest CONTIGUOUS durable sequence, walking the batch
-        # in the order it was sent. The highest durable seq is not safe: if
-        # seq 5 is refused and seq 6 stored, acknowledging 6 makes a
-        # cursor-based collector discard 5 for ever. Stopping at the first
-        # non-durable record means the collector re-sends from there.
-        ack_seq = None
-        newest_utc = None
-        for o in obs:
-            if not isinstance(o, dict):
-                break
-            try:
-                u = utc_key(parse_obs_ts(o.get('obs_ts')))
-            except StoreError:
-                break
-            if u not in durable:
-                break
-            if newest_utc is None or u > newest_utc:
-                newest_utc = u
-            sq = o.get('seq')
-            if isinstance(sq, int):
-                ack_seq = sq
+        ack_seq, newest_utc, seq_problem = ack_from_dispositions(obs, disp)
+        if seq_problem:
+            details.append(seq_problem)
 
         self.server.record(station, accepted, dup, rejected, newest_utc,
                            ack_seq, collector or {})
@@ -498,9 +484,41 @@ class Server(ThreadingHTTPServer):
     def _heartbeat(self):
         while not self._beat_stop.wait(HEARTBEAT_S):
             try:
+                self.retry_degraded()
                 self.write_status()
             except Exception as e:
                 sys.stderr.write('heartbeat: %s\n' % e)
+
+    def server_close(self):
+        # Stop the heartbeat before the socket goes. Left running, it outlives
+        # the server and keeps writing into a directory that may already be
+        # gone -- harmless in production, but every test harness leaked one.
+        self._beat_stop.set()
+        try:
+            self._beat.join(timeout=HEARTBEAT_S + 5)
+        except RuntimeError:
+            pass
+        super().server_close()
+
+    def retry_degraded(self):
+        """Re-test days that failed at startup for a transient reason.
+
+        A LockTimeout or a passing OSError during startup reconciliation used
+        to pin health at 503 until someone restarted the service. Corruption
+        stays until it is fixed; anything that now succeeds is cleared.
+        """
+        if not self.degraded:
+            return
+        for name in list(self.degraded):
+            store = self.stores.get(name.split('/')[0])
+            if store is None:
+                continue
+            try:
+                store.reconcile_all()
+            except Exception:
+                continue
+            if not store.degraded():
+                self.degraded.pop(name, None)
 
     # ------------------------------------------------------------ capacity
 
@@ -515,7 +533,15 @@ class Server(ThreadingHTTPServer):
                 pass
             self.shutdown_request(request)
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # Thread creation can fail (RuntimeError: can't start new thread).
+            # Without this the slot is held for ever and the accepted socket
+            # is never closed, so the cap ratchets down to zero.
+            self.slots.release()
+            self.shutdown_request(request)
+            raise
 
     def process_request_thread(self, request, client_address):
         try:
@@ -548,10 +574,23 @@ class Server(ThreadingHTTPServer):
                         seq_gaps=st.seq_gaps, collector=dict(st.collector))
 
     def write_status(self):
-        """Absolute timestamps are authoritative; obs_age_s is a convenience
-        that goes stale if nothing rewrites it. feed_watch.py refreshes it every
-        minute so a dead producer shows a growing age rather than a frozen one.
+        """Publish the primary station's status.
+
+        Absolute timestamps are authoritative; obs_age_s is a convenience that
+        goes stale if nothing rewrites it, so the heartbeat thread rewrites
+        this document every HEARTBEAT_S and a dead producer shows a growing age
+        rather than a frozen one. Nothing outside this process may write it.
+
+        The snapshot is taken INSIDE the lock and held through the rename.
+        Taking it outside let a slow writer read an old snapshot, get
+        overtaken by a newer one, and then replace the file with its stale
+        copy -- publishing a regression in the very field that proves
+        liveness.
         """
+        with self._status_lock:
+            self._write_status_locked()
+
+    def _write_status_locked(self):
         st = self.snapshot()
         now = time.time()
         last_obs = st['last_obs_utc']
@@ -587,26 +626,22 @@ class Server(ThreadingHTTPServer):
             'degraded': self.current_degraded(),
         }
         path = self.cfg['status']
-        # Serialised: unique temp names stop two writers sharing an inode, but
-        # without this an older snapshot could still land after a newer one and
-        # regress the file.
-        with self._status_lock:
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.',
-                                       prefix='.status-', suffix='.tmp')
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.',
+                                   prefix='.status-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(doc, f, indent=1, sort_keys=True)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError as e:
+            sys.stderr.write('status write failed: %s\n' % e)
             try:
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    json.dump(doc, f, indent=1, sort_keys=True)
-                    f.write('\n')
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.chmod(tmp, 0o644)
-                os.replace(tmp, path)
-            except OSError as e:
-                sys.stderr.write('status write failed: %s\n' % e)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def current_degraded(self):
         """Days any store currently cannot read, plus startup failures."""
@@ -615,6 +650,57 @@ class Server(ThreadingHTTPServer):
             for day, msg in store.degraded().items():
                 out['%s/%s' % (name, day)] = msg
         return out
+
+
+def ack_from_dispositions(obs, disp):
+    """Highest safely-acknowledgeable seq, and the newest durable instant.
+
+    The cursor contract: within one request the collector sends records in
+    increasing sequence order, and we acknowledge the longest leading run that
+    is BOTH durable and correctly ordered. Anything after the first problem is
+    left unacknowledged so the collector resends it.
+
+    Strictly increasing rather than exactly +1: the collector may legitimately
+    skip sequences after it drops spool files under disk pressure, and that
+    loss is reported separately as a data_loss marker and counted in seq_gaps.
+    A record with no integer seq stops the acknowledgement rather than being
+    stepped over -- there is nothing to acknowledge it WITH.
+
+    Durability is taken per input, never from a set of UTC instants: two inputs
+    can share an instant, and a set cannot say which of them is the record on
+    disk.
+    """
+    ack = None
+    newest = None
+    problem = None
+
+    # newest_utc covers every durable record, not merely the acknowledged
+    # prefix -- a good observation after a malformed one is still on disk, and
+    # reporting stale freshness because of the malformed one would hide it.
+    for o, d in zip(obs, disp):
+        if d not in DURABLE or not isinstance(o, dict):
+            continue
+        try:
+            u = utc_key(parse_obs_ts(o.get('obs_ts')))
+        except StoreError:
+            continue
+        if newest is None or u > newest:
+            newest = u
+
+    for o, d in zip(obs, disp):
+        if d not in DURABLE:
+            problem = problem or ('seq stops at a %s record' % d)
+            break
+        sq = o.get('seq') if isinstance(o, dict) else None
+        if not isinstance(sq, int) or isinstance(sq, bool):
+            problem = problem or 'a durable record carries no integer seq'
+            break
+        if ack is not None and sq <= ack:
+            problem = problem or ('seq %s does not increase after %s' % (sq, ack))
+            break
+        ack = sq
+
+    return ack, newest, problem
 
 
 def parse_station_arg(value):
@@ -640,9 +726,22 @@ def main(argv=None):
     p.add_argument('--status', required=True)
     p.add_argument('--min-obs-ts', type=int, default=None,
                    help='exact UTC epoch of cutover; obs at or before are refused')
+    p.add_argument('--allow-crash-injection', action='store_true',
+                   help=argparse.SUPPRESS)
     p.add_argument('--max-conns', type=int, default=16)
     p.add_argument('--enable-echo', action='store_true')
     args = p.parse_args(argv)
+
+    # CYC_STORE_CRASH_AT makes the store os._exit mid-write. It exists for the
+    # crash-interleaving tests. A stray Environment= line in a unit file would
+    # otherwise give a permanent exit/restart loop that looks like a crash bug,
+    # so refuse to start rather than obey it by accident.
+    if os.environ.get('CYC_STORE_CRASH_AT') and not args.allow_crash_injection:
+        raise SystemExit('CYC_STORE_CRASH_AT is set (%r). That makes the store '
+                         'exit mid-write. Unset it, or pass '
+                         '--allow-crash-injection if this really is a test.'
+                         % os.environ['CYC_STORE_CRASH_AT'])
+
 
     keys = load_keys(args.keyfile)
     stations = dict(args.station)

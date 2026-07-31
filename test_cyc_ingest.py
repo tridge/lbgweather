@@ -81,6 +81,20 @@ class Harness:
     def url(self, path):
         return 'http://127.0.0.1:%d%s' % (self.port, path)
 
+    def signed_request(self, path, doc, key=KEY, station=STATION):
+        body = json.dumps(doc).encode('utf-8')
+        ts = int(time.time())
+        nonce = secrets.token_hex(16)
+        req = urllib.request.Request(self.url(path), data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('X-CYC-Station', station)
+        req.add_header('X-CYC-Timestamp', str(ts))
+        req.add_header('X-CYC-Nonce', nonce)
+        req.add_header('X-CYC-Signature',
+                       sign(bytes.fromhex(key), 'POST', path, station, ts,
+                            nonce, body))
+        return req
+
     def post(self, path, doc, key=KEY, station=STATION, ts=None, nonce=None,
              corrupt_sig=False, raw=None):
         body = raw if raw is not None else json.dumps(doc).encode('utf-8')
@@ -611,6 +625,181 @@ def test_concurrent_posts_do_not_deadlock_or_lose_records():
               % (n, len(stored)))
 
 
+def test_shedding_stores_nothing_and_retries_cleanly():
+    print('\n== a shed request must store nothing, provably ==')
+    with Harness() as h:
+        # Cap of 1, and one slot held open by a connection that never sends a
+        # request. Every other request is now GUARANTEED to be shed, so the
+        # assertions below cannot pass by luck the way the 24-way test can.
+        import http.client
+        h.srv.slots = threading.BoundedSemaphore(1)
+        hog = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+        hog.connect()
+        time.sleep(0.4)
+        try:
+            code, body = h.post('/ingest/obs',
+                                doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        finally:
+            hog.close()
+        check(code == 503, 'the post was shed (got %s)' % code)
+
+        import cyc_store
+        f = cyc_store.DayFiles(h.logs, 2026, 7, 31)
+        check(not os.path.exists(f.jsonl),
+              'nothing at all was written - the shed happened before any '
+              'storage work')
+
+        time.sleep(0.3)
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        check(code == 200 and body['accepted'] == 1,
+              'and the slot was released, so the retry stores it (got %s)'
+              % code)
+
+
+def test_status_never_regresses_under_concurrent_writers():
+    print('\n== the status document must not go backwards ==')
+    with Harness() as h:
+        seen = []
+        stop = threading.Event()
+
+        def watch():
+            while not stop.is_set():
+                try:
+                    with open(h.status) as f:
+                        seen.append(json.load(f).get('last_obs_epoch'))
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.002)
+        w = threading.Thread(target=watch, daemon=True)
+        w.start()
+
+        # Many writers racing, plus the heartbeat, all calling write_status.
+        def fire(i):
+            h.post('/ingest/obs',
+                   doc([obs('2026-07-31T%02d:%02d:03+10:00'
+                            % (10 + i // 60, i % 60), i + 1)]))
+        ts = [threading.Thread(target=fire, args=(i,)) for i in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=60)
+        for _ in range(20):
+            h.srv.write_status()
+        stop.set()
+        w.join(timeout=5)
+
+        vals = [v for v in seen if v is not None]
+        regressions = [(a, b) for a, b in zip(vals, vals[1:]) if b < a]
+        check(not regressions,
+              'last_obs_epoch never went backwards across %d reads (%s)'
+              % (len(vals), regressions[:3]))
+
+
+def test_ack_sequence_contract():
+    print('\n== the ACK sequence contract, per input ==')
+    from cyc_ingest import ack_from_dispositions as A
+    from cyc_store import STORED, DUPLICATE, REJECTED
+
+    def o(ts, seq=None):
+        d = {'obs_ts': ts}
+        if seq is not None:
+            d['seq'] = seq
+        return d
+
+    t1, t2, t3 = ('2026-07-31T10:00:03+10:00', '2026-07-31T10:01:03+10:00',
+                  '2026-07-31T10:02:03+10:00')
+
+    ack, newest, _ = A([o(t1, 5), o(t2, 6)], [STORED, STORED])
+    check(ack == 6, 'a clean increasing run is fully acknowledged')
+
+    ack, _, _ = A([o(t1, 5), o(t2, 6)], [REJECTED, STORED])
+    check(ack is None, 'a leading rejection stops the acknowledgement')
+
+    ack, _, why = A([o(t1, 5), o(t2, 7)], [STORED, STORED])
+    check(ack == 7, 'a seq GAP is still acknowledged (spool loss is explicit)')
+
+    ack, _, why = A([o(t1, 10), o(t2, 9)], [STORED, STORED])
+    check(ack == 10 and why,
+          'a DECREASING seq stops at the violation (got %s, %r)' % (ack, why))
+
+    ack, _, why = A([o(t1, 5), o(t2), o(t3, 7)], [STORED, STORED, STORED])
+    check(ack == 5 and why,
+          'a durable record with no seq stops the run rather than being '
+          'stepped over (got %s)' % ack)
+
+    ack, _, why = A([o(t1, 5), o(t2, True)], [STORED, STORED])
+    check(ack == 5, 'a bool is not an acceptable seq')
+
+    # The UTC-laundering case: two inputs on ONE instant, the first stored and
+    # the second rejected. A UTC key set cannot tell them apart.
+    ack, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, REJECTED])
+    check(ack == 5,
+          'a record rejected on an instant another record occupies is NOT '
+          'acknowledged (got %s)' % ack)
+
+    ack, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, DUPLICATE])
+    check(ack == 6, 'but a genuine duplicate IS durable and acknowledged')
+
+    # Freshness must cover everything durable, not just the acked prefix.
+    _, newest, _ = A([o(t1), o(t3, 9)], [STORED, STORED])
+    check(newest == utc_key(parse_obs_ts(t3)),
+          'newest instant reflects the later durable record even though the '
+          'ACK stopped early')
+
+
+def test_duplicate_instant_in_one_batch():
+    print('\n== two observations sharing an instant in one request ==')
+    with Harness() as h:
+        ts = '2026-07-31T10:00:03+10:00'
+        code, body = h.post('/ingest/obs', doc([obs(ts, 1, wind=1.0),
+                                                obs(ts, 2, wind=9.9)]))
+        check(body['accepted'] == 1 and body['duplicates'] == 1,
+              'one stored, one recognised as the same instant')
+        check(body['ack_seq'] == 2,
+              'both acknowledged - the second is durable in the sense that '
+              'the instant is on disk (got %s)' % body['ack_seq'])
+        import cyc_store
+        recs = h.srv.stores[STATION]._read_jsonl(
+            cyc_store.DayFiles(h.logs, 2026, 7, 31))
+        check(len(recs) == 1, 'only one record on disk')
+        check(recs[0]['wind_kt'] == 1.0, 'first write wins')
+
+
+def test_busy_carries_retry_after():
+    print('\n== a transient refusal says when to come back ==')
+    with Harness() as h:
+        import cyc_store
+        orig = cyc_store.Store.put
+
+        def busy(self, observations):
+            raise cyc_store.LockTimeout('busy for the test')
+        cyc_store.Store.put = busy
+        try:
+            req = h.signed_request('/ingest/obs',
+                                   doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                code, hdrs = 200, {}
+            except urllib.error.HTTPError as e:
+                code, hdrs = e.code, dict(e.headers)
+        finally:
+            cyc_store.Store.put = orig
+        check(code == 503, 'a busy day lock sheds with 503 (got %s)' % code)
+        check(hdrs.get('Retry-After') == '5',
+              'and carries Retry-After (got %r)' % hdrs.get('Retry-After'))
+
+
+def test_heartbeat_stops_with_the_server():
+    print('\n== the heartbeat does not outlive the server ==')
+    with Harness() as h:
+        beat = h.srv._beat
+        check(beat.is_alive(), 'heartbeat running while serving')
+    check(not beat.is_alive(),
+          'heartbeat stopped by server_close - it used to keep writing into '
+          'a deleted directory for ever')
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -633,6 +822,12 @@ def main():
     test_shadow_only_advances_on_a_real_ack()
     test_a_second_station_cannot_speak_for_the_primary()
     test_concurrent_posts_do_not_deadlock_or_lose_records()
+    test_shedding_stores_nothing_and_retries_cleanly()
+    test_status_never_regresses_under_concurrent_writers()
+    test_ack_sequence_contract()
+    test_duplicate_instant_in_one_batch()
+    test_busy_carries_retry_after()
+    test_heartbeat_stops_with_the_server()
 
     print()
     if FAILURES:
