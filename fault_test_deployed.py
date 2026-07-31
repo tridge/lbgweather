@@ -20,8 +20,8 @@ import time
 import urllib.error
 import urllib.request
 
-WIND = '/home/lbgweather/wind'
-sys.path.insert(0, WIND)
+CODE = '/home/lbgweather/lib/cyc'    # service code lives outside DocumentRoot
+sys.path.insert(0, CODE)
 from cyc_ingest import sign            # noqa: E402
 from cyc_store import parse_obs_ts, utc_key  # noqa: E402
 
@@ -52,9 +52,10 @@ class Instance:
 
     def start(self):
         self.p = subprocess.Popen(
-            ['/usr/bin/python3', os.path.join(WIND, 'cyc_ingest.py'),
+            ['/usr/bin/python3', os.path.join(CODE, 'cyc_ingest.py'),
              '--host', '127.0.0.1', '--port', str(PORT),
-             '--keyfile', self.keyfile, '--logdir', self.logs,
+             '--keyfile', self.keyfile,
+             '--station', 'cyc1=' + self.logs,
              '--statedir', self.state, '--status', self.status],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(60):
@@ -98,7 +99,7 @@ class Instance:
                      ('X-CYC-Timestamp', str(ts)),
                      ('X-CYC-Nonce', nonce),
                      ('X-CYC-Signature',
-                      sign(KEY.encode(), 'POST', path, 'cyc1', ts, nonce, body))]:
+                      sign(bytes.fromhex(KEY), 'POST', path, 'cyc1', ts, nonce, body))]:
             req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -117,6 +118,19 @@ class Instance:
         return sum(1 for line in open(p) if line.strip())
 
 
+def ago(seconds):
+    """An ISO timestamp `seconds` in the past, with an explicit offset.
+
+    Fixtures must be in the past: future-dated observations are refused, which
+    is itself deliberate -- a collector with a bad clock would otherwise write
+    records that look perpetually fresh.
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    t = datetime.now(ZoneInfo('Australia/Sydney')) - timedelta(seconds=seconds)
+    return t.replace(microsecond=0).isoformat(timespec='seconds')
+
+
 def obs(ts, seq, wind=1.0):
     return {'obs_ts': ts, 'seq': seq, 'src': 'loop', 'wind_kt': wind,
             'wind_avg_kt': 0.9, 'wind_dir': 270, 'wind_gust_kt': 2.0,
@@ -125,29 +139,31 @@ def obs(ts, seq, wind=1.0):
 
 print('== out-of-order backfill (6 hours late) ==')
 with Instance() as inst:
-    inst.post([obs('2026-08-01T12:00:00+10:00', 1, 1.0),
-               obs('2026-08-01T12:01:00+10:00', 2, 2.0)])
-    code, body = inst.post([obs('2026-08-01T06:00:00+10:00', 3, 6.0)])
+    recent, later, old = ago(120), ago(60), ago(3600)
+    inst.post([obs(recent, 1, 1.0), obs(later, 2, 2.0)])
+    code, body = inst.post([obs(old, 3, 6.0)])
     check(code == 200 and body['accepted'] == 1, 'backfill accepted')
-    lines = inst.csv(2026, 8, 1).decode().rstrip('\r\n').split('\r\n')
+    y, m, d = [int(x) for x in old[:10].split('-')]
+    lines = inst.csv(y, m, d).decode().rstrip('\r\n').split('\r\n')
     stamps = [l.split(',')[0] for l in lines[1:]]
-    check(stamps == sorted(stamps), 'CSV re-sorted, not appended',
-          str(stamps))
-    check(stamps[0] == '2026-08-01 06:00:00',
-          'six-hour-old record placed first')
+    check(stamps == sorted(stamps), 'CSV re-sorted, not appended', str(stamps))
+    check(stamps[0] == old[11:19].join(['%s ' % old[:10], '']).strip()
+          or stamps[0].endswith(old[11:19]),
+          'hour-old record placed first (%s)' % stamps[0])
     check(len(lines) == 4, 'header + 3 rows')
 
 print()
 print('== replay is byte-identical ==')
 with Instance() as inst:
-    batch = [obs('2026-08-01T12:00:00+10:00', 1),
-             obs('2026-08-01T12:01:00+10:00', 2)]
+    a, b = ago(120), ago(60)
+    batch = [obs(a, 1), obs(b, 2)]
     inst.post(batch)
-    before = inst.csv(2026, 8, 1)
+    y, m, d = [int(x) for x in a[:10].split('-')]
+    before = inst.csv(y, m, d)
     code, body = inst.post(batch)
     check(body['accepted'] == 0 and body['duplicates'] == 2,
           'replay -> 0 accepted, 2 duplicates')
-    check(inst.csv(2026, 8, 1) == before, 'CSV unchanged byte-for-byte')
+    check(inst.csv(y, m, d) == before, 'CSV unchanged byte-for-byte')
 
 print()
 print('== DST fall-back fold, real Canberra dates ==')
@@ -165,11 +181,13 @@ with Instance() as inst:
 print()
 print('== SIGKILL mid-write, then retry ==')
 with Instance() as inst:
-    inst.post([obs('2026-08-01T12:00:00+10:00', 1)])
-    before_rows = inst.jsonl_count(2026, 8, 1)
+    base = ago(7200)
+    y, m, d = [int(x) for x in base[:10].split('-')]
+    inst.post([obs(base, 1)])
+    before_rows = inst.jsonl_count(y, m, d)
 
     # Kill hard while a large batch is in flight.
-    big = [obs('2026-08-01T13:%02d:00+10:00' % i, 100 + i) for i in range(60)]
+    big = [obs(ago(7200 - 60 * i), 100 + i) for i in range(1, 61)]
     import threading
     res = {}
 
@@ -183,15 +201,17 @@ with Instance() as inst:
     time.sleep(0.05)
     inst.kill()
     t.join(timeout=15)
-    check(True, 'service killed mid-POST (client saw %s)'
+    # NOT check(True): that could never fail. Assert what actually happened.
+    killed = inst.p.poll() is not None
+    check(killed, 'service is dead after SIGKILL (client saw %s)'
           % ('error' if 'e' in res else 'status %s' % res.get('r', ('?',))[0]))
 
     inst.start()          # restart, as systemd Restart=always would
     code, body = inst.post(big)
     check(code == 200, 'retry after restart accepted')
 
-    rows = inst.jsonl_count(2026, 8, 1)
-    csv_rows = len(inst.csv(2026, 8, 1).decode().rstrip('\r\n').split('\r\n')) - 1
+    rows = inst.jsonl_count(y, m, d)
+    csv_rows = len(inst.csv(y, m, d).decode().rstrip('\r\n').split('\r\n')) - 1
     check(rows == csv_rows,
           'JSONL and CSV agree after crash + retry (%d vs %d)' % (rows, csv_rows))
     check(rows == before_rows + len(big),
@@ -200,14 +220,15 @@ with Instance() as inst:
 print()
 print('== cutover instant refuses pre-cutover data ==')
 with Instance() as inst:
-    inst.post([obs('2026-08-01T12:00:00+10:00', 1)])
+    inst.post([obs(ago(600), 1)])
     # restart with a cutover instant set
     inst.kill(signal.SIGTERM)
-    cut = utc_key(parse_obs_ts('2026-08-01T12:00:30+10:00'))
+    cut = utc_key(parse_obs_ts(ago(300)))
     inst.p = subprocess.Popen(
-        ['/usr/bin/python3', os.path.join(WIND, 'cyc_ingest.py'),
+        ['/usr/bin/python3', os.path.join(CODE, 'cyc_ingest.py'),
          '--host', '127.0.0.1', '--port', str(PORT),
-         '--keyfile', inst.keyfile, '--logdir', inst.logs,
+         '--keyfile', inst.keyfile,
+         '--station', 'cyc1=' + inst.logs,
          '--statedir', inst.state, '--status', inst.status,
          '--min-obs-ts', str(cut)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -218,8 +239,7 @@ with Instance() as inst:
             break
         except Exception:
             time.sleep(0.25)
-    code, body = inst.post([obs('2026-08-01T11:59:00+10:00', 9),
-                            obs('2026-08-01T12:05:00+10:00', 10)])
+    code, body = inst.post([obs(ago(400), 9), obs(ago(120), 10)])
     check(body['accepted'] == 1 and body['rejected'] == 1,
           'pre-cutover refused, post-cutover accepted')
 

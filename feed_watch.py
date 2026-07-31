@@ -41,6 +41,8 @@ AUTH_FAIL_WARN = 20
 BACKLOG_WARN = 60
 REMINDER_S = 86400
 RETRY_S = 900
+# Small allowance for ordinary clock jitter before a future date is a fault.
+SKEW_TOLERANCE_S = 120
 
 
 def load_notify_emails():
@@ -127,6 +129,12 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
         return 'alarm', ['no observation has ever been recorded']
 
     age = now - last_obs
+    if age < -SKEW_TOLERANCE_S:
+        # A future-dated record looks perpetually fresh, which is precisely the
+        # blindness this watchdog exists to remove.
+        return 'alarm', ['observation is dated %s in the FUTURE - the '
+                         'collector clock is wrong and the historical record '
+                         'is being mis-stamped' % fmt_age(-age)]
     if age > alarm_age:
         severity = 'alarm'
         problems.append('feed is %s old (alarm above %s)'
@@ -227,13 +235,26 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     now = time.time()
+    state = load_json(args.state, {}) or {}
     status = load_json(args.status)
+
     if status is None:
-        # No status file at all is itself a fault, but it is also the normal
-        # state before first deployment, so stay quiet rather than crying wolf.
-        if not args.quiet:
-            print('feed_watch: no status document at %s' % args.status)
-        return 0
+        # Before first deployment this is normal and silence is right. Once we
+        # have seen a status document, its disappearance is a real fault --
+        # deletion, a permission change, or the producer dying -- and must not
+        # be invisible.
+        if not state.get('ever_seen_status'):
+            if not args.quiet:
+                print('feed_watch: no status document at %s (never seen one '
+                      'yet, staying quiet)' % args.status)
+            return 0
+        status = {}
+        severity, problems = 'alarm', [
+            'status document %s has disappeared or is unreadable' % args.status]
+    else:
+        state['ever_seen_status'] = True
+        severity = None
+        problems = None
 
     # Refresh the derived age so a dead producer shows a growing number.
     last_obs = status.get('last_obs_epoch')
@@ -242,9 +263,9 @@ def main(argv=None):
         status['age_refreshed_at_epoch'] = int(now)
         save_json_atomic(args.status, status)
 
-    severity, problems = evaluate(status, now, args.warn_age, args.alarm_age,
-                                  args.lag_warn)
-    state = load_json(args.state, {}) or {}
+    if severity is None:
+        severity, problems = evaluate(status, now, args.warn_age,
+                                      args.alarm_age, args.lag_warn)
     in_episode = bool(state.get('in_episode'))
     last_mail = state.get('last_mail_epoch', 0)
     last_attempt = state.get('last_attempt_epoch', 0)
@@ -268,20 +289,27 @@ def main(argv=None):
         elif pending is None and now - last_mail > REMINDER_S:
             pending = 'alarm'                        # daily reminder
     elif severity == 'ok' and in_episode:
-        pending = 'recovered'                        # recovery
+        # Never discard an undelivered outage alert by overwriting it with a
+        # recovery notice -- that would announce the end of an incident nobody
+        # was told about. Merge instead.
+        pending = 'alarm_resolved' if pending == 'alarm' else 'recovered'
 
     if pending:
         first_try = (pending != prev_pending)
         if first_try or now - last_attempt >= RETRY_S:
             state['last_attempt_epoch'] = now
-            recovered = (pending == 'recovered')
+            recovered = pending in ('recovered', 'alarm_resolved')
             if args.no_mail:
                 print('feed_watch: would mail (%s)' % pending)
                 state['last_mail_epoch'] = now
                 pending = None
             else:
-                subject = ('lbgweather: feed recovered' if recovered
-                           else 'lbgweather: weather feed stale')
+                subject = {
+                    'alarm': 'lbgweather: weather feed stale',
+                    'recovered': 'lbgweather: feed recovered',
+                    'alarm_resolved':
+                        'lbgweather: feed went stale and has recovered',
+                }[pending]
                 if send_email(subject,
                               body_html(status, problems, now, recovered)):
                     state['last_mail_epoch'] = now
@@ -289,7 +317,13 @@ def main(argv=None):
 
     state['pending_mail'] = pending
 
-    state['in_episode'] = (severity == 'alarm')
+    # An episode persists through 'warn' and only ends at 'ok'. Clearing it on
+    # a transient dip to warn would make the next alarm look like a new
+    # episode and re-alert, and would skip the recovery mail entirely.
+    if severity == 'alarm':
+        state['in_episode'] = True
+    elif severity == 'ok':
+        state['in_episode'] = False
     state['last_severity'] = severity
     state['last_check_epoch'] = int(now)
     save_json_atomic(args.state, state, mode=0o600)

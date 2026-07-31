@@ -83,6 +83,8 @@ check(code == 413, 'oversized body refused at the edge (%d MB)'
 
 print()
 print('== rate limiting (this host only) ==')
+print('   note: leaves this IP limited for %ds; auth cases above must run first'
+      % 300)
 codes = []
 for _ in range(14):
     c, _ = req('/ingest/obs', 'POST', jbody(OBS), hdrs())
@@ -97,11 +99,15 @@ for p, want in [('/etc/cyc_ingest.key', 404),
                 # Apache rejects the malformed URI outright; either way
                 # the key is unreachable.
                 ('/../etc/cyc_ingest.key', 400),
-                ('/cyc_ingest.py', 403),
-                ('/cyc_store.py', 403),
-                ('/feed_watch.py', 403),
-                ('/feedwatch_state.json', 403),
-                ('/cyc_shadow_post.py', 403)]:
+                # 404, not 403: the service code no longer lives under the
+                # DocumentRoot at all, so its existence is not even confirmed.
+                ('/cyc_ingest.py', 404),
+                ('/cyc_store.py', 404),
+                ('/feed_watch.py', 404),
+                ('/cyc_shadow_post.py', 404),
+                ('/feedwatch_state.json', 404),
+                ('/wind_logger.py', 403),
+                ('/notify_emails.txt', 403)]:
     code, _ = req(p)
     check(code == want, 'GET %s -> %s' % (p, want), 'got %s' % code)
 

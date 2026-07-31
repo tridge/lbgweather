@@ -4,32 +4,35 @@
 Two tiers, deliberately:
 
   wind_logs/YYYY/MM/DD.jsonl   write-ahead truth. Full-fidelity, one JSON object
-                               per line, carries the observation's real UTC
+                               per line, carrying the observation's real UTC
                                instant and every field the collector sent.
 
   wind_logs/YYYY/MM/DD.csv     a *projection* of the JSONL for the website. Same
-                               seven columns, same CRLF line ending and same
-                               naive-local timestamp that wind_logger.py has
-                               always written, so index.html needs no change.
+                               seven columns, same CRLF line ending and the same
+                               naive-local timestamp wind_logger.py has always
+                               written, so index.html needs no change.
 
-The CSV is rebuildable from the JSONL at any time, which is what makes the pair
-crash-safe: JSONL is appended and fsynced first, and if we die before the CSV is
-updated, reconcile() repairs it.
+The CSV is always rebuildable from the JSONL, which is what makes the pair
+crash-safe. Ordering matters: the JSONL is appended and fsynced first, the
+in-memory dedup index is updated only *after* that succeeds, and the CSV is
+projected last. reconcile() compares the CSV against a freshly rendered
+projection -- byte-for-byte, not by row count, because equal counts can hide
+wrong values, wrong order, a partial row or a missing header.
 
 Dedup keys on the UTC instant, never the local timestamp string. Canberra's
-autumn fall-back produces two distinct observations that render as the same local
-string -- wind_logs/2026/04/05.csv already contains two 02:00:03 rows carrying
-different readings. Keying on the string would silently delete an hour of history
-every April.
+autumn fall-back produces two distinct observations that render identically
+(wind_logs/2026/04/05.csv already holds two 02:00:03 rows with different
+readings), so a string key would delete an hour of history every April.
 """
 
 import csv
 import fcntl
 import io
 import json
+import math
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Australia/Sydney')
@@ -40,26 +43,42 @@ CSV_FIELDS = ['timestamp', 'wind_kt', 'wind_avg_kt', 'wind_dir',
 
 CSV_NEWLINE = '\r\n'
 
+# An observation dated further ahead than this is refused. A collector with a
+# broken clock would otherwise write records that look perpetually fresh, which
+# is exactly the blindness this whole project exists to remove.
+MAX_FUTURE_S = 300
+
 
 class StoreError(Exception):
-    pass
+    """Bad input. Caller should reject the record, not retry it."""
+
+
+class CorruptionError(Exception):
+    """On-disk state is not what we wrote. Never silently repaired."""
 
 
 def parse_obs_ts(value):
     """Parse an ISO 8601 timestamp that MUST carry an explicit UTC offset.
 
     Rejecting naive timestamps is the point: a bare local string is ambiguous
-    for one hour every April, and accepting one would reintroduce exactly the
-    bug this module exists to avoid.
+    for one hour every April, and accepting one would reintroduce the bug this
+    module exists to avoid. Archive records that carry console wall-clock time
+    with no offset must be disambiguated by the collector, which has the
+    ordering context to do it; they cannot be resolved here.
     """
     if not isinstance(value, str):
-        raise StoreError('obs_ts must be a string, got %r' % type(value).__name__)
+        raise StoreError('obs_ts must be a string, got %s'
+                         % type(value).__name__)
     try:
         dt = datetime.fromisoformat(value)
     except ValueError as e:
         raise StoreError('obs_ts not ISO 8601: %s' % e)
     if dt.tzinfo is None or dt.utcoffset() is None:
         raise StoreError('obs_ts must carry an explicit UTC offset: %r' % value)
+    if dt.microsecond:
+        # Identity is whole seconds; sub-second precision would silently
+        # collapse two distinct instants into one dedup key.
+        raise StoreError('obs_ts must not carry fractional seconds: %r' % value)
     return dt
 
 
@@ -69,7 +88,6 @@ def utc_key(dt):
 
 
 def local_date(dt):
-    """The Canberra local date an observation belongs to, as (YYYY, MM, DD)."""
     loc = dt.astimezone(TZ)
     return loc.year, loc.month, loc.day
 
@@ -77,6 +95,13 @@ def local_date(dt):
 def local_stamp(dt):
     """The naive-local string wind_logger.py has always written."""
     return dt.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def check_value(key, v):
+    """Reject values that JSON permits but CSV and consumers cannot carry."""
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        raise StoreError('%s is %r, which cannot be represented' % (key, v))
+    return v
 
 
 def _fsync_dir(path):
@@ -88,8 +113,6 @@ def _fsync_dir(path):
 
 
 class DayFiles:
-    """Paths for one local day."""
-
     def __init__(self, root, y, m, d):
         self.dir = os.path.join(root, '%04d' % y, '%02d' % m)
         self.jsonl = os.path.join(self.dir, '%02d.jsonl' % d)
@@ -101,18 +124,25 @@ class DayFiles:
 
 
 class Store:
-    def __init__(self, logdir, statedir, min_obs_ts=None):
+    def __init__(self, logdir, statedir, station='cyc1', min_obs_ts=None,
+                 max_future_s=MAX_FUTURE_S, jsonl_mode=0o640):
         """min_obs_ts is an exact UTC epoch, not a date.
 
-        Observations at or before it are refused, which is what stops a
-        misconfigured collector -- or archive records recovered from the console
-        covering the hours before cutover -- from rewriting legacy history.
+        Observations at or before it are refused, which stops a misconfigured
+        collector -- or archive records recovered from the console covering the
+        hours before cutover -- from rewriting legacy history.
         """
         self.logdir = logdir
         self.statedir = statedir
+        self.station = station
         self.min_obs_ts = min_obs_ts
+        self.max_future_s = max_future_s
+        self.jsonl_mode = jsonl_mode
         os.makedirs(self.statedir, exist_ok=True)
-        self._index = {}          # day key -> set of utc keys present in JSONL
+        # day key -> (set of utc keys, jsonl stat signature). The signature lets
+        # us notice another process having written and reload rather than
+        # trusting a stale set.
+        self._index = {}
 
     # ---------------------------------------------------------------- locking
 
@@ -132,41 +162,72 @@ class Store:
             self.fd = None
             return False
 
-    # ------------------------------------------------------------------ index
+    # ------------------------------------------------------------- integrity
 
-    def _load_index(self, files):
-        """UTC keys already present in a day's JSONL, read once then cached."""
-        if files.key in self._index:
-            return self._index[files.key]
-        keys = set()
-        if os.path.exists(files.jsonl):
-            with open(files.jsonl, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        keys.add(int(rec['utc']))
-                    except (ValueError, KeyError):
-                        continue        # tolerate a torn final line
-        self._index[files.key] = keys
-        return keys
+    @staticmethod
+    def _sig(path):
+        try:
+            st = os.stat(path)
+            return (st.st_size, st.st_mtime_ns, st.st_ino)
+        except FileNotFoundError:
+            return None
 
-    def _read_jsonl(self, files):
+    def _repair_torn_tail(self, files):
+        """Truncate an incomplete final JSONL line. Must hold the day lock.
+
+        A crash mid-append can leave a partial line. Appending after it would
+        splice the next object onto the fragment, producing a permanently
+        malformed line and losing the retried observation too -- so the
+        fragment is removed before any append.
+        """
+        if not os.path.exists(files.jsonl):
+            return False
+        size = os.path.getsize(files.jsonl)
+        if size == 0:
+            return False
+        with open(files.jsonl, 'rb+') as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) == b'\n':
+                return False
+            f.seek(0)
+            data = f.read()
+            cut = data.rfind(b'\n')
+            f.truncate(cut + 1)          # cut == -1 truncates to 0
+            f.flush()
+            os.fsync(f.fileno())
+        self._index.pop(files.key, None)
+        return True
+
+    def _read_jsonl(self, files, strict=True):
+        """Parse a day's JSONL. Malformed lines are corruption, not noise."""
         out = []
         if not os.path.exists(files.jsonl):
             return out
         with open(files.jsonl, 'r', encoding='utf-8') as f:
-            for line in f:
+            for n, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
-                except ValueError:
+                    rec = json.loads(line)
+                    int(rec['utc'])
+                except (ValueError, KeyError, TypeError) as e:
+                    if strict:
+                        raise CorruptionError(
+                            '%s line %d is not a valid record: %s'
+                            % (files.jsonl, n, e))
                     continue
+                out.append(rec)
         return out
+
+    def _load_index(self, files):
+        sig = self._sig(files.jsonl)
+        cached = self._index.get(files.key)
+        if cached is not None and cached[1] == sig:
+            return cached[0]
+        keys = {int(r['utc']) for r in self._read_jsonl(files)}
+        self._index[files.key] = (keys, sig)
+        return keys
 
     # ------------------------------------------------------------ projection
 
@@ -187,31 +248,28 @@ class Store:
         if value is None:
             return ''
         if isinstance(value, float) and value.is_integer():
-            # match wind_logger.py, which writes round(x, 1) -- 4.0 not 4
+            # match wind_logger.py, which writes round(x, 1): 4.0 not 4
             return '%.1f' % value
         return str(value)
 
-    def _write_csv_atomic(self, files, records):
-        """Rewrite the whole CSV from records, sorted by UTC instant.
-
-        os.replace() is atomic, so a browser fetching mid-rewrite gets either the
-        whole old file or the whole new one, never a truncated one. The temp file
-        is created in the same directory (required for atomic rename) and is named
-        so it matches neither wind_stats.py's */*/*.csv glob nor anything the
-        frontend requests.
-        """
+    def render_csv(self, records):
+        """The canonical CSV bytes for a set of records. The only renderer."""
         records = sorted(records, key=lambda r: int(r['utc']))
         buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=CSV_FIELDS, lineterminator=CSV_NEWLINE)
+        w = csv.DictWriter(buf, fieldnames=CSV_FIELDS,
+                           lineterminator=CSV_NEWLINE)
         w.writeheader()
         for rec in records:
             row = self._csv_row(rec)
             w.writerow({k: self._fmt(v) for k, v in row.items()})
-        data = buf.getvalue()
+        return buf.getvalue().encode('utf-8')
 
+    def _write_csv_atomic(self, files, data):
+        """os.replace is atomic, so a browser fetching mid-rewrite gets either
+        the whole old file or the whole new one, never a truncated one."""
         fd, tmp = tempfile.mkstemp(dir=files.dir, prefix='.', suffix='.csvtmp')
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+            with os.fdopen(fd, 'wb') as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
@@ -223,75 +281,170 @@ class Store:
                 os.unlink(tmp)
             raise
 
-    def _append_csv(self, files, records):
-        """Fast path: append rows known to sort after everything already there."""
-        exists = os.path.exists(files.csv)
-        with open(files.csv, 'a', encoding='utf-8', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS,
-                               lineterminator=CSV_NEWLINE)
-            if not exists:
-                w.writeheader()
-            for rec in sorted(records, key=lambda r: int(r['utc'])):
-                row = self._csv_row(rec)
-                w.writerow({k: self._fmt(v) for k, v in row.items()})
-            f.flush()
-            os.fsync(f.fileno())
-        if not exists:
-            os.chmod(files.csv, 0o644)
+    def reconcile(self, files):
+        """Rebuild the CSV if it differs from the projection of the JSONL.
 
-    def _csv_max_utc(self, files):
-        """Highest UTC instant currently represented in the CSV.
-
-        Derived from the JSONL rather than parsed back out of the CSV, because
-        the CSV's local strings are ambiguous across a fold -- which is the whole
-        reason the JSONL exists.
+        Compares the whole rendered file, not the row count. Equal counts can
+        hide wrong values, wrong order, a partial final row, a missing header,
+        or a missing row cancelled out by a duplicate. Caller must hold the day
+        lock.
         """
         recs = self._read_jsonl(files)
         if not recs:
-            return None
-        return max(int(r['utc']) for r in recs)
+            return False
+        want = self.render_csv(recs)
+        try:
+            with open(files.csv, 'rb') as f:
+                have = f.read()
+        except FileNotFoundError:
+            have = None
+        if have == want:
+            return False
+        self._write_csv_atomic(files, want)
+        return True
 
-    def _csv_row_count(self, files):
+    def reconcile_all(self, max_days=14):
+        """Repair every recent day at startup.
+
+        Without this, a crash between the JSONL and CSV writes for a day that no
+        later request happens to touch -- yesterday's backfill, say -- is never
+        noticed.
+        """
+        repaired = []
+        days = []
+        for root, _dirs, names in os.walk(self.logdir):
+            for name in names:
+                if name.endswith('.jsonl'):
+                    p = os.path.join(root, name)
+                    try:
+                        days.append((os.path.getmtime(p), p))
+                    except OSError:
+                        pass
+        for _mtime, path in sorted(days, reverse=True)[:max_days]:
+            rel = os.path.relpath(path, self.logdir)
+            parts = rel.split(os.sep)
+            if len(parts) != 3:
+                continue
+            try:
+                y, m, d = int(parts[0]), int(parts[1]), int(parts[2][:2])
+            except ValueError:
+                continue
+            files = DayFiles(self.logdir, y, m, d)
+            with self._DayLock(self.statedir, files.key):
+                self._repair_torn_tail(files)
+                if self.reconcile(files):
+                    repaired.append(files.key)
+        return repaired
+
+    # -------------------------------------------------------- legacy adoption
+
+    def adopt_legacy_csv(self, files):
+        """Import pre-existing CSV rows into the JSONL before we ever rewrite it.
+
+        Production days have a CSV written by wind_logger.py but no JSONL. The
+        first new observation would otherwise cause a rewrite from a JSONL
+        holding only that one record -- erasing the whole pre-cutover part of
+        the day. Caller must hold the day lock.
+
+        Local timestamps are ambiguous for one hour each April. The file is in
+        chronological order, so the fold is resolved by requiring each row to be
+        strictly later than the previous one: the first 02:00:03 takes fold 0
+        (AEDT), the second fold 1 (AEST).
+        """
         if not os.path.exists(files.csv):
             return 0
-        n = 0
+        if self._read_jsonl(files):
+            return 0                      # already has truth; nothing to adopt
+
         with open(files.csv, 'r', encoding='utf-8', newline='') as f:
-            for i, _line in enumerate(f):
-                n = i
-        return n        # excludes the header
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return 0
 
-    def reconcile(self, files):
-        """Rebuild the CSV from the JSONL if they disagree on row count.
+        adopted = []
+        last = None
+        for row in rows:
+            stamp = (row.get('timestamp') or '').strip()
+            if not stamp:
+                continue
+            try:
+                naive = datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                raise CorruptionError('%s: unparseable legacy timestamp %r'
+                                      % (files.csv, stamp))
+            chosen = None
+            for fold in (0, 1):
+                cand = naive.replace(tzinfo=TZ, fold=fold)
+                key = utc_key(cand)
+                if last is None or key > last:
+                    chosen = (cand, key)
+                    break
+            if chosen is None:
+                # Non-monotonic legacy data; keep it rather than drop it, but do
+                # not let it corrupt ordering.
+                cand = naive.replace(tzinfo=TZ, fold=1)
+                chosen = (cand, utc_key(cand))
+            cand, key = chosen
+            last = key
 
-        Covers the crash window between the JSONL append and the CSV append. A
-        retry of that request would otherwise be classified as all-duplicates and
-        the CSV would stay permanently short.
-        """
-        recs = self._read_jsonl(files)
-        if not recs:
-            return False
-        if self._csv_row_count(files) == len(recs):
-            return False
-        self._write_csv_atomic(files, recs)
-        return True
+            rec = {'utc': key, 'local': local_stamp(cand),
+                   'obs_ts': cand.isoformat(timespec='seconds'),
+                   'src': 'legacy', 'station': self.station}
+            for col in CSV_FIELDS[1:]:
+                raw = (row.get(col) or '').strip()
+                if raw == '':
+                    rec[col] = None
+                else:
+                    try:
+                        rec[col] = int(raw) if '.' not in raw else float(raw)
+                    except ValueError:
+                        rec[col] = raw
+            adopted.append(rec)
+
+        if not adopted:
+            return 0
+        self._append_jsonl(files, adopted)
+        return len(adopted)
 
     # ------------------------------------------------------------------ write
 
+    def _append_jsonl(self, files, recs):
+        """Durable append. Returns only after fsync succeeds."""
+        with open(files.jsonl, 'a', encoding='utf-8') as f:
+            for rec in sorted(recs, key=lambda r: int(r['utc'])):
+                f.write(json.dumps(rec, sort_keys=True) + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(files.jsonl, self.jsonl_mode)
+        except OSError:
+            pass
+        self._index.pop(files.key, None)   # force reload with the new signature
+
     def put(self, observations):
-        """Store observations. Returns (accepted, duplicates, rejected, details).
+        """Store observations. Returns (accepted, duplicates, rejected, details,
+        durable_keys) where durable_keys are the UTC keys now known to be on
+        disk -- either newly written or already present.
 
         Idempotent: first write wins, so replay, retry-after-lost-ACK and
-        overlapping backfill are all no-ops that write nothing. That also means
-        an `archive` record (an interval average) can never overwrite a `loop`
-        record (the instantaneous value the chart wants).
+        overlapping backfill are no-ops. That also means an `archive` record (an
+        interval average) can never overwrite a `loop` record.
         """
         by_day = {}
         rejected = 0
         details = []
+        now = datetime.now(TZ).timestamp()
 
         for obs in observations:
+            if not isinstance(obs, dict):
+                rejected += 1
+                details.append('observation is %s, not an object'
+                               % type(obs).__name__)
+                continue
             try:
                 dt = parse_obs_ts(obs.get('obs_ts'))
+                for k, v in obs.items():
+                    check_value(k, v)
             except StoreError as e:
                 rejected += 1
                 details.append(str(e))
@@ -301,96 +454,109 @@ class Store:
                 rejected += 1
                 details.append('before cutover: %s' % obs.get('obs_ts'))
                 continue
+            if key > now + self.max_future_s:
+                rejected += 1
+                details.append('dated %ds in the future: %s'
+                               % (key - now, obs.get('obs_ts')))
+                continue
             rec = dict(obs)
             rec['utc'] = key
             rec['local'] = local_stamp(dt)
+            rec['station'] = self.station
             y, m, d = local_date(dt)
             by_day.setdefault((y, m, d), []).append(rec)
 
         accepted = 0
         duplicates = 0
+        durable = set()
 
         for (y, m, d), recs in sorted(by_day.items()):
             files = DayFiles(self.logdir, y, m, d)
             files.ensure_dir()
             with self._DayLock(self.statedir, files.key):
-                a, dup = self._put_day(files, recs)
+                a, dup, keys = self._put_day(files, recs)
                 accepted += a
                 duplicates += dup
+                durable |= keys
 
-        return accepted, duplicates, rejected, details
+        return accepted, duplicates, rejected, details, durable
 
     def _put_day(self, files, recs):
+        self._repair_torn_tail(files)
+        # Adopt any pre-existing CSV before it can be rewritten from a JSONL
+        # that does not yet describe it.
+        self.adopt_legacy_csv(files)
+
         seen = self._load_index(files)
 
         fresh = []
-        dup = 0
+        fresh_keys = set()
+        dup_keys = set()
         for rec in recs:
-            if rec['utc'] in seen:
-                dup += 1
+            if rec['utc'] in seen or rec['utc'] in fresh_keys:
+                dup_keys.add(rec['utc'])
                 continue
-            seen.add(rec['utc'])
+            fresh_keys.add(rec['utc'])
             fresh.append(rec)
 
         if not fresh:
-            # Nothing new. If a previous request died between the JSONL and CSV
-            # writes, this is the moment we notice and repair.
+            # Nothing new. If an earlier request died between the JSONL and CSV
+            # writes, this is when we notice and repair.
             self.reconcile(files)
-            return 0, dup
+            return 0, len(dup_keys), dup_keys
 
-        # 1. JSONL first, and fsync it. This is the write-ahead log: once it is
-        #    durable the observation is not lost even if we die on the next line.
-        with open(files.jsonl, 'a', encoding='utf-8') as f:
-            for rec in sorted(fresh, key=lambda r: r['utc']):
-                f.write(json.dumps(rec, sort_keys=True) + '\n')
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(files.jsonl, 0o644)
+        # 1. Durable first. The index is NOT updated until this returns: if the
+        #    append fails (ENOSPC is a live risk on these machines) the records
+        #    must remain unknown so a retry stores them rather than being
+        #    dismissed as duplicates.
+        self._append_jsonl(files, fresh)
 
-        # 2. Project to CSV.
-        prior_max = None
+        # 2. Project. Always rebuild from the JSONL so the CSV can never drift.
         existing = self._read_jsonl(files)
-        prior = [r for r in existing if r['utc'] not in {x['utc'] for x in fresh}]
-        if prior:
-            prior_max = max(int(r['utc']) for r in prior)
+        want = self.render_csv(existing)
+        try:
+            with open(files.csv, 'rb') as f:
+                have = f.read()
+        except FileNotFoundError:
+            have = None
+        if have != want:
+            self._write_csv_atomic(files, want)
 
-        in_order = prior_max is None or min(r['utc'] for r in fresh) > prior_max
-        csv_consistent = self._csv_row_count(files) == len(prior)
-
-        if in_order and csv_consistent:
-            self._append_csv(files, fresh)          # O(1) steady state
-        else:
-            self._write_csv_atomic(files, existing)  # backfill, or repair
-
-        return len(fresh), dup
+        return len(fresh), len(dup_keys), fresh_keys | dup_keys
 
     # ----------------------------------------------------------------- status
 
     def last_observation(self):
-        """Most recent stored observation across all days, or None."""
+        """The newest observation by UTC instant across all days.
+
+        Scans rather than taking the last line: the JSONL is append-ordered, not
+        UTC-ordered, so after an out-of-order backfill the final line is an old
+        record and seeding from it would understate freshness.
+        """
         newest = None
+        days = []
         for root, _dirs, names in os.walk(self.logdir):
             for name in names:
-                if not name.endswith('.jsonl'):
-                    continue
-                path = os.path.join(root, name)
-                try:
-                    with open(path, 'rb') as f:
-                        f.seek(0, os.SEEK_END)
-                        size = f.tell()
-                        f.seek(max(0, size - 8192))
-                        tail = f.read().decode('utf-8', 'replace')
-                except OSError:
-                    continue
-                for line in reversed(tail.splitlines()):
-                    line = line.strip()
-                    if not line:
-                        continue
+                if name.endswith('.jsonl'):
+                    p = os.path.join(root, name)
                     try:
-                        rec = json.loads(line)
-                    except ValueError:
-                        continue
-                    if newest is None or int(rec['utc']) > int(newest['utc']):
-                        newest = rec
-                    break
+                        days.append((os.path.getmtime(p), p))
+                    except OSError:
+                        pass
+        for _mtime, path in sorted(days, reverse=True)[:3]:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            u = int(rec['utc'])
+                        except (ValueError, KeyError, TypeError):
+                            continue
+                        if newest is None or u > int(newest['utc']):
+                            newest = rec
+            except OSError:
+                continue
         return newest

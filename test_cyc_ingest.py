@@ -19,10 +19,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cyc_ingest  # noqa: E402
 from cyc_ingest import Server, Stats, sign, load_keys  # noqa: E402
-from cyc_store import Store  # noqa: E402
+from cyc_store import Store, parse_obs_ts, utc_key  # noqa: E402
 
 FAILURES = []
 KEY = secrets.token_hex(32)
+OTHER_KEY = secrets.token_hex(32)
 STATION = 'cyc1'
 
 
@@ -45,9 +46,9 @@ class Harness:
         with open(self.keyfile, 'w') as f:
             f.write('%s\t%s\n' % (STATION, KEY))
         cfg = {'keys': load_keys(self.keyfile), 'status': self.status,
-               'enable_echo': True}
-        store = Store(self.logs, self.state)
-        self.srv = Server(('127.0.0.1', 0), cfg, store)
+               'enable_echo': True, 'max_conns': 16, 'primary': STATION}
+        stores = {STATION: Store(self.logs, self.state, station=STATION)}
+        self.srv = Server(('127.0.0.1', 0), cfg, stores)
         self.port = self.srv.server_address[1]
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self.t.start()
@@ -67,7 +68,7 @@ class Harness:
         body = raw if raw is not None else json.dumps(doc).encode('utf-8')
         ts = int(time.time()) if ts is None else ts
         nonce = nonce or secrets.token_hex(16)
-        sig = sign(key.encode('ascii'), 'POST', path, station, ts, nonce, body)
+        sig = sign(bytes.fromhex(key), 'POST', path, station, ts, nonce, body)
         if corrupt_sig:
             sig = sig[:-1] + ('0' if sig[-1] != '0' else '1')
         req = urllib.request.Request(self.url(path), data=body, method='POST')
@@ -158,11 +159,22 @@ def test_bad_signature_and_rate_limit():
 
 
 def test_clock_skew():
-    print('\n== clock skew is distinct from auth failure ==')
+    print('\n== clock skew is reported only to an authenticated caller ==')
     with Harness() as h:
         d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+
+        # A bad signature with a skewed clock must look like plain auth failure,
+        # not leak that the station exists via a distinguishable response.
+        code, body = h.post('/ingest/obs', d, ts=int(time.time()) - 600,
+                            corrupt_sig=True)
+        check(code == 401 and body.get('error') == 'auth_failed',
+              'unauthenticated skew is indistinguishable from auth failure')
+        code, body = h.post('/ingest/obs', d, ts=int(time.time()) - 600,
+                            station='no-such-station')
+        check(code == 401, 'unknown station with skew -> 401, not 400')
+
         code, body = h.post('/ingest/obs', d, ts=int(time.time()) - 600)
-        check(code == 400, 'ten minutes of skew -> 400')
+        check(code == 400, 'ten minutes of skew, valid signature -> 400')
         check(body.get('error') == 'clock_skew', 'error is clock_skew, not auth_failed')
         check('server_time_epoch' in body, 'server time returned so collector can diagnose')
 
@@ -222,7 +234,7 @@ def test_status_document():
         with open(h.status) as f:
             st = json.load(f)
         for k in ('last_obs_epoch', 'written_at_epoch', 'obs_age_s',
-                  'recv_lag_s', 'seq', 'auth_failures_1h'):
+                  'recv_lag_s', 'seq', 'auth_failures_recent'):
             check(k in st, 'status has %s' % k)
         check(st['seq'] == 5, 'seq recorded')
         check(isinstance(st['last_obs_epoch'], int),
@@ -236,9 +248,9 @@ def test_restart_seeding():
         # Restart the service against the same storage, as a deploy does.
         h.srv.shutdown(); h.srv.server_close()
         cfg = {'keys': load_keys(h.keyfile), 'status': h.status,
-               'enable_echo': True}
-        store = Store(h.logs, h.state)
-        h.srv = Server(('127.0.0.1', 0), cfg, store)
+               'enable_echo': True, 'max_conns': 16, 'primary': STATION}
+        store = Store(h.logs, h.state, station=STATION)
+        h.srv = Server(('127.0.0.1', 0), cfg, {STATION: store})
         h.port = h.srv.server_address[1]
         last = store.last_observation()
         if last:
@@ -259,6 +271,109 @@ def test_restart_seeding():
         check(st.get('seq') == 7, 'sequence recovered from storage')
 
 
+
+def test_station_isolation():
+    print('\n== a station cannot write as another ==')
+    with Harness() as h:
+        # Body declares a different station than the signing key.
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['station'] = 'someone-else'
+        code, body = h.post('/ingest/obs', d)
+        check(code == 400 and 'station' in (body.get('detail') or ''),
+              'declared station must match the signing key')
+
+        # A key with no configured store is authenticated but cannot write.
+        with open(h.keyfile, 'a') as f:
+            f.write('%s\t%s\n' % ('cyc1-test', OTHER_KEY))
+        h.srv.cfg['keys'] = load_keys(h.keyfile)
+        d2 = doc([obs('2026-07-31T10:05:00+10:00', 2)])
+        d2['station'] = 'cyc1-test'
+        code, body = h.post('/ingest/obs', d2, key=OTHER_KEY,
+                            station='cyc1-test')
+        check(code == 403 and body.get('error') == 'station_not_configured',
+              'authenticated but unconfigured station refused, not fallen back')
+
+
+def test_schema_version():
+    print('\n== schema version is enforced ==')
+    with Harness() as h:
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['schema'] = 99
+        code, body = h.post('/ingest/obs', d)
+        check(code == 400 and body.get('error') == 'bad_schema',
+              'unknown schema version rejected')
+
+
+def test_request_framing():
+    print('\n== request framing ==')
+    import http.client
+    with Harness() as h:
+        def raw(headers, body=b'{}'):
+            c = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+            c.putrequest('POST', '/ingest/obs', skip_host=True,
+                         skip_accept_encoding=True)
+            for k, v in headers:
+                c.putheader(k, v)
+            c.endheaders()
+            try:
+                c.send(body)
+            except Exception:
+                pass
+            try:
+                r = c.getresponse()
+                return r.status
+            except Exception:
+                return None
+            finally:
+                c.close()
+
+        code = raw([('Host', 'x'), ('Content-Length', '-1')])
+        check(code == 400, 'negative Content-Length rejected (got %s)' % code)
+
+        code = raw([('Host', 'x'), ('Transfer-Encoding', 'chunked')])
+        check(code == 400, 'chunked transfer rejected (got %s)' % code)
+
+        code = raw([('Host', 'x'), ('Content-Length', '2'),
+                    ('Content-Length', '3')])
+        check(code == 400, 'duplicate Content-Length rejected (got %s)' % code)
+
+
+def test_ack_seq_only_durable():
+    print('\n== ack_seq never covers records that were not stored ==')
+    with Harness() as h:
+        # Rebuild the store with a cutover instant partway through the batch.
+        cut = utc_key(parse_obs_ts('2026-07-31T10:00:30+10:00'))
+        h.srv.stores[STATION] = Store(h.logs, h.state, station=STATION,
+                                      min_obs_ts=cut)
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:00:00+10:00', 5),
+                                 obs('2026-07-31T10:01:00+10:00', 6)]))
+        check(body['accepted'] == 1 and body['rejected'] == 1,
+              'one accepted, one refused as pre-cutover')
+        check(body['ack_seq'] == 6,
+              'ack_seq is the stored record (6), not the refused one (got %s)'
+              % body['ack_seq'])
+
+
+def test_key_file_validation():
+    print('\n== key file format is enforced ==')
+    import tempfile as _tf
+    for content, label in [('cyc1\tnothex!!\n', 'non-hex key'),
+                           ('cyc1\tdeadbeef\n', 'short key'),
+                           ('cyc1\n', 'missing key')]:
+        d = _tf.mkdtemp()
+        path = os.path.join(d, 'k')
+        with open(path, 'w') as f:
+            f.write(content)
+        raised = False
+        try:
+            load_keys(path)
+        except SystemExit:
+            raised = True
+        check(raised, '%s rejected at load' % label)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -268,6 +383,11 @@ def main():
     test_health_and_echo()
     test_status_document()
     test_restart_seeding()
+    test_station_isolation()
+    test_schema_version()
+    test_request_framing()
+    test_ack_seq_only_durable()
+    test_key_file_validation()
 
     print()
     if FAILURES:

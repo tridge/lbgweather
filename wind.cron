@@ -1,15 +1,23 @@
 #!/bin/bash
+# Runs every minute from cron. flock prevents overlap: the network calls below
+# can exceed 60s, and two concurrent runs would race on the CSV append and on
+# every state file.
+cd $HOME/wind
+exec /usr/bin/flock -n /home/lbgweather/var/wind-cron.lock -c '
 cd $HOME/wind
 (
+    date -Is
     python3 wind_logger.py
     python3 bom_logger.py
     # Shadow-feed the new ingest receiver from the same cloud data, so the
     # whole server half runs on real data while production is untouched.
     # Scaffolding for the cutover - delete once the collector posts directly.
-    python3 cyc_shadow_post.py --quiet
+    python3 $HOME/lib/cyc/cyc_shadow_post.py --quiet
     # Alarm if the feed goes stale. wind_logger.py writes a plausible-looking
     # CSV row every minute whether or not the station is alive, so without this
     # a dead station is invisible - as it was for three weeks in July 2026.
-    python3 feed_watch.py --status status.json --state feedwatch_state.json \
+    python3 $HOME/lib/cyc/feed_watch.py --status status.json \
+        --state $HOME/var/cyc_ingest/feedwatch_state.json \
         --warn-age 1200 --quiet
 ) >> wind.log 2>&1
+'
