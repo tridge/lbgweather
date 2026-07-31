@@ -19,7 +19,8 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cyc_ingest  # noqa: E402
 from cyc_ingest import Server, Stats, sign, load_keys  # noqa: E402
-from cyc_store import Store, parse_obs_ts, utc_key  # noqa: E402
+from cyc_store import Store, parse_obs_ts, utc_key, TZ  # noqa: E402
+from datetime import datetime  # noqa: E402
 
 FAILURES = []
 KEY = secrets.token_hex(32)
@@ -35,7 +36,15 @@ def check(cond, what):
         FAILURES.append(what)
 
 
+KEY2 = 'bb' * 32
+
+
 class Harness:
+    def __init__(self, second_station=None):
+        # A second, non-primary station: its data must not touch the primary's
+        # storage, freshness or status document.
+        self.second = second_station
+
     def __enter__(self):
         self.d = tempfile.mkdtemp(prefix='cycingest-test-')
         self.logs = os.path.join(self.d, 'wind_logs')
@@ -45,9 +54,18 @@ class Harness:
         os.makedirs(self.logs)
         with open(self.keyfile, 'w') as f:
             f.write('%s\t%s\n' % (STATION, KEY))
+            if self.second:
+                f.write('%s\t%s\n' % (self.second, KEY2))
         cfg = {'keys': load_keys(self.keyfile), 'status': self.status,
-               'enable_echo': True, 'max_conns': 16, 'primary': STATION}
+               'enable_echo': True, 'max_conns': 16, 'primary': STATION,
+               'degraded': {}}
         stores = {STATION: Store(self.logs, self.state, station=STATION)}
+        if self.second:
+            self.logs2 = os.path.join(self.d, 'wind_logs2')
+            os.makedirs(self.logs2)
+            stores[self.second] = Store(
+                self.logs2, os.path.join(self.d, 'state2'),
+                station=self.second)
         self.srv = Server(('127.0.0.1', 0), cfg, stores)
         self.port = self.srv.server_address[1]
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
@@ -91,7 +109,12 @@ class Harness:
             with urllib.request.urlopen(self.url(path), timeout=10) as r:
                 return r.status, json.loads(r.read())
         except urllib.error.HTTPError as e:
-            return e.code, {}
+            # Parse the error body too: discarding it made a correct 503 look
+            # like an empty response and hid what health was actually saying.
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
 
 
 def obs(ts, seq, wind=1.0):
@@ -100,8 +123,8 @@ def obs(ts, seq, wind=1.0):
             'temp_c': 13.0, 'humidity': 50}
 
 
-def doc(obslist):
-    return {'schema': 1, 'station': STATION, 'obs': obslist,
+def doc(obslist, station=STATION):
+    return {'schema': 1, 'station': station, 'obs': obslist,
             'collector': {'version': '0.1', 'spool_backlog': 0}}
 
 
@@ -248,7 +271,8 @@ def test_restart_seeding():
         # Restart the service against the same storage, as a deploy does.
         h.srv.shutdown(); h.srv.server_close()
         cfg = {'keys': load_keys(h.keyfile), 'status': h.status,
-               'enable_echo': True, 'max_conns': 16, 'primary': STATION}
+               'enable_echo': True, 'max_conns': 16, 'primary': STATION,
+               'degraded': {}}
         store = Store(h.logs, h.state, station=STATION)
         h.srv = Server(('127.0.0.1', 0), cfg, {STATION: store})
         h.port = h.srv.server_address[1]
@@ -350,8 +374,21 @@ def test_ack_seq_only_durable():
                                  obs('2026-07-31T10:01:00+10:00', 6)]))
         check(body['accepted'] == 1 and body['rejected'] == 1,
               'one accepted, one refused as pre-cutover')
-        check(body['ack_seq'] == 6,
-              'ack_seq is the stored record (6), not the refused one (got %s)'
+        # seq 5 was refused. Acknowledging 6 -- the highest DURABLE seq --
+        # would make a cursor-based collector discard seq 5 for ever. The ACK
+        # must stop at the first gap.
+        check(body['ack_seq'] is None,
+              'ack_seq stops at the first non-durable record (got %s)'
+              % body['ack_seq'])
+
+        # With the refused record last, the durable prefix is acknowledged.
+        h.srv.stores[STATION] = Store(h.logs, h.state, station=STATION,
+                                      min_obs_ts=cut)
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:02:00+10:00', 7),
+                                 obs('2026-07-31T09:00:00+10:00', 8)]))
+        check(body['ack_seq'] == 7,
+              'contiguous durable prefix acknowledged (got %s)'
               % body['ack_seq'])
 
 
@@ -374,6 +411,206 @@ def test_key_file_validation():
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+def test_station_required():
+    print('\n== the body must declare its station ==')
+    with Harness() as h:
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        del d['station']
+        code, body = h.post('/ingest/obs', d)
+        check(code == 400, 'a missing station is rejected, not accepted')
+
+
+def test_collector_must_be_object():
+    print('\n== malformed collector metadata is refused before storage ==')
+    with Harness() as h:
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['collector'] = 'not an object'
+        code, body = h.post('/ingest/obs', d)
+        check(code == 400, 'truthy non-dict collector rejected')
+        # And the record must NOT have been stored on the way to failing.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        check(body['accepted'] == 1,
+              'the observation was not committed by the rejected request')
+
+
+def test_capacity_is_enforced_before_threads():
+    print('\n== over-capacity connections are shed with a real 503 ==')
+    import http.client
+    with Harness() as h:
+        h.srv.slots = threading.BoundedSemaphore(1)
+        held = []
+        # Occupy the single slot with a connection that has sent no request.
+        c0 = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+        c0.connect()
+        held.append(c0)
+        time.sleep(0.4)
+
+        c = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+        status = None
+        try:
+            c.request('GET', '/ingest/health')
+            status = c.getresponse().status
+        except Exception as e:
+            status = 'error: %r' % e
+        finally:
+            c.close()
+            for x in held:
+                x.close()
+        check(status == 503,
+              'second connection gets a genuine 503, not a dropped socket '
+              '(got %s)' % status)
+
+
+def test_health_reports_degraded_storage():
+    print('\n== unreadable storage is not reported as healthy ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        code, body = h.get('/ingest/health')
+        check(code == 200 and body['ok'] is True, 'healthy while readable')
+
+        jsonl = os.path.join(h.logs, '2026', '07', '31.jsonl')
+        with open(jsonl, 'w') as f:
+            f.write('{"garbage": true}\n')
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:05:00+10:00', 2)]))
+        code, body = h.get('/ingest/health')
+        check(code == 503 and body.get('ok') is False,
+              'health turns unhealthy when a day cannot be read (got %s %s)'
+              % (code, body))
+        check(body.get('degraded'), 'the affected day is named')
+
+
+def test_hmac_against_a_fixed_vector():
+    print('\n== HMAC matches an independent fixed vector ==')
+    import hashlib as _h, hmac as _m
+    key = bytes.fromhex('00' * 32)
+    body = b'{"x":1}'
+    signing = '\n'.join(['v1', 'POST', '/ingest/obs', 'cyc1', '1700000000',
+                          'abcdef', _h.sha256(body).hexdigest()])
+    expect = 'v1=' + _m.new(key, signing.encode(), _h.sha256).hexdigest()
+    got = sign(key, 'POST', '/ingest/obs', 'cyc1', 1700000000, 'abcdef', body)
+    check(got == expect,
+          'signature matches a vector computed without the production helper')
+    check(expect.startswith('v1=') and len(expect) == 67, 'shape is v1=<64 hex>')
+
+
+
+def test_shadow_only_advances_on_a_real_ack():
+    print('\n== the shadow poster advances only on a real acknowledgement ==')
+    from cyc_shadow_post import acknowledged
+    check(acknowledged(200, {'ok': True, 'accepted': 1, 'rejected': 0,
+                             'ack_seq': 7}, 7), 'accepted and acknowledged')
+    check(acknowledged(200, {'ok': True, 'accepted': 0, 'duplicates': 1,
+                             'rejected': 0, 'ack_seq': 7}, 7),
+          'a duplicate is still durable')
+    check(not acknowledged(200, {'ok': True, 'accepted': 0, 'rejected': 1,
+                                 'ack_seq': None}, 7),
+          'a refused record is NOT acknowledged despite the 200')
+    check(not acknowledged(200, {'ok': True, 'rejected': 0, 'ack_seq': 6}, 7),
+          'an ack for a different seq does not count')
+    check(not acknowledged(200, {'ok': False, 'rejected': 0, 'ack_seq': 7}, 7),
+          'ok:false is not an acknowledgement')
+    check(not acknowledged(503, {}, 7), 'a 503 is not an acknowledgement')
+
+
+
+def test_a_second_station_cannot_speak_for_the_primary():
+    print('\n== one station must not affect another ==')
+    with Harness(second_station='cyc2') as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        st1 = json.load(open(h.status))
+        check(st1['station'] == STATION, 'status belongs to the primary')
+
+        # cyc2 posts something much fresher, under its own valid key.
+        fresh = datetime.now(TZ).replace(microsecond=0).isoformat(
+            timespec='seconds')
+        code, body = h.post('/ingest/obs',
+                            doc([obs(fresh, 500)], station='cyc2'),
+                            key=KEY2, station='cyc2')
+        check(code == 200, 'cyc2 is accepted on its own key (got %s)' % code)
+
+        st2 = json.load(open(h.status))
+        check(st2['last_obs_epoch'] == st1['last_obs_epoch'],
+              "cyc2's fresher observation did NOT advance the primary's "
+              'freshness - a test station cannot make a dead primary look alive')
+        check(st2['seq'] == st1['seq'], "and did not advance the primary's seq")
+        check(st2['accepted'] == st1['accepted'],
+              "and was not counted in the primary's totals")
+
+        # Storage is separate too.
+        p1 = os.path.join(h.logs, '2026', '07', '31.jsonl')
+        check(len(open(p1).read().strip().splitlines()) == 1,
+              "the primary's day file holds only its own record")
+        check(os.path.exists(h.logs2), 'cyc2 wrote into its own tree')
+
+        # And cyc2's key cannot be used to write as cyc1.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T11:00:03+10:00', 9)]),
+                            key=KEY2, station=STATION)
+        check(code == 401,
+              'cyc2 signing as cyc1 is rejected (got %s)' % code)
+
+
+
+def test_concurrent_posts_do_not_deadlock_or_lose_records():
+    print('\n== concurrent writers: no deadlock, no lost records ==')
+    with Harness() as h:
+        n = 24                    # deliberately above max_conns (16)
+        results = [None] * n
+
+        def stamp(i):
+            return '2026-07-31T%02d:%02d:03+10:00' % (10 + i // 60, i % 60)
+
+        def fire(i):
+            try:
+                results[i] = h.post('/ingest/obs',
+                                    doc([obs(stamp(i), i + 1)]))
+            except Exception as e:
+                results[i] = ('exc', repr(e))
+
+        threads = [threading.Thread(target=fire, args=(i,)) for i in range(n)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        elapsed = time.time() - t0
+
+        check(not any(t.is_alive() for t in threads),
+              'every request finished - the day lock plus the connection '
+              'semaphore did not deadlock (%.1fs)' % elapsed)
+
+        codes = [r[0] if r else None for r in results]
+        shed = [i for i, c in enumerate(codes) if c == 503]
+        # 503 is CORRECT here: 24 concurrent against a cap of 16. What matters
+        # is that nothing else happened and that a shed request stored nothing
+        # -- a partial write under load would be far worse than a refusal.
+        check(all(c in (200, 503) for c in codes),
+              'every response was either accepted or cleanly shed (codes %s)'
+              % sorted(set(codes)))
+        print('       (%d of %d shed by the connection cap)' % (len(shed), n))
+
+        import cyc_store
+        f = cyc_store.DayFiles(h.logs, 2026, 7, 31)
+        stored = h.srv.stores[STATION]._read_jsonl(f)
+        check(len(stored) == n - len(shed),
+              'exactly the accepted requests are durable - a shed request '
+              'wrote nothing (%d stored, %d accepted)'
+              % (len(stored), n - len(shed)))
+        check(len({r['utc'] for r in stored}) == len(stored),
+              'and none duplicated')
+
+        # Retrying the shed ones must succeed and complete the set.
+        for i in shed:
+            code, _ = h.post('/ingest/obs', doc([obs(stamp(i), i + 1)]))
+            check(code == 200, 'shed request %d succeeds on retry' % i)
+        stored = h.srv.stores[STATION]._read_jsonl(f)
+        check(len(stored) == n,
+              'all %d observations durable after retry (got %d)'
+              % (n, len(stored)))
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -388,6 +625,14 @@ def main():
     test_request_framing()
     test_ack_seq_only_durable()
     test_key_file_validation()
+    test_station_required()
+    test_collector_must_be_object()
+    test_capacity_is_enforced_before_threads()
+    test_health_reports_degraded_storage()
+    test_hmac_against_a_fixed_vector()
+    test_shadow_only_advances_on_a_real_ack()
+    test_a_second_station_cannot_speak_for_the_primary()
+    test_concurrent_posts_do_not_deadlock_or_lose_records()
 
     print()
     if FAILURES:

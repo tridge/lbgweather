@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, TZ, parse_obs_ts, utc_key,  # noqa: E402
-                       StoreError, CorruptionError)
+                       StoreError, CorruptionError, LockTimeout)
 
 SCHEME = 'v1'
 MAX_BODY = 2 * 1024 * 1024
@@ -43,6 +43,10 @@ AUTH_FAIL_LIMIT = 10
 DRAIN_CAP = 8 * 1024 * 1024
 # Wall-clock cap on a single client connection.
 SOCKET_TIMEOUT_S = 20
+# Bounds on the in-memory guard tables.
+HEARTBEAT_S = 60
+MAX_NONCES = 20000
+MAX_FAIL_IPS = 4096
 
 
 def now_iso():
@@ -128,6 +132,11 @@ class Guard:
             self._reap(now)
             if nonce in self.nonces:
                 return False
+            if len(self.nonces) >= MAX_NONCES:
+                # Bounded: refuse rather than grow without limit. Only
+                # authenticated callers reach here, so this is a safety net,
+                # not a normal path.
+                return False
             self.nonces[nonce] = now + NONCE_TTL_S
             return True
 
@@ -138,7 +147,16 @@ class Guard:
 
     def record_failure(self, ip, now):
         with self.lock:
-            self.failures.setdefault(ip, []).append(now)
+            if (ip not in self.failures) and len(self.failures) >= MAX_FAIL_IPS:
+                # Under a distributed probe, stop tracking new sources rather
+                # than let the table grow without bound.
+                return
+            hits = self.failures.setdefault(ip, [])
+            hits.append(now)
+            # Keep only what the limiter can act on; a single source cannot
+            # grow its own list without bound either.
+            if len(hits) > AUTH_FAIL_LIMIT * 2:
+                del hits[:-AUTH_FAIL_LIMIT * 2]
 
     def recent_failures(self, now):
         """Auth failures still inside the limiter window (5 min, not an hour)."""
@@ -186,28 +204,6 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(SOCKET_TIMEOUT_S)
-        self._slot = self.server.slots.acquire(blocking=False)
-
-    def finish(self):
-        try:
-            super().finish()
-        finally:
-            if getattr(self, '_slot', False):
-                self.server.slots.release()
-
-    def handle_one_request(self):
-        if not getattr(self, '_slot', False):
-            # Over capacity: shed the connection rather than queue threads.
-            try:
-                self.send_response(503)
-                self.send_header('Content-Length', '0')
-                self.send_header('Retry-After', '5')
-                self.end_headers()
-            except Exception:
-                pass
-            self.close_connection = True
-            return
-        super().handle_one_request()
 
     # ------------------------------------------------------------- utilities
 
@@ -365,15 +361,20 @@ class Handler(BaseHTTPRequestHandler):
     # -------------------------------------------------------------- handlers
 
     def health(self):
-        st = self.server.stats
+        st = self.server.snapshot()
         now = time.time()
-        age = None if st.last_obs_utc is None else int(now - st.last_obs_utc)
-        self.respond(200, {
-            'ok': True,
-            'age_s': age,
-            'last_obs_ts': (None if st.last_obs_utc is None else
-                            datetime.fromtimestamp(st.last_obs_utc, TZ)
+        last = st['last_obs_utc']
+        degraded = self.server.current_degraded()
+        self.respond(200 if not degraded else 503, {
+            # Storage we cannot read is not "ok" -- returning 200 while a day
+            # is unreadable is exactly the silent failure this project exists
+            # to remove.
+            'ok': not degraded,
+            'age_s': None if last is None else int(now - last),
+            'last_obs_ts': (None if last is None else
+                            datetime.fromtimestamp(last, TZ)
                             .isoformat(timespec='seconds')),
+            'degraded': degraded,
             'server_time': now_iso(),
         })
 
@@ -390,10 +391,19 @@ class Handler(BaseHTTPRequestHandler):
         # The station in the body must match the key that signed the request.
         # Otherwise the field is decorative and a test key could write into the
         # real station's tree.
+        # Required, not optional: an absent field would otherwise be accepted
+        # and the check would only bite callers honest enough to fill it in.
         declared = doc.get('station')
-        if declared is not None and declared != station:
+        if declared != station:
             return self.fail(400, 'bad_schema',
-                             detail='station does not match the signing key')
+                             detail='station must be present and match the '
+                                    'signing key')
+
+        collector = doc.get('collector')
+        if collector is not None and not isinstance(collector, dict):
+            # A truthy non-dict would be committed and then crash the status
+            # writer after the record was already stored.
+            return self.fail(400, 'bad_schema', detail='collector must be an object')
 
         obs = doc.get('obs')
         if not isinstance(obs, list):
@@ -409,6 +419,9 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             accepted, dup, rejected, details, durable = store.put(obs)
+        except LockTimeout as e:
+            self.log_message('day lock busy: %s', e)
+            return self.fail(503, 'busy')
         except CorruptionError as e:
             self.log_message('CORRUPTION: %s', e)
             return self.fail(500, 'storage_corrupt')
@@ -418,30 +431,30 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message('storage error: %s', e)
             return self.fail(500, 'storage_error')
 
-        # ack_seq is the highest seq the store reported as DURABLE -- newly
-        # written or already present. Records the store refused (before the
-        # cutover instant, malformed, future-dated) must NOT be acknowledged, or
-        # the collector advances its cursor past data that was never stored.
+        # ack_seq is the highest CONTIGUOUS durable sequence, walking the batch
+        # in the order it was sent. The highest durable seq is not safe: if
+        # seq 5 is refused and seq 6 stored, acknowledging 6 makes a
+        # cursor-based collector discard 5 for ever. Stopping at the first
+        # non-durable record means the collector re-sends from there.
         ack_seq = None
         newest_utc = None
         for o in obs:
             if not isinstance(o, dict):
-                continue
+                break
             try:
                 u = utc_key(parse_obs_ts(o.get('obs_ts')))
             except StoreError:
-                continue
+                break
             if u not in durable:
-                continue
+                break
             if newest_utc is None or u > newest_utc:
                 newest_utc = u
             sq = o.get('seq')
-            if isinstance(sq, int) and (ack_seq is None or sq > ack_seq):
+            if isinstance(sq, int):
                 ack_seq = sq
 
-        self.server.stats.record(accepted, dup, rejected, newest_utc, ack_seq,
-                                 doc.get('collector') or {})
-        self.server.write_status()
+        self.server.record(station, accepted, dup, rejected, newest_utc,
+                           ack_seq, collector or {})
 
         self.respond(200, {
             'ok': True,
@@ -463,15 +476,71 @@ class Server(ThreadingHTTPServer):
         self.cfg = cfg
         self.stores = stores
         self.guard = Guard()
-        self.stats = Stats()
-        # Bound concurrent handlers. Without a cap, slow clients each hold a
-        # thread (and an Apache worker) for the full socket timeout; on a shared
-        # VPS also running postfix and five other sites that is a cheap way to
-        # exhaust the box.
+        # Per-station stats. Sharing one set let a secondary station advance the
+        # primary's apparent freshness and replace its collector metadata, i.e.
+        # a test station could make a dead primary look healthy.
+        self.stats_by_station = {name: Stats() for name in stores}
+        self.primary = cfg.get('primary')
+        self.degraded = dict(cfg.get('degraded') or {})
+        # Bound concurrent handlers. Acquired in process_request, BEFORE the
+        # thread is spawned: acquiring inside the handler would cap nothing,
+        # since ThreadingHTTPServer has already created the thread by then.
         self.slots = threading.BoundedSemaphore(cfg.get('max_conns', 16))
+        self._status_lock = threading.Lock()
+        # obs_age_s must keep growing when the producer dies, or a dead feed
+        # looks frozen-but-fresh -- the exact failure this project exists to
+        # remove. The producer refreshes its own document; nothing else may
+        # write it, since a read-modify-write from outside races this.
+        self._beat = threading.Thread(target=self._heartbeat, daemon=True)
+        self._beat_stop = threading.Event()
+        self._beat.start()
 
-    def snapshot(self):
-        st = self.stats
+    def _heartbeat(self):
+        while not self._beat_stop.wait(HEARTBEAT_S):
+            try:
+                self.write_status()
+            except Exception as e:
+                sys.stderr.write('heartbeat: %s\n' % e)
+
+    # ------------------------------------------------------------ capacity
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Retry-After: 5\r\n'
+                                b'Content-Length: 0\r\n'
+                                b'Connection: close\r\n\r\n')
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    # --------------------------------------------------------------- stats
+
+    @property
+    def stats(self):
+        return self.stats_by_station[self.primary]
+
+    def record(self, station, accepted, dup, rejected, newest_utc, seq,
+               collector):
+        st = self.stats_by_station.get(station)
+        if st is None:
+            return
+        st.record(accepted, dup, rejected, newest_utc, seq, collector)
+        # Only the primary station owns the public status document.
+        if station == self.primary:
+            self.write_status()
+
+    def snapshot(self, station=None):
+        st = self.stats_by_station[station or self.primary]
         with st.lock:
             return dict(accepted=st.accepted, duplicates=st.duplicates,
                         rejected=st.rejected, last_post=st.last_post,
@@ -488,7 +557,7 @@ class Server(ThreadingHTTPServer):
         last_obs = st['last_obs_utc']
         last_post = st['last_post']
         doc = {
-            'station': self.cfg.get('primary', 'cyc1'),
+            'station': self.primary,
             'written_at': now_iso(),
             'written_at_epoch': int(now),
             'last_obs_ts': (None if last_obs is None else
@@ -510,30 +579,42 @@ class Server(ThreadingHTTPServer):
             'accepted': st['accepted'],
             'duplicates': st['duplicates'],
             'rejected': st['rejected'],
+            # Name matches what feed_watch reads. A rename on one side only
+            # made authentication failures invisible to the watchdog.
             'auth_failures_recent': self.guard.recent_failures(now),
             'source': (st['collector'] or {}).get('source', 'unknown'),
             'collector': st['collector'],
+            'degraded': self.current_degraded(),
         }
         path = self.cfg['status']
-        # Unique temp name: two concurrent handlers sharing a fixed
-        # "status.json.tmp" can truncate each other's inode, and one may still
-        # be writing after the other has renamed it into place.
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.',
-                                   prefix='.status-', suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(doc, f, indent=1, sort_keys=True)
-                f.write('\n')
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, path)
-        except OSError as e:
-            sys.stderr.write('status write failed: %s\n' % e)
+        # Serialised: unique temp names stop two writers sharing an inode, but
+        # without this an older snapshot could still land after a newer one and
+        # regress the file.
+        with self._status_lock:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.',
+                                       prefix='.status-', suffix='.tmp')
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(doc, f, indent=1, sort_keys=True)
+                    f.write('\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, path)
+            except OSError as e:
+                sys.stderr.write('status write failed: %s\n' % e)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def current_degraded(self):
+        """Days any store currently cannot read, plus startup failures."""
+        out = dict(self.degraded)
+        for name, store in self.stores.items():
+            for day, msg in store.degraded().items():
+                out['%s/%s' % (name, day)] = msg
+        return out
 
 
 def parse_station_arg(value):
@@ -582,22 +663,41 @@ def main(argv=None):
            'enable_echo': args.enable_echo, 'max_conns': args.max_conns,
            'primary': primary}
 
+    # Two stations must never name the same tree: their locks are
+    # station-specific, so they would mutate the same JSONL and CSV under
+    # different locks and corrupt each other.
+    seen_paths = {}
+    for name, logdir in stations.items():
+        real = os.path.realpath(logdir)
+        if real in seen_paths:
+            raise SystemExit('stations %r and %r both map to %s'
+                             % (seen_paths[real], name, real))
+        seen_paths[real] = name
+
     stores = {}
     for name, logdir in stations.items():
         stores[name] = Store(logdir, os.path.join(args.statedir, name),
                              station=name, min_obs_ts=args.min_obs_ts)
 
     # Repair anything a previous crash left inconsistent, including days no
-    # later request would touch.
+    # later request would touch. Failures are carried into health rather than
+    # logged once and forgotten: serving 200 over unreadable storage is the
+    # silent failure this project exists to remove.
+    degraded = {}
     for name, store in stores.items():
         try:
-            repaired = store.reconcile_all()
+            repaired, errors = store.reconcile_all()
             if repaired:
                 sys.stderr.write('reconciled %s: %s\n'
                                  % (name, ', '.join(repaired)))
+            for day, msg in errors:
+                degraded['%s/%s' % (name, day)] = msg
+                sys.stderr.write('DEGRADED %s/%s: %s\n' % (name, day, msg))
         except Exception as e:
-            sys.stderr.write('reconcile_all(%s) failed: %s\n' % (name, e))
+            degraded[name] = str(e)
+            sys.stderr.write('DEGRADED reconcile_all(%s): %s\n' % (name, e))
 
+    cfg['degraded'] = degraded
     srv = Server((args.host, args.port), cfg, stores)
 
     # Seed from storage before serving. Stats are in-memory, so without this a
