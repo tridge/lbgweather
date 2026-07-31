@@ -289,6 +289,16 @@ def main(argv=None):
                 with os.fdopen(fd, 'w') as f:
                     f.write('armed %s\n' % datetime.fromtimestamp(now, TZ)
                             .isoformat(timespec='seconds'))
+                    f.flush()
+                    os.fsync(f.fileno())
+                # fsync the directory too: without it a power cut right here
+                # loses the marker, and the watchdog silently disarms -- the
+                # one failure this file exists to prevent.
+                dfd = os.open(os.path.dirname(args.marker) or '.', os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
             except FileExistsError:
                 pass          # another instance armed first; fine
             except OSError as e:

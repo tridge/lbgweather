@@ -13,22 +13,9 @@ cd $HOME/wind
     # whole server half runs on real data while production is untouched.
     # Scaffolding for the cutover - delete once the collector posts directly.
     python3 $HOME/lib/cyc/cyc_shadow_post.py --quiet
-    # Alarm if the feed goes stale. wind_logger.py writes a plausible-looking
-    # CSV row every minute whether or not the station is alive, so without this
-    # a dead station is invisible - as it was for three weeks in July 2026.
-    python3 $HOME/lib/cyc/feed_watch.py --status status.json \
-        --state $HOME/var/cyc_ingest/feedwatch_state.json \
-        --health-out $HOME/wind/feed_health.json \
-        --warn-age 1200 --quiet
-    # And the view from the receiver. Separate state, marker and health file:
-    # two instances sharing any of those would overwrite one another and one
-    # outage would mask the other. The lag threshold is higher because the
-    # shadow path inherits the ~15 min latency of the cloud feed.
-    # (No apostrophes in here: the whole block is a single-quoted flock -c
-    # argument, and one stray quote breaks every line below it.)
-    python3 $HOME/lib/cyc/feed_watch.py --status cyc_status.json \
-        --state $HOME/var/cyc_ingest/feedwatch_cyc_state.json \
-        --health-out $HOME/wind/cyc_feed_health.json \
-        --warn-age 1800 --alarm-age 5400 --lag-warn 1500 --quiet
+    # The watchdog itself is NOT here. It used to run from this file, which
+    # meant that if cron stopped, the thing that would have noticed stopped
+    # with it. It now runs from cyc-feedwatch.timer; if cron dies, status.json
+    # stops being refreshed and the timer alarms.
 ) >> wind.log 2>&1
 '
