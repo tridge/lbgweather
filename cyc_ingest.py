@@ -37,6 +37,8 @@ SKEW_S = 300
 NONCE_TTL_S = 600
 AUTH_FAIL_WINDOW_S = 300
 AUTH_FAIL_LIMIT = 10
+# Read and discard at most this much of an over-large body before rejecting it.
+DRAIN_CAP = 8 * 1024 * 1024
 
 
 def now_iso():
@@ -188,12 +190,34 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----------------------------------------------------------------- auth
 
+    def drain(self, length):
+        """Discard an over-large request body before rejecting it.
+
+        Responding without reading the body leaves the peer still sending. Apache
+        then reports 'AH01084 pass request body failed - Broken pipe' and hands
+        the CLIENT a 502 instead of our 413, which is both misleading and looks
+        like the backend fell over. LimitRequestBody does not gate
+        reverse-proxied bodies, so this has to be handled here.
+
+        Bounded: beyond DRAIN_CAP we stop reading and let the connection close,
+        because draining is a courtesy and must not become a way to occupy the
+        server indefinitely.
+        """
+        remaining = min(length, DRAIN_CAP)
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def read_body(self):
         try:
             length = int(self.headers.get('Content-Length', '0'))
         except ValueError:
             return None, 'bad_request'
         if length > MAX_BODY:
+            self.drain(length)
+            self.close_connection = True
             return None, 'too_large'
         return self.rfile.read(length) if length else b'', None
 
