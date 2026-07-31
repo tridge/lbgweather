@@ -158,6 +158,21 @@ def post(url, key, station, doc, timeout=20):
             return e.code, {'error': raw[:200].decode('utf-8', 'replace')}
 
 
+def acknowledged(code, resp, seq):
+    """True only if the receiver confirms THIS record is durable.
+
+    A 200 alone is not an acknowledgement: the receiver can accept a request
+    and still refuse the record inside it (pre-cutover, malformed,
+    future-dated). Advancing the cursor on the status line alone drops that
+    observation for ever.
+    """
+    if code != 200 or not isinstance(resp, dict):
+        return False
+    return (resp.get('ok') is not False
+            and resp.get('rejected') in (0, None)
+            and resp.get('ack_seq') == seq)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--url', default=DEFAULT_URL)
@@ -207,17 +222,26 @@ def main(argv=None):
     }
 
     code, resp = post(args.url, key, args.station, doc)
-    if code == 200:
+    # A 200 is not an acknowledgement. The receiver reports per-record
+    # outcomes in the body, and it can accept a request while refusing the
+    # record inside it (pre-cutover, malformed, future-dated). Advancing the
+    # cursor on the status line alone would drop that observation for ever.
+    if acknowledged(code, resp, seq):
         state['seq'] = seq
         state['last_obs_epoch'] = obs_epoch
         state['last_ok_epoch'] = int(time.time())
+        # Clear the previous failure. Leaving it behind made a recovered
+        # poster look permanently broken on inspection.
+        state.pop('last_error', None)
+        state.pop('last_error_epoch', None)
         save_state(args.state, state)
         if not args.quiet:
             print('shadow: %s accepted=%s duplicates=%s'
                   % (obs['obs_ts'], resp.get('accepted'), resp.get('duplicates')))
     else:
         # Do NOT advance the cursor: the observation must be retried.
-        print('shadow: POST failed %s %s' % (code, resp), file=sys.stderr)
+        print('shadow: not acknowledged: HTTP %s %s' % (code, resp),
+              file=sys.stderr)
         state['last_error_epoch'] = int(time.time())
         state['last_error'] = '%s %s' % (code, resp.get('error'))
         save_state(args.state, state)

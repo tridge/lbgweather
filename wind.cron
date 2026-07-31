@@ -18,6 +18,17 @@ cd $HOME/wind
     # a dead station is invisible - as it was for three weeks in July 2026.
     python3 $HOME/lib/cyc/feed_watch.py --status status.json \
         --state $HOME/var/cyc_ingest/feedwatch_state.json \
+        --health-out $HOME/wind/feed_health.json \
         --warn-age 1200 --quiet
+    # And the view from the receiver. Separate state, marker and health file:
+    # two instances sharing any of those would overwrite one another and one
+    # outage would mask the other. The lag threshold is higher because the
+    # shadow path inherits the ~15 min latency of the cloud feed.
+    # (No apostrophes in here: the whole block is a single-quoted flock -c
+    # argument, and one stray quote breaks every line below it.)
+    python3 $HOME/lib/cyc/feed_watch.py --status cyc_status.json \
+        --state $HOME/var/cyc_ingest/feedwatch_cyc_state.json \
+        --health-out $HOME/wind/cyc_feed_health.json \
+        --warn-age 1800 --alarm-age 5400 --lag-warn 1500 --quiet
 ) >> wind.log 2>&1
 '
