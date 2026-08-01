@@ -53,6 +53,9 @@ HEARTBEAT_S = 60
 SHED_TIMEOUT_S = 5
 SHED_DRAIN_CAP = 1 << 20
 SHED_QUEUE = 256
+# Degraded days rechecked per heartbeat. Bounded so a pile of bad days
+# cannot hold the heartbeat past the shutdown join.
+RETRY_PER_BEAT = 4
 MAX_NONCES = 20000
 MAX_FAIL_IPS = 4096
 
@@ -418,6 +421,21 @@ class Handler(BaseHTTPRequestHandler):
                              detail='station must be present and match the '
                                     'signing key')
 
+        # Validated BEFORE anything is stored: rejecting after the write meant
+        # a malformed request stored its observations and then returned 400.
+        loss = doc.get('data_loss')
+        if loss is not None and not isinstance(loss, dict):
+            return self.fail(400, 'bad_schema',
+                             detail='data_loss must be an object')
+        loss = loss or {}
+        loss_from, loss_to = loss.get('from'), loss.get('to')
+        if (loss_from is not None or loss_to is not None) and not (
+                is_int(loss_from) and is_int(loss_to)
+                and loss_to >= loss_from):
+            return self.fail(400, 'bad_schema',
+                             detail='data_loss from/to must be integers with '
+                                    'to >= from')
+
         collector = doc.get('collector')
         if collector is not None and not isinstance(collector, dict):
             # A truthy non-dict would be committed and then crash the status
@@ -450,19 +468,17 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message('storage error: %s', e)
             return self.fail(500, 'storage_error')
 
-        loss = doc.get('data_loss')
-        if loss is not None and not isinstance(loss, dict):
-            return self.fail(400, 'bad_schema',
-                             detail='data_loss must be an object')
-        loss = loss or {}
-        ack_seq, newest_utc, gaps, seq_problem = ack_from_dispositions(
-            obs, disp, last_ack=self.server.last_ack(station),
-            loss_from=loss.get('from'), loss_to=loss.get('to'))
-        if seq_problem:
-            details.append(seq_problem)
-
-        self.server.record(station, accepted, dup, rejected, newest_utc,
-                           ack_seq, collector or {}, gaps=gaps)
+        # One transaction: read the cursor, decide, write it back. Split, two
+        # concurrent requests would both measure contiguity against the same
+        # cursor and both advance past it.
+        with self.server.cursor_lock(station):
+            ack_seq, newest_utc, gaps, seq_problem = ack_from_dispositions(
+                obs, disp, last_ack=self.server.last_ack(station),
+                loss_from=loss_from, loss_to=loss_to)
+            if seq_problem:
+                details.append(seq_problem)
+            self.server.record(station, accepted, dup, rejected, newest_utc,
+                               ack_seq, collector or {}, gaps=gaps)
 
         self.respond(200, {
             'ok': True,
@@ -500,6 +516,10 @@ class Server(ThreadingHTTPServer):
         # since ThreadingHTTPServer has already created the thread by then.
         self.slots = threading.BoundedSemaphore(cfg.get('max_conns', 16))
         self._status_lock = threading.Lock()
+        # Reading the cursor and recording the new one must be one transaction,
+        # or two concurrent requests evaluate contiguity against the same value
+        # and both advance it.
+        self._cursor_locks = {name: threading.Lock() for name in stores}
         # obs_age_s must keep growing when the producer dies, or a dead feed
         # looks frozen-but-fresh -- the exact failure this project exists to
         # remove. The producer refreshes its own document; nothing else may
@@ -508,6 +528,7 @@ class Server(ThreadingHTTPServer):
         self._beat_stop = threading.Event()
         self._beat.start()
         self.shed_q = queue.Queue(maxsize=SHED_QUEUE)
+        self._shed_closed = False
         self._shedder = threading.Thread(target=self._shed_worker, daemon=True)
         self._shedder.start()
 
@@ -528,6 +549,21 @@ class Server(ThreadingHTTPServer):
             self._beat.join(timeout=HEARTBEAT_S + 5)
         except RuntimeError:
             pass
+        # Close anything still queued rather than waiting behind it: the
+        # sentinel goes to the back of the queue, so a full queue or a slow
+        # peer would otherwise leave the worker and its sockets alive after
+        # server_close returned.
+        self._shed_closed = True
+        while True:
+            try:
+                pending = self.shed_q.get_nowait()
+            except queue.Empty:
+                break
+            if pending is not None:
+                try:
+                    self.shutdown_request(pending)
+                except Exception:
+                    pass
         try:
             self.shed_q.put_nowait(None)
             self._shedder.join(timeout=SHED_TIMEOUT_S + 5)
@@ -536,40 +572,47 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
     def retry_degraded(self):
-        """Re-test days that failed at startup for a transient reason.
+        """Re-test degraded days, a bounded number per heartbeat.
 
-        A LockTimeout or a passing OSError during startup reconciliation used
-        to pin health at 503 until someone restarted the service.
+        Each entry names its own day, and that day is what gets rechecked --
+        not whatever reconcile_all happens to walk. A day that stays broken
+        long enough to fall outside the recent-files window would otherwise
+        stop being examined and then look recovered because nothing looked.
 
-        The result of reconcile_all() is what decides, not store.degraded():
-        degraded() only knows about JSONL parse failures, so foreign-row
-        refusals, OSError and LockTimeout -- which come back in `errors` --
-        were being declared recovered while still failing. And it runs ONCE per
-        station, not once per degraded day: fourteen bad days meant fourteen
-        full fourteen-day scans every heartbeat.
+        Bounded per heartbeat, with a short lock timeout, because fourteen bad
+        days at ten seconds each would block the heartbeat well past the
+        shutdown join.
         """
         if not self.degraded:
             return
-        stations = {k.split('/')[0] for k in self.degraded}
-        for name in stations:
+        for key in sorted(self.degraded)[:RETRY_PER_BEAT]:
+            name, _, day = key.partition('/')
             store = self.stores.get(name)
             if store is None:
-                continue                  # not a station key; leave it alone
-            try:
-                _repaired, errors = store.reconcile_all()
-            except Exception as e:
-                self.degraded[name] = str(e)
                 continue
-            still = {'%s/%s' % (name, day): msg for day, msg in errors}
-            still.update({'%s/%s' % (name, day): msg
-                          for day, msg in store.degraded().items()})
-            # Replace this station's entries wholesale: anything absent from
-            # the fresh result really has recovered, anything present is still
-            # broken, and a NEW failure is picked up rather than hidden.
-            for key in [k for k in self.degraded
-                        if k == name or k.startswith(name + '/')]:
+            if not day:
+                # A whole-station failure (reconcile_all itself blew up).
+                try:
+                    _repaired, errors = store.reconcile_all()
+                except Exception as e:
+                    self.degraded[key] = str(e)
+                    continue
+                if errors:
+                    self.degraded[key] = errors[0][1]
+                else:
+                    self.degraded.pop(key, None)
+                    for d, msg in store.degraded().items():
+                        self.degraded['%s/%s' % (name, d)] = msg
+                continue
+            try:
+                store.recheck_day(day)
+            except Exception as e:
+                self.degraded[key] = str(e)      # still broken; keep the entry
+                continue
+            if day in store.degraded():
+                self.degraded[key] = store.degraded()[day]
+            else:
                 self.degraded.pop(key, None)
-            self.degraded.update(still)
 
     # ------------------------------------------------------------ capacity
 
@@ -603,11 +646,18 @@ class Server(ThreadingHTTPServer):
         drain what it was still sending. Closing on an unread body makes the
         kernel send RST and the client reports a broken pipe rather than the
         503 we wrote.
+
+        The budget is an ABSOLUTE deadline, not a per-recv timeout. A socket
+        timeout restarts on every successful read, so a peer trickling a byte
+        every few seconds could hold the only shed worker until it reached the
+        drain cap -- and once the queue behind it filled, every later refusal
+        degraded to the bare close this worker exists to avoid.
         """
         while True:
             request = self.shed_q.get()
             if request is None:
                 return
+            deadline = time.monotonic() + SHED_TIMEOUT_S
             try:
                 request.settimeout(SHED_TIMEOUT_S)
                 request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
@@ -620,6 +670,10 @@ class Server(ThreadingHTTPServer):
                     pass
                 drained = 0
                 while drained < SHED_DRAIN_CAP:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    request.settimeout(left)
                     chunk = request.recv(65536)
                     if not chunk:
                         break
@@ -641,6 +695,47 @@ class Server(ThreadingHTTPServer):
     def stats(self):
         return self.stats_by_station[self.primary]
 
+    def cursor_path(self, station):
+        return os.path.join(self.cfg['statedir'], station, 'cursor.json')
+
+    def load_cursor(self, station):
+        """The acknowledged sequence, from disk.
+
+        This is NOT derivable from storage. Durable and acknowledged are
+        different: a batch with durable seq 5 and 7 and an undeclared gap
+        acknowledges only 5, yet both are in the JSONL. Seeding the cursor from
+        the newest stored observation would launder 7 -- the record we
+        deliberately refused -- straight into the cursor on the next restart.
+        """
+        try:
+            with open(self.cursor_path(station)) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return None, 0
+        last = doc.get('last_ack')
+        gaps = doc.get('seq_gaps')
+        return (last if is_int(last) else None, gaps if is_int(gaps) else 0)
+
+    def save_cursor(self, station, last_ack, gaps):
+        path = self.cursor_path(station)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                                       prefix='.cursor-', suffix='.tmp')
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'station': station, 'last_ack': last_ack,
+                           'seq_gaps': gaps, 'written_at': now_iso()}, f)
+                f.write('\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError as e:
+            sys.stderr.write('cursor write failed for %s: %s\n' % (station, e))
+
+    def cursor_lock(self, station):
+        return self._cursor_locks.setdefault(station, threading.Lock())
+
     def last_ack(self, station):
         st = self.stats_by_station.get(station)
         if st is None:
@@ -655,6 +750,10 @@ class Server(ThreadingHTTPServer):
             return
         st.record(accepted, dup, rejected, newest_utc, seq, collector,
                   gaps=gaps)
+        if seq is not None or gaps:
+            with st.lock:
+                last, total = st.last_seq, st.seq_gaps
+            self.save_cursor(station, last, total)
         # Only the primary station owns the public status document.
         if station == self.primary:
             self.write_status()
@@ -746,22 +845,35 @@ class Server(ThreadingHTTPServer):
         return out
 
 
+def is_int(v):
+    """A real integer. bool is a subclass of int and must not qualify."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
                           loss_to=None):
     """Highest safely-acknowledgeable seq, the newest durable instant, gaps.
 
     Returns (ack, newest_utc, gaps, problem).
 
-    The cursor contract is exact +1 continuity, within a request and ACROSS
-    requests. Acknowledging seq 7 when 6 was never seen tells a cursor-based
-    collector to discard 6, and it does not matter whether the hole was inside
-    one batch or between two: strictly-increasing was not enough, because the
-    receiver never compared against what it had previously acknowledged.
+    Three rules, and they are not the same rule:
 
-    A collector that drops spool files under disk pressure must SAY SO, by
-    declaring `data_loss: {from, to}` in the document. That authorises exactly
-    one jump, over exactly that range, and the skipped count is recorded as
-    seq_gaps so the loss is in the record rather than inferred from silence.
+      * ADVANCING past the cursor requires exactly +1. Acknowledging seq 7 when
+        6 was never seen tells a cursor-based collector to discard 6, and it
+        makes no difference whether the hole was inside one batch or between
+        two requests.
+      * RE-acknowledging at or below the cursor is always allowed for a durable
+        record. This is the ordinary lost-response retry: the collector never
+        saw our 200, resends, and the record comes back as a duplicate. Demanding
+        +1 there refuses the retry for ever and wedges the collector -- which is
+        exactly the stall this rule used to cause.
+      * Within one request the sequence must strictly increase, so a
+        mis-ordered batch is refused rather than partly acknowledged.
+
+    A collector that drops spool files must SAY SO, by declaring
+    `data_loss: {from, to}`. That authorises exactly one jump over exactly that
+    range, and the skipped count is recorded as seq_gaps so the loss is in the
+    record rather than inferred from silence.
 
     Durability is taken per input, never from a set of UTC instants: two inputs
     can share an instant, and a set cannot say which of them is on disk.
@@ -783,7 +895,8 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
     ack = None
     gaps = 0
     problem = None
-    prev = last_ack
+    cursor = last_ack
+    in_batch = None
     loss_used = False
 
     for o, d in zip(obs, disp):
@@ -791,27 +904,31 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
             problem = problem or ('acknowledgement stops at a %s record' % d)
             break
         sq = o.get('seq') if isinstance(o, dict) else None
-        if not isinstance(sq, int) or isinstance(sq, bool):
+        if not is_int(sq):
             problem = problem or 'a durable record carries no integer seq'
             break
+        if in_batch is not None and sq <= in_batch:
+            problem = problem or ('seq %s does not increase after %s within '
+                                  'the request' % (sq, in_batch))
+            break
 
-        if prev is None:
-            pass                       # first sequence we have ever seen
-        elif sq == prev + 1:
-            pass                       # the ordinary case
-        elif (not loss_used and loss_from is not None and loss_to is not None
-              and loss_from == prev + 1 and loss_to == sq - 1
+        if cursor is None or sq == cursor + 1:
+            cursor = sq                      # first ever, or the ordinary case
+        elif sq <= cursor:
+            pass                             # replay of ground already covered
+        elif (not loss_used and is_int(loss_from) and is_int(loss_to)
+              and loss_from == cursor + 1 and loss_to == sq - 1
               and loss_to >= loss_from):
-            # A declared, contiguous, single loss range. Record what it cost.
             gaps += loss_to - loss_from + 1
             loss_used = True
+            cursor = sq
         else:
             problem = problem or (
                 'seq %s does not follow %s and no data_loss covers the gap'
-                % (sq, prev))
+                % (sq, cursor))
             break
 
-        prev = sq
+        in_batch = sq
         ack = sq
 
     return ack, newest, gaps, problem
@@ -874,7 +991,7 @@ def main(argv=None):
     primary = args.station[0][0]
     cfg = {'keys': keys, 'status': args.status,
            'enable_echo': args.enable_echo, 'max_conns': args.max_conns,
-           'primary': primary}
+           'primary': primary, 'statedir': args.statedir}
 
     # Two stations must never name the same tree: their locks are
     # station-specific, so they would mutate the same JSONL and CSV under
@@ -917,17 +1034,28 @@ def main(argv=None):
     # restart makes status.json report "no observation has ever been recorded"
     # until the next one arrives -- which feed_watch correctly treats as an
     # alarm. Every deploy would otherwise fire a false alert.
-    try:
-        last = stores[primary].last_observation()
-    except Exception:
-        last = None
-    if last:
-        srv.stats.last_obs_utc = int(last['utc'])
-        if isinstance(last.get('seq'), int):
-            srv.stats.last_seq = last['seq']
-        sys.stderr.write('seeded from storage: last observation %s\n'
-                         % datetime.fromtimestamp(srv.stats.last_obs_utc, TZ)
-                         .isoformat(timespec='seconds'))
+    for name, store in stores.items():
+        st = srv.stats_by_station[name]
+        try:
+            last = store.last_observation()
+        except Exception:
+            last = None
+        if last:
+            st.last_obs_utc = int(last['utc'])
+            sys.stderr.write('seeded %s from storage: last observation %s\n'
+                             % (name,
+                                datetime.fromtimestamp(st.last_obs_utc, TZ)
+                                .isoformat(timespec='seconds')))
+        # The CURSOR comes from its own file, never from storage: a durable
+        # record is not necessarily an acknowledged one, and inferring the
+        # cursor from the newest observation would launder a record we
+        # explicitly refused to acknowledge.
+        last_ack, gaps = srv.load_cursor(name)
+        st.last_seq = last_ack
+        st.seq_gaps = gaps
+        if last_ack is not None:
+            sys.stderr.write('seeded %s cursor: last_ack=%s seq_gaps=%s\n'
+                             % (name, last_ack, gaps))
 
     srv.write_status()
     sys.stderr.write('cyc-ingest listening on %s:%d, stations: %s\n'

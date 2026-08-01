@@ -58,7 +58,7 @@ class Harness:
                 f.write('%s\t%s\n' % (self.second, KEY2))
         cfg = {'keys': load_keys(self.keyfile), 'status': self.status,
                'enable_echo': True, 'max_conns': 16, 'primary': STATION,
-               'degraded': {}}
+               'degraded': {}, 'statedir': self.state}
         stores = {STATION: Store(self.logs, self.state, station=STATION)}
         if self.second:
             self.logs2 = os.path.join(self.d, 'wind_logs2')
@@ -286,7 +286,7 @@ def test_restart_seeding():
         h.srv.shutdown(); h.srv.server_close()
         cfg = {'keys': load_keys(h.keyfile), 'status': h.status,
                'enable_echo': True, 'max_conns': 16, 'primary': STATION,
-               'degraded': {}}
+               'degraded': {}, 'statedir': h.state}
         store = Store(h.logs, h.state, station=STATION)
         h.srv = Server(('127.0.0.1', 0), cfg, {STATION: store})
         h.port = h.srv.server_address[1]
@@ -676,10 +676,13 @@ def test_status_never_regresses_under_concurrent_writers():
         w.start()
 
         # Many writers racing, plus the heartbeat, all calling write_status.
+        results = [None] * 20
+
         def fire(i):
-            h.post('/ingest/obs',
-                   doc([obs('2026-07-31T%02d:%02d:03+10:00'
-                            % (10 + i // 60, i % 60), i + 1)]))
+            results[i] = h.post(
+                '/ingest/obs',
+                doc([obs('2026-07-31T%02d:%02d:03+10:00'
+                         % (10 + i // 60, i % 60), i + 1)]))
         ts = [threading.Thread(target=fire, args=(i,)) for i in range(20)]
         for t in ts:
             t.start()
@@ -691,6 +694,19 @@ def test_status_never_regresses_under_concurrent_writers():
         w.join(timeout=5)
 
         vals = [v for v in seen if v is not None]
+        # Without this the test could pass having observed nothing at all.
+        check(len(vals) > 20 and len(set(vals)) > 1,
+              'the watcher actually saw the document change (%d reads, %d '
+              'distinct values)' % (len(vals), len(set(vals))))
+        codes = [r[0] if r else None for r in results]
+        # 20 concurrent against a cap of 16 means some are legitimately shed.
+        served = codes.count(200)
+        check(served >= 10 and all(c in (200, 503) for c in codes),
+              'enough posts got through to make the race real (%d served, '
+              'codes %s)' % (served, sorted(set(codes), key=repr)))
+        check(json.load(open(h.status))['accepted'] == served,
+              'and every served post is in the published status (%s vs %s)'
+              % (json.load(open(h.status))['accepted'], served))
         regressions = [(a, b) for a, b in zip(vals, vals[1:]) if b < a]
         check(not regressions,
               'last_obs_epoch never went backwards across %d reads (%s)'
@@ -852,6 +868,166 @@ def test_heartbeat_stops_with_the_server():
           'a deleted directory for ever')
 
 
+
+def test_lost_ack_retry_is_acknowledged_again():
+    print('\n== a retry after a lost response must be acknowledged ==')
+    with Harness() as h:
+        d = doc([obs('2026-07-31T10:00:03+10:00', 5)])
+        code, body = h.post('/ingest/obs', d)
+        check(body['ack_seq'] == 5, 'first delivery acknowledged')
+
+        # The collector never saw that response. It resends the same record,
+        # which comes back as a durable duplicate. Demanding +1 here refused
+        # it for ever and the collector could never advance -- and the old
+        # replay test only checked duplicate counts, so it passed anyway.
+        code, body = h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00',
+                                                    5)]))
+        check(body['duplicates'] == 1, 'the retry is a duplicate')
+        check(body['ack_seq'] == 5,
+              'and is acknowledged AGAIN rather than stalling the collector '
+              '(got %s)' % body['ack_seq'])
+
+        # A replayed prefix followed by genuinely new data still advances.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:00:03+10:00', 5),
+                                 obs('2026-07-31T10:01:03+10:00', 6)]))
+        check(body['ack_seq'] == 6,
+              'a replayed prefix plus new data advances (got %s)'
+              % body['ack_seq'])
+
+        # An old, long-acknowledged record is still confirmed durable.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:00:03+10:00', 5)]))
+        check(body['ack_seq'] == 5,
+              'an old record is confirmed at its own seq (got %s)'
+              % body['ack_seq'])
+
+
+def test_cursor_survives_restart_without_laundering():
+    print('\n== the acknowledged cursor is persisted, not inferred ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 5)]))
+        # A batch whose LATER record is durable but NOT acknowledged: seq 7
+        # after 5 with no data_loss. It is stored, but the ack stops at 5.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T11:00:03+10:00', 7)]))
+        check(body['ack_seq'] is None, 'the undeclared gap is not acknowledged')
+        import cyc_store
+        recs = h.srv.stores[STATION]._read_jsonl(
+            cyc_store.DayFiles(h.logs, 2026, 7, 31))
+        check(len(recs) == 2, 'but seq 7 IS durable on disk')
+
+        cur = os.path.join(h.state, STATION, 'cursor.json')
+        check(os.path.exists(cur), 'the cursor is written to its own file')
+        check(json.load(open(cur))['last_ack'] == 5,
+              'and holds 5, not the newer durable 7 (got %s)'
+              % json.load(open(cur))['last_ack'])
+
+        # Restart: the cursor must come from that file. Inferring it from the
+        # newest stored observation would launder the refused 7 into it.
+        last_ack, gaps = h.srv.load_cursor(STATION)
+        check(last_ack == 5,
+              'a restart reloads 5, so seq 6 is still required (got %s)'
+              % last_ack)
+
+
+def test_malformed_data_loss_stores_nothing():
+    print('\n== a malformed data_loss must not store first ==')
+    with Harness() as h:
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['data_loss'] = 'not an object'
+        code, _ = h.post('/ingest/obs', d)
+        check(code == 400, 'rejected (got %s)' % code)
+
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['data_loss'] = {'from': True, 'to': True}
+        code, _ = h.post('/ingest/obs', d)
+        check(code == 400, 'boolean bounds rejected (got %s)' % code)
+
+        d = doc([obs('2026-07-31T10:00:03+10:00', 1)])
+        d['data_loss'] = {'from': 9, 'to': 2}
+        code, _ = h.post('/ingest/obs', d)
+        check(code == 400, 'to < from rejected (got %s)' % code)
+
+        # Nothing may have been written on the way to any of those 400s.
+        import cyc_store
+        check(not os.path.exists(
+            os.path.join(h.logs, '2026', '07', '31.jsonl')),
+            'and no observation was stored before the rejection')
+
+
+def test_shed_queue_saturation_still_closes_cleanly():
+    print('\n== a full shed queue degrades to a close, not a hang ==')
+    import http.client
+    with Harness() as h:
+        h.srv.slots = threading.BoundedSemaphore(1)
+        h.srv.shed_q = __import__('queue').Queue(maxsize=1)
+        hog = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+        hog.connect()
+        time.sleep(0.3)
+
+        outcomes = []
+        conns = []
+        t0 = time.time()
+        try:
+            for _ in range(6):
+                c = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
+                conns.append(c)
+                try:
+                    c.request('GET', '/ingest/health')
+                    outcomes.append(c.getresponse().status)
+                except Exception as e:
+                    outcomes.append(type(e).__name__)
+        finally:
+            elapsed = time.time() - t0
+            for c in conns:
+                c.close()
+            hog.close()
+        # With a deliberately tiny queue most refusals DO degrade to a bare
+        # close -- that is the documented behaviour. What must never happen is
+        # a hang, or an over-capacity request being served.
+        check(200 not in outcomes,
+              'no over-capacity request was served (%s)' % outcomes)
+        check(len(outcomes) == 6 and elapsed < 40,
+              'all six completed promptly rather than hanging (%.1fs)'
+              % elapsed)
+
+
+
+def test_retry_degraded_distinguishes_transient_from_permanent():
+    print('\n== degraded days are rechecked, not aged out ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        jsonl = os.path.join(h.logs, '2026', '07', '31.jsonl')
+        good = open(jsonl).read()
+
+        # A genuinely broken day, recorded as degraded.
+        with open(jsonl, 'w') as f:
+            f.write('{"not": "a record"}\n')
+        h.srv.degraded['%s/2026-07-31' % STATION] = 'seeded by the test'
+
+        h.srv.retry_degraded()
+        check('%s/2026-07-31' % STATION in h.srv.degraded,
+              'a still-broken day is KEPT, not cleared (%s)' % h.srv.degraded)
+
+        # The recheck names the specific day, so it works even for a day that
+        # no recent-files scan would reach.
+        h.srv.degraded['%s/2019-01-01' % STATION] = 'ancient and broken'
+        h.srv.retry_degraded()
+        check('%s/2019-01-01' % STATION not in h.srv.degraded,
+              'a day with nothing wrong is cleared even though it is far '
+              'outside any recent window (%s)' % h.srv.degraded)
+
+        # Repair the real one; the next heartbeat must clear it.
+        with open(jsonl, 'w') as f:
+            f.write(good)
+        h.srv.retry_degraded()
+        check(not h.srv.degraded,
+              'a repaired day is cleared (%s)' % h.srv.degraded)
+        code, body = h.get('/ingest/health')
+        check(code == 200 and body['ok'] is True, 'and health recovers')
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -877,6 +1053,11 @@ def main():
     test_shedding_stores_nothing_and_retries_cleanly()
     test_status_never_regresses_under_concurrent_writers()
     test_ack_sequence_contract()
+    test_lost_ack_retry_is_acknowledged_again()
+    test_cursor_survives_restart_without_laundering()
+    test_malformed_data_loss_stores_nothing()
+    test_shed_queue_saturation_still_closes_cleanly()
+    test_retry_degraded_distinguishes_transient_from_permanent()
     test_seq_gaps_are_counted_from_the_batch()
     test_duplicate_instant_in_one_batch()
     test_busy_carries_retry_after()
