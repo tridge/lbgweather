@@ -69,6 +69,10 @@ def get_log_file():
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, now.strftime('%d') + '.csv')
 
+class LockUnavailable(Exception):
+    """The shared day lock could not be taken. Do not write the CSV."""
+
+
 @contextmanager
 def day_lock(log_file):
     """Hold the same day lock cyc_store.py uses.
@@ -76,9 +80,13 @@ def day_lock(log_file):
     Without this there are two unsynchronised writers on one CSV: this one
     appends, and the store rewrites the whole file from its JSONL. An append
     landing between the store reading the file and replacing it goes into the
-    old inode and is lost. The store refuses to project over rows it cannot
-    account for, but that check cannot close the window on its own -- only a
-    shared lock can.
+    old inode and is lost.
+
+    There is deliberately NO unlocked fallback. Contention here is most likely
+    while the store is doing the adoption or projection that must not be raced,
+    so an unlocked append would fire exactly when it is most dangerous. Missing
+    one sample is recoverable; silently erasing one, or corrupting the cutover,
+    is not.
 
     The key must match cyc_store.DayFiles.key: "YYYY-MM-DD".
     """
@@ -90,11 +98,8 @@ def day_lock(log_file):
         fd = os.open(os.path.join(LOCK_DIR, 'day-%s.lock' % key),
                      os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as e:
-        # Never let a lock problem stop the logging this file exists to do.
-        print('wind_logger: no day lock (%s); appending unlocked' % e,
-              file=sys.stderr)
-        yield
-        return
+        raise LockUnavailable('cannot open the day lock in %s: %s'
+                              % (LOCK_DIR, e))
     deadline = time.monotonic() + LOCK_TIMEOUT_S
     try:
         while True:
@@ -103,9 +108,8 @@ def day_lock(log_file):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    print('wind_logger: day lock busy for %ds; appending '
-                          'unlocked' % LOCK_TIMEOUT_S, file=sys.stderr)
-                    break
+                    raise LockUnavailable('day lock %s busy for %ds'
+                                          % (key, LOCK_TIMEOUT_S))
                 time.sleep(0.1)
         yield
     finally:
@@ -117,18 +121,30 @@ def day_lock(log_file):
 
 
 def log_data(data):
-    """Append data to today's CSV file, under the shared day lock."""
+    """Append data to today's CSV file, under the shared day lock.
+
+    Returns False and logs loudly if the lock was unavailable. The caller keeps
+    going -- status.json still gets written, so the watchdog sees the feed's
+    real age rather than a silence it cannot explain.
+    """
     log_file = get_log_file()
 
-    with day_lock(log_file):
-        file_exists = os.path.exists(log_file)
-        with open(log_file, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(data)
-            f.flush()
-            os.fsync(f.fileno())
+    # The contextmanager raises on __enter__, not on construction, so the
+    # `with` has to be inside the try.
+    try:
+        with day_lock(log_file):
+            file_exists = os.path.exists(log_file)
+            with open(log_file, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(data)
+                f.flush()
+                os.fsync(f.fileno())
+    except LockUnavailable as e:
+        print('wind_logger: NOT logging this sample: %s' % e, file=sys.stderr)
+        return False
+    return True
 
 def write_status(weather_json):
     """Record the feed's OWN timestamp so staleness is detectable.

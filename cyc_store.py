@@ -408,6 +408,21 @@ class Store:
         self._write_csv_atomic(files, want)
         return True
 
+    def recheck_day(self, daykey, timeout=2):
+        """Re-test ONE named day. Raises if it is still bad.
+
+        reconcile_all only walks the most recent files, so a day that stays
+        broken long enough to fall outside that window would silently stop
+        being examined -- and then look recovered simply because nothing
+        checked it. A short lock timeout keeps a caller on a timer from
+        stalling behind a busy day.
+        """
+        y, m, d = (int(x) for x in daykey.split('-'))
+        files = DayFiles(self.logdir, y, m, d)
+        with self._DayLock(self.statedir, files.key, timeout=timeout):
+            self._repair_torn_tail(files)
+            return self.reconcile(files)
+
     def reconcile_all(self, max_days=14):
         """Repair every recent day at startup.
 
