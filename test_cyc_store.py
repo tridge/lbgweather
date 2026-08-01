@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -773,6 +774,74 @@ def test_dispositions_are_per_input():
         check(len(disp) == 4, 'length matches the input list')
 
 
+
+def test_wind_logger_shares_the_day_lock():
+    print('\n== the legacy writer and the store use ONE lock ==')
+    import subprocess
+    with Tmp() as t:
+        f = DayFiles(t.logs, 2026, 7, 31)
+        f.ensure_dir()
+        state_for_station = os.path.join(t.state, 'cyc1')
+        os.makedirs(state_for_station, exist_ok=True)
+
+        # wind_logger lives in the web tree, not beside the service code, so
+        # find it rather than assuming it is importable from here. Not finding
+        # it is a failure, not a skip: the whole point is that these two files
+        # agree, and an unrun check proves nothing.
+        wl_dir = None
+        for cand in (HERE, os.path.expanduser('~/wind')):
+            if os.path.exists(os.path.join(cand, 'wind_logger.py')):
+                wl_dir = cand
+                break
+        check(wl_dir is not None,
+              'wind_logger.py found, so the shared-lock invariant can be '
+              'checked')
+        if wl_dir is None:
+            return
+
+        # wind_logger derives its lock path from the CSV path and CYC_LOCK_DIR.
+        # If that ever stops matching DayFiles.key, the two writers hold
+        # different locks and neither notices.
+        src = ('import os, sys; sys.path.insert(0, %r); '
+               'os.environ["CYC_LOCK_DIR"] = %r; '
+               'import wind_logger as wl; '
+               'import fcntl, time; '
+               'lf = %r\n'
+               'with wl.day_lock(lf):\n'
+               '    print("HELD", flush=True)\n'
+               '    time.sleep(3)\n'
+               % (wl_dir, state_for_station,
+                  os.path.join(t.logs, '2026', '07', '31.csv')))
+        p = subprocess.Popen([sys.executable, '-c', src],
+                             stdout=subprocess.PIPE, text=True)
+        try:
+            check(p.stdout.readline().strip() == 'HELD',
+                  'wind_logger acquired the day lock')
+
+            # The store must now be unable to take it. If the paths did not
+            # match, this would succeed instantly and prove nothing.
+            s = Store(t.logs, state_for_station, station='cyc1')
+            t0 = time.time()
+            blocked = False
+            try:
+                with s._DayLock(state_for_station, f.key, timeout=1):
+                    pass
+            except LockTimeout:
+                blocked = True
+            check(blocked,
+                  'the store is BLOCKED by the legacy writer - one lock, not '
+                  'two (waited %.1fs)' % (time.time() - t0))
+        finally:
+            p.kill()
+            p.wait(timeout=10)
+
+        # And once released, the store proceeds.
+        s = Store(t.logs, state_for_station, station='cyc1')
+        with s._DayLock(state_for_station, f.key, timeout=5):
+            pass
+        check(True, 'and proceeds once the writer releases it')
+
+
 def main():
     for fn in [test_format_contract, test_replay_and_first_write_wins,
                test_out_of_order, test_dst_fold, test_spring_forward,
@@ -790,6 +859,7 @@ def main():
                test_foreign_csv_rows_are_never_projected_over,
                test_empty_jsonl_beside_a_legacy_csv,
                test_dispositions_are_per_input,
+               test_wind_logger_shares_the_day_lock,
                test_adoption_is_atomic,
                test_adoption_rejects_damaged_input,
                test_adoption_rejects_impossible_local_times,

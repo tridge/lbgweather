@@ -3,15 +3,25 @@
 
 import requests
 import csv
+import fcntl
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
 WEATHER_URL = "https://canberrayc.com/admin/php/cyc/getWeather.php"
 LOG_BASE_DIR = "wind_logs"
 STATUS_FILE = "status.json"
+# Shared with cyc_store.py. Both writers must name the SAME directory and the
+# same lock file, or the lock protects nothing at all. The store puts its day
+# locks in <statedir>/<station>, so this must be the statedir of whichever
+# station owns LOG_BASE_DIR -- cyc1 once the collector writes production.
+# Override with CYC_LOCK_DIR if that ever changes.
+LOCK_DIR = os.environ.get(
+    'CYC_LOCK_DIR', os.path.expanduser("~/var/cyc_ingest/cyc1"))
+LOCK_TIMEOUT_S = 10
 
 # Conversion factors
 MPH_TO_KNOTS = 0.868976
@@ -59,16 +69,66 @@ def get_log_file():
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, now.strftime('%d') + '.csv')
 
-def log_data(data):
-    """Append data to today's CSV file"""
-    log_file = get_log_file()
-    file_exists = os.path.exists(log_file)
+@contextmanager
+def day_lock(log_file):
+    """Hold the same day lock cyc_store.py uses.
 
-    with open(log_file, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(data)
+    Without this there are two unsynchronised writers on one CSV: this one
+    appends, and the store rewrites the whole file from its JSONL. An append
+    landing between the store reading the file and replacing it goes into the
+    old inode and is lost. The store refuses to project over rows it cannot
+    account for, but that check cannot close the window on its own -- only a
+    shared lock can.
+
+    The key must match cyc_store.DayFiles.key: "YYYY-MM-DD".
+    """
+    stem = os.path.basename(log_file)[:-4]
+    parts = log_file.split(os.sep)
+    key = '%s-%s-%s' % (parts[-3], parts[-2], stem)
+    try:
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        fd = os.open(os.path.join(LOCK_DIR, 'day-%s.lock' % key),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        # Never let a lock problem stop the logging this file exists to do.
+        print('wind_logger: no day lock (%s); appending unlocked' % e,
+              file=sys.stderr)
+        yield
+        return
+    deadline = time.monotonic() + LOCK_TIMEOUT_S
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print('wind_logger: day lock busy for %ds; appending '
+                          'unlocked' % LOCK_TIMEOUT_S, file=sys.stderr)
+                    break
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def log_data(data):
+    """Append data to today's CSV file, under the shared day lock."""
+    log_file = get_log_file()
+
+    with day_lock(log_file):
+        file_exists = os.path.exists(log_file)
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(data)
+            f.flush()
+            os.fsync(f.fileno())
 
 def write_status(weather_json):
     """Record the feed's OWN timestamp so staleness is detectable.

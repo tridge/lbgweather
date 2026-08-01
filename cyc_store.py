@@ -656,11 +656,30 @@ class Store:
         anything extra means a second writer.
         """
         def stamps(blob):
+            """Timestamps of the data rows, parsed as CSV.
+
+            Splitting on the first comma was wrong three ways: a quoted
+            timestamp read as foreign, surrounding whitespace that adoption
+            accepts became a false foreign row, and a headerless file lost its
+            first DATA row to the header skip -- so that row could be
+            overwritten, which is the exact thing this guard exists to stop.
+            """
             if not blob:
                 return collections.Counter()
-            rows = blob.decode('utf-8', 'replace').replace('\r\n', '\n').split('\n')
-            return collections.Counter(
-                r.split(',', 1)[0] for r in rows[1:] if r.strip())
+            rdr = csv.reader(io.StringIO(blob.decode('utf-8', 'replace')))
+            out = collections.Counter()
+            first = True
+            for row in rdr:
+                if not row or not any(c.strip() for c in row):
+                    continue
+                if first:
+                    first = False
+                    if [c.strip() for c in row] == CSV_FIELDS:
+                        continue          # a real header; skip it
+                    # No header. Count this row -- discarding it would let a
+                    # foreign first row be projected away silently.
+                out[row[0].strip()] += 1
+            return out
 
         extra = stamps(have) - stamps(want)
         return sorted(extra.elements())
