@@ -1,0 +1,44 @@
+[Unit]
+Description=CYC weather ingest (HMAC-authenticated observation receiver)
+After=network.target
+
+[Service]
+Type=simple
+User=lbgweather
+Group=lbgweather
+WorkingDirectory=/home/lbgweather/wind
+# Existing CSVs are 0664; writing them 0600 would make Apache return 403 and
+# blank the website while data arrived perfectly.
+UMask=0022
+# Service code lives outside the Apache DocumentRoot.
+ExecStart=/usr/bin/python3 /home/lbgweather/lib/cyc/cyc_ingest.py \
+    --host 127.0.0.1 --port 8790 \
+    --keyfile  /home/lbgweather/etc/cyc_ingest.key \
+    --station  cyc1=/home/lbgweather/wind/wind_logs_new \
+    --statedir /home/lbgweather/var/cyc_ingest \
+    --status   /home/lbgweather/wind/cyc_status.json \
+    --max-conns 16
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Containment. This box also serves five other domains and runs postfix, so a
+# runaway here must not be able to take the machine with it.
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=1024
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/lbgweather/wind /home/lbgweather/var
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

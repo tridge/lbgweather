@@ -1,0 +1,31 @@
+[Unit]
+Description=CYC weather feed staleness watchdog
+Documentation=https://github.com/tridge/lbgweather
+After=network.target
+
+[Service]
+Type=oneshot
+User=lbgweather
+Group=lbgweather
+WorkingDirectory=/home/lbgweather/wind
+# Deliberately NOT run from wind.cron. It used to be, which meant a dead cron
+# silenced the watchdog that would have reported it. Running from a timer makes
+# cron death visible: wind_logger stops refreshing status.json and this alarms.
+ExecStart=/usr/bin/python3 /home/lbgweather/lib/cyc/feed_watch.py \
+    --status status.json \
+    --state /home/lbgweather/var/cyc_ingest/feedwatch_state.json \
+    --health-out /home/lbgweather/wind/feed_health.json \
+    --warn-age 1200 --quiet
+ExecStart=/usr/bin/python3 /home/lbgweather/lib/cyc/feed_watch.py \
+    --status cyc_status.json \
+    --state /home/lbgweather/var/cyc_ingest/feedwatch_cyc_state.json \
+    --health-out /home/lbgweather/wind/cyc_feed_health.json \
+    --warn-age 1800 --alarm-age 5400 --lag-warn 1500 --quiet
+TimeoutStartSec=120
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
