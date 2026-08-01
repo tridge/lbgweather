@@ -582,6 +582,7 @@ def test_concurrent_posts_do_not_deadlock_or_lose_records():
                                     doc([obs(stamp(i), i + 1)]))
             except Exception as e:
                 results[i] = ('exc', repr(e))
+                print('       request %d raised: %r' % (i, e))
 
         threads = [threading.Thread(target=fire, args=(i,)) for i in range(n)]
         t0 = time.time()
@@ -602,7 +603,7 @@ def test_concurrent_posts_do_not_deadlock_or_lose_records():
         # -- a partial write under load would be far worse than a refusal.
         check(all(c in (200, 503) for c in codes),
               'every response was either accepted or cleanly shed (codes %s)'
-              % sorted(set(codes)))
+              % sorted(set(codes), key=repr))
         print('       (%d of %d shed by the connection cap)' % (len(shed), n))
 
         import cyc_store
@@ -710,42 +711,93 @@ def test_ack_sequence_contract():
     t1, t2, t3 = ('2026-07-31T10:00:03+10:00', '2026-07-31T10:01:03+10:00',
                   '2026-07-31T10:02:03+10:00')
 
-    ack, newest, _ = A([o(t1, 5), o(t2, 6)], [STORED, STORED])
-    check(ack == 6, 'a clean increasing run is fully acknowledged')
+    ack, newest, gaps, _ = A([o(t1, 5), o(t2, 6)], [STORED, STORED])
+    check(ack == 6 and gaps == 0, 'a clean +1 run is fully acknowledged')
 
-    ack, _, _ = A([o(t1, 5), o(t2, 6)], [REJECTED, STORED])
+    ack, _, _, _ = A([o(t1, 5), o(t2, 6)], [REJECTED, STORED])
     check(ack is None, 'a leading rejection stops the acknowledgement')
 
-    ack, _, why = A([o(t1, 5), o(t2, 7)], [STORED, STORED])
-    check(ack == 7, 'a seq GAP is still acknowledged (spool loss is explicit)')
+    # THE CASE THAT WAS WRONG. Acknowledging 7 when 6 was never seen tells a
+    # cursor-based collector to discard 6 for ever.
+    ack, _, gaps, why = A([o(t1, 5), o(t2, 7)], [STORED, STORED])
+    check(ack == 5 and why,
+          'an UNDECLARED seq gap stops the acknowledgement (got %s, %r)'
+          % (ack, why))
+    check(gaps == 0, 'and nothing is counted as lost - it may still arrive')
 
-    ack, _, why = A([o(t1, 10), o(t2, 9)], [STORED, STORED])
-    check(ack == 10 and why,
-          'a DECREASING seq stops at the violation (got %s, %r)' % (ack, why))
+    # ...unless the collector declares exactly what it dropped.
+    ack, _, gaps, why = A([o(t1, 5), o(t2, 7)], [STORED, STORED],
+                          loss_from=6, loss_to=6)
+    check(ack == 7 and gaps == 1 and not why,
+          'a DECLARED loss range authorises the jump and is counted '
+          '(ack=%s gaps=%s)' % (ack, gaps))
 
-    ack, _, why = A([o(t1, 5), o(t2), o(t3, 7)], [STORED, STORED, STORED])
+    ack, _, _, _ = A([o(t1, 5), o(t2, 7)], [STORED, STORED],
+                     loss_from=6, loss_to=9)
+    check(ack == 5, 'a loss range that does not match the gap is refused')
+
+    # Continuity holds ACROSS requests, not only within one.
+    ack, _, _, why = A([o(t2, 7)], [STORED], last_ack=5)
+    check(ack is None and why,
+          'a gap against the PREVIOUS request is caught too (got %s)' % ack)
+    ack, _, _, _ = A([o(t2, 6)], [STORED], last_ack=5)
+    check(ack == 6, 'and the contiguous continuation is accepted')
+    ack, _, gaps, _ = A([o(t2, 7)], [STORED], last_ack=5,
+                        loss_from=6, loss_to=6)
+    check(ack == 7 and gaps == 1, 'a declared cross-request loss is allowed')
+
+    ack, _, _, why = A([o(t1, 10), o(t2, 9)], [STORED, STORED])
+    check(ack == 10 and why, 'a DECREASING seq stops at the violation')
+
+    ack, _, _, why = A([o(t1, 5), o(t2), o(t3, 7)], [STORED, STORED, STORED])
     check(ack == 5 and why,
           'a durable record with no seq stops the run rather than being '
           'stepped over (got %s)' % ack)
 
-    ack, _, why = A([o(t1, 5), o(t2, True)], [STORED, STORED])
+    ack, _, _, _ = A([o(t1, 5), o(t2, True)], [STORED, STORED])
     check(ack == 5, 'a bool is not an acceptable seq')
 
     # The UTC-laundering case: two inputs on ONE instant, the first stored and
     # the second rejected. A UTC key set cannot tell them apart.
-    ack, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, REJECTED])
+    ack, _, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, REJECTED])
     check(ack == 5,
           'a record rejected on an instant another record occupies is NOT '
           'acknowledged (got %s)' % ack)
 
-    ack, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, DUPLICATE])
+    ack, _, _, _ = A([o(t1, 5), o(t1, 6)], [STORED, DUPLICATE])
     check(ack == 6, 'but a genuine duplicate IS durable and acknowledged')
 
     # Freshness must cover everything durable, not just the acked prefix.
-    _, newest, _ = A([o(t1), o(t3, 9)], [STORED, STORED])
+    _, newest, _, _ = A([o(t1), o(t3, 9)], [STORED, STORED])
     check(newest == utc_key(parse_obs_ts(t3)),
           'newest instant reflects the later durable record even though the '
           'ACK stopped early')
+
+
+def test_seq_gaps_are_counted_from_the_batch():
+    print('\n== a clean batch must not report phantom losses ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 4)]))
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:01:03+10:00', 5),
+                                 obs('2026-07-31T10:02:03+10:00', 6)]))
+        check(body['ack_seq'] == 6, 'the batch is acknowledged to 6')
+        st = json.load(open(h.status))
+        # Deriving gaps from last_seq and the final ack counted 6 - 4 - 1 = 1
+        # lost observation even though the batch delivered 5 AND 6.
+        check(st['seq_gaps'] == 0,
+              'a contiguous batch reports no lost observations (got %s)'
+              % st['seq_gaps'])
+
+        # A real, declared loss IS counted.
+        d = doc([obs('2026-07-31T10:05:03+10:00', 10)])
+        d['data_loss'] = {'from': 7, 'to': 9}
+        code, body = h.post('/ingest/obs', d)
+        check(body['ack_seq'] == 10, 'the declared jump is acknowledged')
+        st = json.load(open(h.status))
+        check(st['seq_gaps'] == 3,
+              'and the three dropped observations are recorded (got %s)'
+              % st['seq_gaps'])
 
 
 def test_duplicate_instant_in_one_batch():
@@ -825,6 +877,7 @@ def main():
     test_shedding_stores_nothing_and_retries_cleanly()
     test_status_never_regresses_under_concurrent_writers()
     test_ack_sequence_contract()
+    test_seq_gaps_are_counted_from_the_batch()
     test_duplicate_instant_in_one_batch()
     test_busy_carries_retry_after()
     test_heartbeat_stops_with_the_server()

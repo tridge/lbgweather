@@ -21,6 +21,8 @@ import hashlib
 import hmac
 import json
 import os
+import queue
+import socket
 import sys
 import tempfile
 import threading
@@ -45,6 +47,12 @@ DRAIN_CAP = 8 * 1024 * 1024
 SOCKET_TIMEOUT_S = 20
 # Bounds on the in-memory guard tables.
 HEARTBEAT_S = 60
+# Refusing a connection: how long to spend letting the peer read the 503 and
+# finish its body, how much of that body to discard, and how many refusals may
+# queue before we simply drop the connection.
+SHED_TIMEOUT_S = 5
+SHED_DRAIN_CAP = 1 << 20
+SHED_QUEUE = 256
 MAX_NONCES = 20000
 MAX_FAIL_IPS = 4096
 
@@ -177,19 +185,26 @@ class Stats:
         self.seq_gaps = 0
         self.collector = {}
 
-    def record(self, a, d, r, obs_utc, seq, collector):
+    def record(self, a, d, r, obs_utc, seq, collector, gaps=0):
+        """Fold one request's outcome in.
+
+        `gaps` is counted by the caller from the batch itself. Deriving it here
+        from the previous ack and the new one counted every intervening
+        sequence as lost even when the batch delivered them: last_seq 4 plus a
+        clean batch [5, 6] reported one lost observation, because 6 - 4 - 1 = 1.
+        """
         with self.lock:
             self.accepted += a
             self.duplicates += d
             self.rejected += r
             self.last_post = time.time()
+            self.seq_gaps += gaps
             if obs_utc is not None:
                 if self.last_obs_utc is None or obs_utc > self.last_obs_utc:
                     self.last_obs_utc = obs_utc
             if seq is not None:
-                if self.last_seq is not None and seq > self.last_seq + 1:
-                    self.seq_gaps += seq - self.last_seq - 1
-                self.last_seq = max(seq, self.last_seq or seq)
+                self.last_seq = seq if self.last_seq is None else max(
+                    seq, self.last_seq)
             if collector:
                 self.collector = collector
 
@@ -435,12 +450,19 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message('storage error: %s', e)
             return self.fail(500, 'storage_error')
 
-        ack_seq, newest_utc, seq_problem = ack_from_dispositions(obs, disp)
+        loss = doc.get('data_loss')
+        if loss is not None and not isinstance(loss, dict):
+            return self.fail(400, 'bad_schema',
+                             detail='data_loss must be an object')
+        loss = loss or {}
+        ack_seq, newest_utc, gaps, seq_problem = ack_from_dispositions(
+            obs, disp, last_ack=self.server.last_ack(station),
+            loss_from=loss.get('from'), loss_to=loss.get('to'))
         if seq_problem:
             details.append(seq_problem)
 
         self.server.record(station, accepted, dup, rejected, newest_utc,
-                           ack_seq, collector or {})
+                           ack_seq, collector or {}, gaps=gaps)
 
         self.respond(200, {
             'ok': True,
@@ -456,6 +478,11 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # socketserver defaults this to 5. A burst of connections past that is
+    # refused by the kernel before we ever see it, so the caller gets a
+    # connection reset rather than our 503 -- an outcome the connection cap
+    # exists to avoid. Queue them and let the cap do the shedding.
+    request_queue_size = 128
 
     def __init__(self, addr, cfg, stores):
         super().__init__(addr, Handler)
@@ -480,6 +507,9 @@ class Server(ThreadingHTTPServer):
         self._beat = threading.Thread(target=self._heartbeat, daemon=True)
         self._beat_stop = threading.Event()
         self._beat.start()
+        self.shed_q = queue.Queue(maxsize=SHED_QUEUE)
+        self._shedder = threading.Thread(target=self._shed_worker, daemon=True)
+        self._shedder.start()
 
     def _heartbeat(self):
         while not self._beat_stop.wait(HEARTBEAT_S):
@@ -498,40 +528,61 @@ class Server(ThreadingHTTPServer):
             self._beat.join(timeout=HEARTBEAT_S + 5)
         except RuntimeError:
             pass
+        try:
+            self.shed_q.put_nowait(None)
+            self._shedder.join(timeout=SHED_TIMEOUT_S + 5)
+        except (queue.Full, RuntimeError):
+            pass
         super().server_close()
 
     def retry_degraded(self):
         """Re-test days that failed at startup for a transient reason.
 
         A LockTimeout or a passing OSError during startup reconciliation used
-        to pin health at 503 until someone restarted the service. Corruption
-        stays until it is fixed; anything that now succeeds is cleared.
+        to pin health at 503 until someone restarted the service.
+
+        The result of reconcile_all() is what decides, not store.degraded():
+        degraded() only knows about JSONL parse failures, so foreign-row
+        refusals, OSError and LockTimeout -- which come back in `errors` --
+        were being declared recovered while still failing. And it runs ONCE per
+        station, not once per degraded day: fourteen bad days meant fourteen
+        full fourteen-day scans every heartbeat.
         """
         if not self.degraded:
             return
-        for name in list(self.degraded):
-            store = self.stores.get(name.split('/')[0])
+        stations = {k.split('/')[0] for k in self.degraded}
+        for name in stations:
+            store = self.stores.get(name)
             if store is None:
-                continue
+                continue                  # not a station key; leave it alone
             try:
-                store.reconcile_all()
-            except Exception:
+                _repaired, errors = store.reconcile_all()
+            except Exception as e:
+                self.degraded[name] = str(e)
                 continue
-            if not store.degraded():
-                self.degraded.pop(name, None)
+            still = {'%s/%s' % (name, day): msg for day, msg in errors}
+            still.update({'%s/%s' % (name, day): msg
+                          for day, msg in store.degraded().items()})
+            # Replace this station's entries wholesale: anything absent from
+            # the fresh result really has recovered, anything present is still
+            # broken, and a NEW failure is picked up rather than hidden.
+            for key in [k for k in self.degraded
+                        if k == name or k.startswith(name + '/')]:
+                self.degraded.pop(key, None)
+            self.degraded.update(still)
 
     # ------------------------------------------------------------ capacity
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
+            # Hand the refusal to the shed worker. Writing the 503 and then
+            # closing here would block the accept loop -- exactly when we are
+            # already over capacity -- and closing on a half-sent request body
+            # sends RST, which discards the 503 the client never got to read.
             try:
-                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
-                                b'Retry-After: 5\r\n'
-                                b'Content-Length: 0\r\n'
-                                b'Connection: close\r\n\r\n')
-            except OSError:
-                pass
-            self.shutdown_request(request)
+                self.shed_q.put_nowait(request)
+            except queue.Full:
+                self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
@@ -542,6 +593,41 @@ class Server(ThreadingHTTPServer):
             self.slots.release()
             self.shutdown_request(request)
             raise
+
+    def _shed_worker(self):
+        """Refuse over-capacity connections without stalling the accept loop.
+
+        One thread, not one per refusal: the whole point of the cap is not to
+        create a thread per connection. The sequence matters -- write the
+        response, half-close so the peer sees our bytes followed by EOF, then
+        drain what it was still sending. Closing on an unread body makes the
+        kernel send RST and the client reports a broken pipe rather than the
+        503 we wrote.
+        """
+        while True:
+            request = self.shed_q.get()
+            if request is None:
+                return
+            try:
+                request.settimeout(SHED_TIMEOUT_S)
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Retry-After: 5\r\n'
+                                b'Content-Length: 0\r\n'
+                                b'Connection: close\r\n\r\n')
+                try:
+                    request.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                drained = 0
+                while drained < SHED_DRAIN_CAP:
+                    chunk = request.recv(65536)
+                    if not chunk:
+                        break
+                    drained += len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address):
         try:
@@ -555,12 +641,20 @@ class Server(ThreadingHTTPServer):
     def stats(self):
         return self.stats_by_station[self.primary]
 
+    def last_ack(self, station):
+        st = self.stats_by_station.get(station)
+        if st is None:
+            return None
+        with st.lock:
+            return st.last_seq
+
     def record(self, station, accepted, dup, rejected, newest_utc, seq,
-               collector):
+               collector, gaps=0):
         st = self.stats_by_station.get(station)
         if st is None:
             return
-        st.record(accepted, dup, rejected, newest_utc, seq, collector)
+        st.record(accepted, dup, rejected, newest_utc, seq, collector,
+                  gaps=gaps)
         # Only the primary station owns the public status document.
         if station == self.primary:
             self.write_status()
@@ -652,32 +746,31 @@ class Server(ThreadingHTTPServer):
         return out
 
 
-def ack_from_dispositions(obs, disp):
-    """Highest safely-acknowledgeable seq, and the newest durable instant.
+def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
+                          loss_to=None):
+    """Highest safely-acknowledgeable seq, the newest durable instant, gaps.
 
-    The cursor contract: within one request the collector sends records in
-    increasing sequence order, and we acknowledge the longest leading run that
-    is BOTH durable and correctly ordered. Anything after the first problem is
-    left unacknowledged so the collector resends it.
+    Returns (ack, newest_utc, gaps, problem).
 
-    Strictly increasing rather than exactly +1: the collector may legitimately
-    skip sequences after it drops spool files under disk pressure, and that
-    loss is reported separately as a data_loss marker and counted in seq_gaps.
-    A record with no integer seq stops the acknowledgement rather than being
-    stepped over -- there is nothing to acknowledge it WITH.
+    The cursor contract is exact +1 continuity, within a request and ACROSS
+    requests. Acknowledging seq 7 when 6 was never seen tells a cursor-based
+    collector to discard 6, and it does not matter whether the hole was inside
+    one batch or between two: strictly-increasing was not enough, because the
+    receiver never compared against what it had previously acknowledged.
+
+    A collector that drops spool files under disk pressure must SAY SO, by
+    declaring `data_loss: {from, to}` in the document. That authorises exactly
+    one jump, over exactly that range, and the skipped count is recorded as
+    seq_gaps so the loss is in the record rather than inferred from silence.
 
     Durability is taken per input, never from a set of UTC instants: two inputs
-    can share an instant, and a set cannot say which of them is the record on
-    disk.
+    can share an instant, and a set cannot say which of them is on disk.
     """
-    ack = None
     newest = None
-    problem = None
-
-    # newest_utc covers every durable record, not merely the acknowledged
-    # prefix -- a good observation after a malformed one is still on disk, and
-    # reporting stale freshness because of the malformed one would hide it.
     for o, d in zip(obs, disp):
+        # newest_utc covers every durable record, not merely the acknowledged
+        # prefix -- a good observation after a malformed one is still on disk,
+        # and reporting stale freshness because of the malformed one hides it.
         if d not in DURABLE or not isinstance(o, dict):
             continue
         try:
@@ -687,20 +780,41 @@ def ack_from_dispositions(obs, disp):
         if newest is None or u > newest:
             newest = u
 
+    ack = None
+    gaps = 0
+    problem = None
+    prev = last_ack
+    loss_used = False
+
     for o, d in zip(obs, disp):
         if d not in DURABLE:
-            problem = problem or ('seq stops at a %s record' % d)
+            problem = problem or ('acknowledgement stops at a %s record' % d)
             break
         sq = o.get('seq') if isinstance(o, dict) else None
         if not isinstance(sq, int) or isinstance(sq, bool):
             problem = problem or 'a durable record carries no integer seq'
             break
-        if ack is not None and sq <= ack:
-            problem = problem or ('seq %s does not increase after %s' % (sq, ack))
+
+        if prev is None:
+            pass                       # first sequence we have ever seen
+        elif sq == prev + 1:
+            pass                       # the ordinary case
+        elif (not loss_used and loss_from is not None and loss_to is not None
+              and loss_from == prev + 1 and loss_to == sq - 1
+              and loss_to >= loss_from):
+            # A declared, contiguous, single loss range. Record what it cost.
+            gaps += loss_to - loss_from + 1
+            loss_used = True
+        else:
+            problem = problem or (
+                'seq %s does not follow %s and no data_loss covers the gap'
+                % (sq, prev))
             break
+
+        prev = sq
         ack = sq
 
-    return ack, newest, problem
+    return ack, newest, gaps, problem
 
 
 def parse_station_arg(value):
