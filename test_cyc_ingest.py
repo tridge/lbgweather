@@ -40,7 +40,8 @@ KEY2 = 'bb' * 32
 
 
 class Harness:
-    def __init__(self, second_station=None):
+    def __init__(self, second_station=None, shed_queue=None):
+        self.shed_queue = shed_queue
         # A second, non-primary station: its data must not touch the primary's
         # storage, freshness or status document.
         self.second = second_station
@@ -66,6 +67,8 @@ class Harness:
             stores[self.second] = Store(
                 self.logs2, os.path.join(self.d, 'state2'),
                 station=self.second)
+        if self.shed_queue:
+            cfg['shed_queue'] = self.shed_queue
         self.srv = Server(('127.0.0.1', 0), cfg, stores)
         self.port = self.srv.server_address[1]
         self.t = threading.Thread(target=self.srv.serve_forever, daemon=True)
@@ -923,12 +926,30 @@ def test_cursor_survives_restart_without_laundering():
               'and holds 5, not the newer durable 7 (got %s)'
               % json.load(open(cur))['last_ack'])
 
-        # Restart: the cursor must come from that file. Inferring it from the
-        # newest stored observation would launder the refused 7 into it.
-        last_ack, gaps = h.srv.load_cursor(STATION)
-        check(last_ack == 5,
-              'a restart reloads 5, so seq 6 is still required (got %s)'
-              % last_ack)
+        # An ACTUAL restart, not just a call to load_cursor on the running
+        # server: build a second Server over the same state and check what it
+        # seeds itself with. The previous version of this test never
+        # constructed one, so it could not have caught a bad seeding path.
+        cfg2 = dict(h.srv.cfg)
+        stores2 = {STATION: Store(h.logs, h.state, station=STATION)}
+        srv2 = Server(('127.0.0.1', 0), cfg2, stores2)
+        try:
+            last_ack, gaps = srv2.load_cursor(STATION)
+            srv2.stats_by_station[STATION].last_seq = last_ack
+            check(last_ack == 5,
+                  'the restarted server seeds 5, not the durable 7 (got %s)'
+                  % last_ack)
+            check(srv2.last_ack(STATION) == 5,
+                  'and its live cursor agrees')
+            # Prove the consequence: seq 7 is STILL refused after the restart.
+            ack, _, _, why = cyc_ingest.ack_from_dispositions(
+                [{'obs_ts': '2026-07-31T11:00:03+10:00', 'seq': 7}],
+                ['duplicate'], last_ack=srv2.last_ack(STATION))
+            check(ack is None and why,
+                  'seq 7 is still not acknowledged after the restart (%s)'
+                  % ack)
+        finally:
+            srv2.server_close()
 
 
 def test_malformed_data_loss_stores_nothing():
@@ -959,9 +980,11 @@ def test_malformed_data_loss_stores_nothing():
 def test_shed_queue_saturation_still_closes_cleanly():
     print('\n== a full shed queue degrades to a close, not a hang ==')
     import http.client
-    with Harness() as h:
+    with Harness(shed_queue=1) as h:
+        # The queue size is set BEFORE the worker starts. Swapping srv.shed_q
+        # afterwards left the worker blocked on the original queue, so the
+        # test exercised the bare-close path and never the worker at all.
         h.srv.slots = threading.BoundedSemaphore(1)
-        h.srv.shed_q = __import__('queue').Queue(maxsize=1)
         hog = http.client.HTTPConnection('127.0.0.1', h.port, timeout=10)
         hog.connect()
         time.sleep(0.3)
@@ -1028,6 +1051,112 @@ def test_retry_degraded_distinguishes_transient_from_permanent():
         check(code == 200 and body['ok'] is True, 'and health recovers')
 
 
+
+def test_sequence_conflicts_are_not_laundered():
+    print('\n== a reset or a second collector must not be waved through ==')
+    from cyc_ingest import ack_from_dispositions as A
+    from cyc_store import STORED, DUPLICATE
+    o = lambda sq: {'obs_ts': '2026-07-31T10:00:03+10:00', 'seq': sq}
+
+    # A collector reinstalled with a fresh counter, or a second collector on
+    # the same station. The record is NEW, not a replay -- acknowledging it
+    # would hide the collision behind a cursor that stays at 34.
+    ack, _, _, why = A([o(1)], [STORED], last_ack=34)
+    check(ack is None and 'newly stored' in (why or ''),
+          'a STORED record below the cursor is a conflict, not a replay '
+          '(ack=%s, %r)' % (ack, why))
+
+    # The genuine replay is still fine.
+    check(A([o(5)], [DUPLICATE], last_ack=34)[0] == 5,
+          'a DUPLICATE below the cursor is re-acknowledged')
+    check(A([o(34)], [DUPLICATE], last_ack=34)[0] == 34,
+          'and so is one exactly at the cursor')
+
+    ack, _, _, why = A([o(-3)], [STORED], last_ack=None)
+    check(ack is None and 'negative' in (why or ''),
+          'a negative seq is refused even from a cold cursor')
+
+    # A loss declared against the very first record must still be counted.
+    ack, _, gaps, _ = A([o(7)], [STORED], last_ack=None,
+                        loss_from=1, loss_to=6)
+    check(ack == 7 and gaps == 6,
+          'a loss declared from a cold cursor is counted, not silently '
+          'dropped (ack=%s gaps=%s)' % (ack, gaps))
+
+
+def test_ack_withheld_when_the_cursor_cannot_be_persisted():
+    print('\n== never acknowledge what we could not write down ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        before = json.load(open(os.path.join(h.state, STATION, 'cursor.json')))
+
+        real = h.srv.save_cursor
+        h.srv.save_cursor = lambda *a, **k: False
+        try:
+            code, body = h.post('/ingest/obs',
+                                doc([obs('2026-07-31T10:01:03+10:00', 2)]))
+        finally:
+            h.srv.save_cursor = real
+        check(code == 500 and body.get('error') == 'cursor_write_failed',
+              'the request fails loudly rather than acknowledging (got %s %s)'
+              % (code, body.get('error')))
+        check('ack_seq' not in body, 'and no ack_seq is returned')
+
+        after = json.load(open(os.path.join(h.state, STATION, 'cursor.json')))
+        check(after['last_ack'] == before['last_ack'],
+              'the on-disk cursor did not move (%s -> %s)'
+              % (before['last_ack'], after['last_ack']))
+        check(h.srv.last_ack(STATION) == before['last_ack'],
+              'and neither did the in-memory one, so they still agree')
+
+        # The observation IS durable, so the retry is a duplicate -- and now
+        # that the cursor can be written, it is acknowledged.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:01:03+10:00', 2)]))
+        check(code == 200 and body['ack_seq'] == 2,
+              'the retry succeeds once the cursor can commit (got %s %s)'
+              % (code, body.get('ack_seq')))
+
+
+def test_every_degraded_day_gets_a_turn():
+    print('\n== degraded retries rotate rather than starving the tail ==')
+    with Harness() as h:
+        for i in range(1, 11):
+            h.srv.degraded['%s/2019-01-%02d' % (STATION, i)] = 'seeded'
+        seen = set()
+        for _ in range(4):                      # 4 beats x 4 per beat
+            before = set(h.srv.degraded)
+            h.srv.retry_degraded()
+            seen |= before - set(h.srv.degraded)
+        check(len(seen) == 10,
+              'all ten entries were rechecked within a few beats, not the '
+              'same four for ever (%d cleared)' % len(seen))
+
+
+def test_runtime_corruption_is_retried_not_just_displayed():
+    print('\n== corruption found while serving is rechecked ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        jsonl = os.path.join(h.logs, '2026', '07', '31.jsonl')
+        good = open(jsonl).read()
+        with open(jsonl, 'w') as f:
+            f.write('{"broken": true}\n')
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:05:00+10:00', 2)]))
+
+        check(not h.srv.degraded,
+              'the failure is in the store, not yet in the retry set')
+        h.srv.retry_degraded()
+        check(any('2026-07-31' in k for k in h.srv.degraded),
+              'the heartbeat adopts it so it will be retried (%s)'
+              % h.srv.degraded)
+
+        with open(jsonl, 'w') as f:
+            f.write(good)
+        h.srv.retry_degraded()
+        check(not h.srv.degraded, 'and clears it once repaired (%s)'
+              % h.srv.degraded)
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -1058,6 +1187,10 @@ def main():
     test_malformed_data_loss_stores_nothing()
     test_shed_queue_saturation_still_closes_cleanly()
     test_retry_degraded_distinguishes_transient_from_permanent()
+    test_sequence_conflicts_are_not_laundered()
+    test_ack_withheld_when_the_cursor_cannot_be_persisted()
+    test_every_degraded_day_gets_a_turn()
+    test_runtime_corruption_is_retried_not_just_displayed()
     test_seq_gaps_are_counted_from_the_batch()
     test_duplicate_instant_in_one_batch()
     test_busy_carries_retry_after()

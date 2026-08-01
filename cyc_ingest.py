@@ -32,7 +32,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, TZ, parse_obs_ts, utc_key,  # noqa: E402
-                       StoreError, CorruptionError, LockTimeout, DURABLE)
+                       StoreError, CorruptionError, LockTimeout, DURABLE,
+                       DUPLICATE, _fsync_dir)
 
 SCHEME = 'v1'
 MAX_BODY = 2 * 1024 * 1024
@@ -174,6 +175,10 @@ class Guard:
         with self.lock:
             return sum(len([t for t in v if t > now - AUTH_FAIL_WINDOW_S])
                        for v in self.failures.values())
+
+
+class CursorError(Exception):
+    """The persisted sequence cursor could not be read."""
 
 
 class Stats:
@@ -477,8 +482,16 @@ class Handler(BaseHTTPRequestHandler):
                 loss_from=loss_from, loss_to=loss_to)
             if seq_problem:
                 details.append(seq_problem)
-            self.server.record(station, accepted, dup, rejected, newest_utc,
-                               ack_seq, collector or {}, gaps=gaps)
+            committed = self.server.record(
+                station, accepted, dup, rejected, newest_utc, ack_seq,
+                collector or {}, gaps=gaps)
+        if not committed:
+            # The observations ARE durable; only the cursor is not. Refusing
+            # to acknowledge is the safe half: the collector retries, the
+            # store dedups, and the ACK arrives once the cursor commits.
+            self.log_message('cursor not persisted for %s; withholding ack',
+                             station)
+            return self.fail(500, 'cursor_write_failed', retry_after=30)
 
         self.respond(200, {
             'ok': True,
@@ -527,8 +540,10 @@ class Server(ThreadingHTTPServer):
         self._beat = threading.Thread(target=self._heartbeat, daemon=True)
         self._beat_stop = threading.Event()
         self._beat.start()
-        self.shed_q = queue.Queue(maxsize=SHED_QUEUE)
+        self.shed_q = queue.Queue(maxsize=cfg.get('shed_queue',
+                                                   SHED_QUEUE))
         self._shed_closed = False
+        self._retry_cursor = 0
         self._shedder = threading.Thread(target=self._shed_worker, daemon=True)
         self._shedder.start()
 
@@ -583,9 +598,22 @@ class Server(ThreadingHTTPServer):
         days at ten seconds each would block the heartbeat well past the
         shutdown join.
         """
+        # Corruption found while serving lives in the store, not here. It was
+        # displayed by current_degraded() but never retried, so it could only
+        # ever clear by chance.
+        for name, store in self.stores.items():
+            for day, msg in store.degraded().items():
+                self.degraded.setdefault('%s/%s' % (name, day), msg)
+
         if not self.degraded:
             return
-        for key in sorted(self.degraded)[:RETRY_PER_BEAT]:
+        # Round-robin. Taking the first four every beat retried the same four
+        # permanent failures for ever and starved everything after them.
+        keys = sorted(self.degraded)
+        start = self._retry_cursor % len(keys)
+        window = (keys + keys)[start:start + RETRY_PER_BEAT]
+        self._retry_cursor = (start + RETRY_PER_BEAT) % len(keys)
+        for key in window:
             name, _, day = key.partition('/')
             store = self.stores.get(name)
             if store is None:
@@ -617,12 +645,18 @@ class Server(ThreadingHTTPServer):
     # ------------------------------------------------------------ capacity
 
     def process_request(self, request, client_address):
+        if self._shed_closed:
+            # Shutting down: nothing may join the queue behind the sentinel.
+            self.shutdown_request(request)
+            return
         if not self.slots.acquire(blocking=False):
             # Hand the refusal to the shed worker. Writing the 503 and then
             # closing here would block the accept loop -- exactly when we are
             # already over capacity -- and closing on a half-sent request body
             # sends RST, which discards the 503 the client never got to read.
             try:
+                if self._shed_closed:
+                    raise queue.Full
                 self.shed_q.put_nowait(request)
             except queue.Full:
                 self.shutdown_request(request)
@@ -710,18 +744,38 @@ class Server(ThreadingHTTPServer):
         try:
             with open(self.cursor_path(station)) as f:
                 doc = json.load(f)
-        except (OSError, ValueError):
-            return None, 0
+        except FileNotFoundError:
+            return None, 0                      # genuinely fresh
+        except (OSError, ValueError) as e:
+            # Unreadable is NOT the same as absent. Starting from a cold
+            # cursor would accept any sequence the collector offered next.
+            raise CursorError('%s: %s' % (self.cursor_path(station), e))
+        if not isinstance(doc, dict):
+            raise CursorError('%s: not an object' % self.cursor_path(station))
         last = doc.get('last_ack')
         gaps = doc.get('seq_gaps')
+        if last is not None and not is_int(last):
+            raise CursorError('%s: last_ack is %r'
+                              % (self.cursor_path(station), last))
         return (last if is_int(last) else None, gaps if is_int(gaps) else 0)
 
     def save_cursor(self, station, last_ack, gaps):
+        """Commit the cursor. Returns True only if it is genuinely on disk.
+
+        The caller must not acknowledge anything this fails to persist. A
+        swallowed error here means: we tell the collector seq 6 is safe, it
+        drops its copy, we restart, reload the older cursor, and then refuse
+        seq 7 for ever because nobody has 6 any more.
+        """
         path = self.cursor_path(station)
+        d = os.path.dirname(path)
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
-                                       prefix='.cursor-', suffix='.tmp')
+            os.makedirs(d, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix='.cursor-', suffix='.tmp')
+        except OSError as e:
+            sys.stderr.write('cursor write failed for %s: %s\n' % (station, e))
+            return False
+        try:
             with os.fdopen(fd, 'w') as f:
                 json.dump({'station': station, 'last_ack': last_ack,
                            'seq_gaps': gaps, 'written_at': now_iso()}, f)
@@ -730,8 +784,15 @@ class Server(ThreadingHTTPServer):
                 os.fsync(f.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
+            _fsync_dir(d)          # the rename itself has to survive a crash
+            return True
         except OSError as e:
             sys.stderr.write('cursor write failed for %s: %s\n' % (station, e))
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
 
     def cursor_lock(self, station):
         return self._cursor_locks.setdefault(station, threading.Lock())
@@ -747,16 +808,24 @@ class Server(ThreadingHTTPServer):
                collector, gaps=0):
         st = self.stats_by_station.get(station)
         if st is None:
-            return
+            return False
+        if seq is not None or gaps:
+            # Persist BEFORE advancing in memory, so a failed write leaves the
+            # in-memory cursor and the on-disk cursor agreeing. Advancing
+            # first would leave them divergent until the next restart silently
+            # rewound us.
+            with st.lock:
+                new_last = seq if st.last_seq is None else max(seq,
+                                                               st.last_seq)
+                new_gaps = st.seq_gaps + gaps
+            if not self.save_cursor(station, new_last, new_gaps):
+                return False
         st.record(accepted, dup, rejected, newest_utc, seq, collector,
                   gaps=gaps)
-        if seq is not None or gaps:
-            with st.lock:
-                last, total = st.last_seq, st.seq_gaps
-            self.save_cursor(station, last, total)
         # Only the primary station owns the public status document.
         if station == self.primary:
             self.write_status()
+        return True
 
     def snapshot(self, station=None):
         st = self.stats_by_station[station or self.primary]
@@ -899,6 +968,16 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
     in_batch = None
     loss_used = False
 
+    def take_loss(upto):
+        """Consume a declared loss range ending just before `upto`."""
+        nonlocal gaps, loss_used
+        if (not loss_used and is_int(loss_from) and is_int(loss_to)
+                and loss_to == upto - 1 and loss_to >= loss_from):
+            gaps += loss_to - loss_from + 1
+            loss_used = True
+            return True
+        return False
+
     for o, d in zip(obs, disp):
         if d not in DURABLE:
             problem = problem or ('acknowledgement stops at a %s record' % d)
@@ -907,20 +986,34 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
         if not is_int(sq):
             problem = problem or 'a durable record carries no integer seq'
             break
+        if sq < 0:
+            problem = problem or 'seq %s is negative' % sq
+            break
         if in_batch is not None and sq <= in_batch:
             problem = problem or ('seq %s does not increase after %s within '
                                   'the request' % (sq, in_batch))
             break
 
-        if cursor is None or sq == cursor + 1:
-            cursor = sq                      # first ever, or the ordinary case
+        if cursor is None:
+            # First sequence this station has ever had acknowledged. A loss
+            # declared against that first record still has to be counted;
+            # ignoring it recorded the gap as zero and the loss vanished.
+            take_loss(sq)
+            cursor = sq
+        elif sq == cursor + 1:
+            cursor = sq                                # the ordinary case
         elif sq <= cursor:
-            pass                             # replay of ground already covered
-        elif (not loss_used and is_int(loss_from) and is_int(loss_to)
-              and loss_from == cursor + 1 and loss_to == sq - 1
-              and loss_to >= loss_from):
-            gaps += loss_to - loss_from + 1
-            loss_used = True
+            # Re-acknowledgement is ONLY for a record already on disk. A
+            # newly STORED record below the cursor is not a replay, it is a
+            # sequence conflict -- a collector reinstalled with a reset
+            # counter, or a second collector on the same station. Ack it and
+            # the reset is laundered and the numbering silently collides.
+            if d != DUPLICATE:
+                problem = problem or (
+                    'seq %s is at or below the cursor %s but is newly stored: '
+                    'a reset or a second collector' % (sq, cursor))
+                break
+        elif take_loss(sq):
             cursor = sq
         else:
             problem = problem or (
@@ -1050,7 +1143,14 @@ def main(argv=None):
         # record is not necessarily an acknowledged one, and inferring the
         # cursor from the newest observation would launder a record we
         # explicitly refused to acknowledge.
-        last_ack, gaps = srv.load_cursor(name)
+        try:
+            last_ack, gaps = srv.load_cursor(name)
+        except CursorError as e:
+            raise SystemExit(
+                'cursor for %s is unreadable: %s\n'
+                'Refusing to start: a cold cursor would accept whatever '
+                'sequence the collector offered next. Fix or delete the file '
+                'deliberately.' % (name, e))
         st.last_seq = last_ack
         st.seq_gaps = gaps
         if last_ack is not None:
