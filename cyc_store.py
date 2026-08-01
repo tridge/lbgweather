@@ -421,6 +421,16 @@ class Store:
         files = DayFiles(self.logdir, y, m, d)
         with self._DayLock(self.statedir, files.key, timeout=timeout):
             self._repair_torn_tail(files)
+            recs = self._read_jsonl(files)
+            if not recs and os.path.exists(files.csv):
+                # An empty JSONL beside a CSV with rows is not a healthy empty
+                # day, it is a truncation. Reading it clears the cached
+                # corruption and reconcile() returns early for no records, so
+                # without this check destructive truncation looks like repair.
+                if self._foreign_rows(open(files.csv, 'rb').read(), b''):
+                    raise CorruptionError(
+                        '%s has rows but %s is empty: the JSONL was truncated'
+                        % (files.csv, files.jsonl))
             return self.reconcile(files)
 
     def reconcile_all(self, max_days=14):

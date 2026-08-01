@@ -168,6 +168,14 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
         problems.append('%d authentication failures in the last hour '
                         '- a key mismatch, or someone probing' % auth)
 
+    if status.get('csv_write_failed'):
+        # The feed is fine and we are dropping it on the floor. That is an
+        # alarm, not a warning: every sample in this window is gone.
+        severity = 'alarm'
+        problems.append('the logger could not take the day lock, so samples '
+                        'are being DROPPED - the feed is healthy but nothing '
+                        'is being recorded')
+
     backlog = (status.get('collector') or {}).get('spool_backlog')
     if isinstance(backlog, int) and backlog > BACKLOG_WARN:
         severity = 'alarm' if severity == 'alarm' else 'warn'

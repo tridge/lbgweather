@@ -146,7 +146,7 @@ def log_data(data):
         return False
     return True
 
-def write_status(weather_json):
+def write_status(weather_json, logged=True):
     """Record the feed's OWN timestamp so staleness is detectable.
 
     The CSV deliberately keeps its datetime.now() timestamp - changing it would
@@ -180,6 +180,11 @@ def write_status(weather_json):
         # means the station stopped reporting, independent of our own clock.
         'feed_lag_s': (int(generated - obs_ts)
                        if isinstance(generated, (int, float)) else None),
+        # The feed can be perfectly healthy while we are failing to record it.
+        # Without this the watchdog sees a fresh observation age and stays
+        # green while every sample is dropped -- the same silent failure, one
+        # step further down the pipe.
+        'csv_write_failed': not logged,
     }
     tmp = STATUS_FILE + '.tmp'
     try:
@@ -195,12 +200,17 @@ def write_status(weather_json):
 def main():
     weather = fetch_weather()
     data = extract_wind_data(weather)
-    log_data(data)
-    write_status(weather)
+    logged = log_data(data)
+    # Status is written either way -- the feed's age is still true and useful.
+    # But it carries the failure, and we exit non-zero, so a dropped sample is
+    # visible to the watchdog and to cron rather than only in wind.log.
+    write_status(weather, logged=logged)
     print(f"{data['timestamp']}: {data['wind_kt']} kt, "
           f"avg {data['wind_avg_kt']} kt, "
           f"gust {data['wind_gust_kt']} kt, "
-          f"dir {data['wind_dir']}°")
+          f"dir {data['wind_dir']}°"
+          + ("" if logged else "  [NOT LOGGED - lock unavailable]"))
+    return 0 if logged else 1
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

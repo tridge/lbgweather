@@ -231,6 +231,25 @@ def test_marker_absent_means_never_deployed():
               'and we do not arm ourselves without ever seeing a status')
 
 
+
+def test_dropped_samples_alarm():
+    print('\n== a healthy feed we are failing to record is an alarm ==')
+    with Watch() as w:
+        w.set_age(60, csv_write_failed=True)
+        out = w.run()
+        check(w.mailed(out),
+              'a dropped sample alarms even though the observation is fresh')
+        check('DROPPED' in out or 'DROPPED' in w.health().get(
+            'problems', [''])[0],
+            'and says what is actually wrong (%s)' % w.health().get('problems'))
+        check(w.health().get('severity') == 'alarm', 'severity is alarm')
+
+        w.set_age(60, csv_write_failed=False)
+        out = w.run()
+        check(w.health().get('severity') == 'ok',
+              'and clears once logging resumes')
+
+
 def main():
     for fn in [test_episode_lifecycle, test_episode_survives_a_dip_to_warn,
                test_undelivered_alarm_is_not_discarded,
@@ -239,7 +258,8 @@ def main():
                test_auth_failure_key_matches_the_receiver,
                test_status_document_is_never_modified,
                test_losing_the_state_file_does_not_disarm,
-               test_marker_absent_means_never_deployed]:
+               test_marker_absent_means_never_deployed,
+               test_dropped_samples_alarm]:
         fn()
     print()
     if FAILURES:

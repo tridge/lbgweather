@@ -842,6 +842,65 @@ def test_wind_logger_shares_the_day_lock():
         check(True, 'and proceeds once the writer releases it')
 
 
+
+def test_truncated_jsonl_does_not_read_as_repaired():
+    print('\n== truncating the JSONL is not a repair ==')
+    with Tmp() as t:
+        s = t.store()
+        s.put([obs('2026-07-31T10:00:03+10:00'),
+               obs('2026-07-31T10:01:03+10:00')])
+        f = DayFiles(t.logs, 2026, 7, 31)
+
+        # Corrupt it, then "fix" it by emptying it -- which is what a panicked
+        # hand-repair looks like. _read_jsonl clears its cached corruption for
+        # an empty file and reconcile() returns early with no records, so this
+        # used to read as a healthy empty day and clear health, with the CSV
+        # still holding two rows nothing accounted for.
+        with open(f.jsonl, 'w') as fh:
+            fh.write('')
+        raised = ''
+        try:
+            s.recheck_day('2026-07-31')
+        except CorruptionError as e:
+            raised = str(e)
+        check('truncated' in raised,
+              'an empty JSONL beside a populated CSV is reported, not '
+              'declared healthy (%r)' % raised[:80])
+        check(len(open(f.csv).read().strip().splitlines()) == 3,
+              'and the CSV rows are still there')
+
+
+def test_wind_logger_reports_a_dropped_sample():
+    print('\n== a dropped sample is visible, not just absent ==')
+    import subprocess
+    with Tmp() as t:
+        wl_dir = None
+        for cand in (HERE, os.path.expanduser('~/wind')):
+            if os.path.exists(os.path.join(cand, 'wind_logger.py')):
+                wl_dir = cand
+                break
+        check(wl_dir is not None, 'wind_logger.py found')
+        if wl_dir is None:
+            return
+        src = ('import os, sys; sys.path.insert(0, %r); '
+               'os.environ["CYC_LOCK_DIR"] = "/proc/cannot-create-this"; '
+               'import wind_logger as wl; '
+               'wl.LOG_BASE_DIR = %r; '
+               'print("RESULT", wl.log_data({"timestamp": "2026-07-31 10:00:00",'
+               ' "wind_kt": 1.0, "wind_avg_kt": 1.0, "wind_dir": 90,'
+               ' "wind_gust_kt": 2.0, "temp_c": 10.0, "humidity": 50}))'
+               % (wl_dir, t.logs))
+        r = subprocess.run([sys.executable, '-c', src], capture_output=True,
+                           text=True, timeout=60)
+        check('RESULT False' in r.stdout,
+              'log_data reports failure rather than returning silently (%r)'
+              % r.stdout.strip()[:60])
+        check('NOT logging' in r.stderr, 'and says why on stderr')
+        import glob
+        check(not glob.glob(os.path.join(t.logs, '*', '*', '*.csv')),
+              'and wrote NOTHING unlocked')
+
+
 def main():
     for fn in [test_format_contract, test_replay_and_first_write_wins,
                test_out_of_order, test_dst_fold, test_spring_forward,
@@ -860,6 +919,8 @@ def main():
                test_empty_jsonl_beside_a_legacy_csv,
                test_dispositions_are_per_input,
                test_wind_logger_shares_the_day_lock,
+               test_truncated_jsonl_does_not_read_as_repaired,
+               test_wind_logger_reports_a_dropped_sample,
                test_adoption_is_atomic,
                test_adoption_rejects_damaged_input,
                test_adoption_rejects_impossible_local_times,
