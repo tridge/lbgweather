@@ -169,17 +169,28 @@ def note_failure(logged):
     try:
         with open(FAIL_FILE) as f:
             doc = json.load(f)
+        if not isinstance(doc, dict):
+            raise TypeError('latch is not an object')
         count = int(doc.get('count', 0))
         last = float(doc.get('last_epoch', 0))
     except FileNotFoundError:
         count, last = 0, 0
-    except (OSError, ValueError, TypeError):
-        # We cannot tell whether a failure is outstanding. Do not publish a
-        # clean zero on that basis.
+    except (OSError, ValueError, TypeError, AttributeError):
+        # Unreadable, or valid JSON that is not an object. We cannot tell
+        # whether a failure is outstanding.
         readable, count, last = False, 0, 0
 
+    if not readable:
+        # Do NOT write. Writing zeros here would overwrite the very record we
+        # could not read, turn unknown into a confident clean state, and clear
+        # csv_latch_unavailable so nothing alarms. Leave it alone and let the
+        # status document say we cannot tell.
+        if not logged:
+            count, last = 1, now
+        return count, last, False
+
     if logged:
-        if readable and (not count or now - last > FAIL_WINDOW_S):
+        if not count or now - last > FAIL_WINDOW_S:
             count, last = 0, 0
     else:
         count += 1
