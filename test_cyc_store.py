@@ -902,7 +902,11 @@ def test_wind_logger_reports_a_dropped_sample():
 
         # main() is what cron runs, and it is main() that has to exit non-zero
         # and publish the failure. Testing log_data alone proved neither.
-        fail_dir = os.path.join(t.d, 'lockfail')
+        # The latch file is INDEPENDENT of the lock directory on purpose:
+        # the failure it reports is that the lock directory is unusable. This
+        # test previously pointed it at a writable temp dir, which is what
+        # hid the fact that production had it inside the failing directory.
+        fail_dir = os.path.join(t.d, 'latch')
         os.makedirs(fail_dir, exist_ok=True)
         status = os.path.join(t.d, 'status.json')
         main_src = (
@@ -930,6 +934,20 @@ def test_wind_logger_reports_a_dropped_sample():
               'and latches a count so a 2-minute watchdog cannot miss a '
               '1-minute failure (%s)' % doc.get('csv_failures_recent'))
         check(doc.get('csv_last_failure_epoch'), 'with a timestamp')
+        check(doc.get('csv_latch_unavailable') is False,
+              'and the latch itself was writable, so the count is trustworthy')
+
+        # Now the case that matters: the latch is ALSO unwritable. We must not
+        # publish a clean-looking zero we cannot stand behind.
+        main_src2 = main_src.replace(
+            repr(os.path.join(fail_dir, 'f.json')),
+            repr('/proc/cannot-write-here/f.json'))
+        r = subprocess.run([sys.executable, '-c', main_src2],
+                           capture_output=True, text=True, timeout=60)
+        doc = json.load(open(status))
+        check(doc.get('csv_latch_unavailable') is True,
+              'an unpersistable latch is declared, not silently zeroed (%s)'
+              % doc.get('csv_latch_unavailable'))
 
 
 def main():

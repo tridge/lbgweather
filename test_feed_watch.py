@@ -267,6 +267,15 @@ def test_dropped_samples_alarm():
         check(w.health().get('severity') == 'ok',
               'a clean status is ok')
 
+        # And not being able to tell is itself a fault: this is the state a
+        # broken lock/state directory produces, and treating it as healthy is
+        # how the latch would have been silently useless.
+        w.set_age(60, csv_write_failed=False, csv_latch_unavailable=True)
+        out = w.run()
+        check(w.health().get('severity') == 'alarm',
+              'an unavailable latch alarms rather than reading as clean (%s)'
+              % w.health().get('severity'))
+
 
 def main():
     for fn in [test_episode_lifecycle, test_episode_survives_a_dip_to_warn,

@@ -180,6 +180,13 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
                         'logger could not take the day lock. The feed is '
                         'healthy and nothing is being recorded'
                         % (recent_fails, CSV_FAIL_WINDOW_S // 60))
+    elif status.get('csv_latch_unavailable'):
+        # We cannot see whether samples are being dropped. Unknown is a fault,
+        # not a pass: this is the state a broken lock directory produces.
+        severity = 'alarm'
+        problems.append('the logger cannot write its failure latch, so '
+                        'dropped samples would be invisible - check the '
+                        'lock and state directories')
     elif status.get('csv_write_failed'):
         # The feed is fine and we are dropping it on the floor. That is an
         # alarm, not a warning: every sample in this window is gone.

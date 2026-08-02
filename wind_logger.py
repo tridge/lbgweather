@@ -25,7 +25,14 @@ LOCK_TIMEOUT_S = 10
 FAIL_WINDOW_S = 900
 # Latched failure record. A transient boolean cleared by the next good minute
 # can fall entirely between two watchdog runs.
-FAIL_FILE = os.path.join(LOCK_DIR, "logger_failures.json")
+#
+# Deliberately NOT under LOCK_DIR. The failure this latch exists to report is
+# "the lock directory is unusable" -- putting the record inside it meant the
+# failing minute could not write the latch and the next good minute published
+# a clean zero, which is the silence the latch was added to prevent.
+FAIL_FILE = os.environ.get(
+    'CYC_LOGGER_FAIL_FILE',
+    os.path.expanduser("~/var/cyc_logger/logger_failures.json"))
 
 # Conversion factors
 MPH_TO_KNOTS = 0.868976
@@ -158,28 +165,46 @@ def note_failure(logged):
     by the very next successful minute.
     """
     now = time.time()
+    readable = True
     try:
         with open(FAIL_FILE) as f:
             doc = json.load(f)
         count = int(doc.get('count', 0))
         last = float(doc.get('last_epoch', 0))
-    except (OSError, ValueError, TypeError):
+    except FileNotFoundError:
         count, last = 0, 0
+    except (OSError, ValueError, TypeError):
+        # We cannot tell whether a failure is outstanding. Do not publish a
+        # clean zero on that basis.
+        readable, count, last = False, 0, 0
+
     if logged:
-        if not count or now - last > FAIL_WINDOW_S:
+        if readable and (not count or now - last > FAIL_WINDOW_S):
             count, last = 0, 0
     else:
         count += 1
         last = now
+
+    persisted = False
     try:
-        os.makedirs(os.path.dirname(FAIL_FILE), exist_ok=True)
+        d = os.path.dirname(FAIL_FILE)
+        os.makedirs(d, exist_ok=True)
         tmp = FAIL_FILE + '.tmp'
         with open(tmp, 'w') as f:
             json.dump({'count': count, 'last_epoch': last}, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, FAIL_FILE)
-    except OSError:
-        pass                # best effort; status still carries it
-    return count, last
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        persisted = True
+    except OSError as e:
+        print('wind_logger: could not persist the failure latch: %s' % e,
+              file=sys.stderr)
+    return count, last, persisted
 
 
 def write_status(weather_json, logged=True):
@@ -202,7 +227,7 @@ def write_status(weather_json, logged=True):
         return
     generated = weather_json.get('generated_at')
     now = time.time()
-    fail_count, fail_last = note_failure(logged)
+    fail_count, fail_last, fail_persisted = note_failure(logged)
 
     doc = {
         'station': 'cyc1',
@@ -226,6 +251,9 @@ def write_status(weather_json, logged=True):
         # watchdog that only runs every two.
         'csv_failures_recent': fail_count,
         'csv_last_failure_epoch': int(fail_last) or None,
+        # If we could not write the latch we cannot promise the count is
+        # complete. Say so rather than let a clean-looking zero stand.
+        'csv_latch_unavailable': not fail_persisted,
     }
     tmp = STATUS_FILE + '.tmp'
     try:
