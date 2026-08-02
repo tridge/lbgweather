@@ -450,6 +450,18 @@ class Handler(BaseHTTPRequestHandler):
         obs = doc.get('obs')
         if not isinstance(obs, list):
             return self.fail(400, 'bad_schema')
+
+        # Every observation must carry a sequence. Without one it is stored
+        # but unacknowledgeable, and a later request naming the same instant
+        # WITH a sequence then classifies as a duplicate and advances the
+        # cursor -- a record admitted with no sequence at all being used to
+        # move the cursor forward.
+        for o in obs:
+            if isinstance(o, dict) and not is_int(o.get('seq')):
+                return self.fail(400, 'bad_schema',
+                                 detail='every observation needs an integer '
+                                        'seq; %r has %r'
+                                        % (o.get('obs_ts'), o.get('seq')))
         if len(obs) > MAX_OBS:
             return self.fail(413, 'too_large')
 

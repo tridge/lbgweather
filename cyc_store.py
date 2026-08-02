@@ -54,6 +54,8 @@ MAX_FUTURE_S = 300
 
 # Bounded wait for a day lock, so contention degrades rather than deadlocks.
 LOCK_TIMEOUT_S = 10
+# A single request may not lock an unbounded number of days at once.
+MAX_DAYS_PER_REQUEST = 32
 
 
 # Per-input outcomes returned by put(). Strings so they survive JSON and read
@@ -318,13 +320,25 @@ class Store:
         return out
 
     def _load_index(self, files):
+        """UTC instant -> the seq it was stored under (or None).
+
+        A set of instants was not enough. The instant is the dedup key, but it
+        is NOT the whole identity: a record already on disk under seq 7 must
+        not be re-acknowledged as seq 6 just because the instant matches, or a
+        caller can walk the cursor forward one number at a time using a single
+        stored observation.
+        """
         sig = self._sig(files.jsonl)
         cached = self._index.get(files.key)
         if cached is not None and cached[1] == sig:
             return cached[0]
-        keys = {int(r['utc']) for r in self._read_jsonl(files)}
-        self._index[files.key] = (keys, sig)
-        return keys
+        idx = {}
+        for r in self._read_jsonl(files):
+            sq = r.get('seq')
+            idx[int(r['utc'])] = (sq if isinstance(sq, int)
+                                  and not isinstance(sq, bool) else None)
+        self._index[files.key] = (idx, sig)
+        return idx
 
     # ------------------------------------------------------------ projection
 
@@ -799,12 +813,30 @@ class Store:
         # request advances the cursor, and the loser's conflict is already on
         # disk by the time it is refused -- after which its retry is an
         # ordinary duplicate and walks straight through.
+        if len(by_day) > MAX_DAYS_PER_REQUEST:
+            raise StoreError(
+                'this request spans %d days; the limit is %d. Split the '
+                'backfill: holding that many day locks at once starves the '
+                'live feed and the legacy logger.'
+                % (len(by_day), MAX_DAYS_PER_REQUEST))
+
         with contextlib.ExitStack() as stack:
             days = []
+            # ONE budget for the whole acquisition, not LOCK_TIMEOUT_S per
+            # day. Per-day timeouts multiply: a many-day request could sit for
+            # minutes holding every lock it had already taken, which starves
+            # the live feed and makes wind_logger drop real samples.
+            deadline = time.monotonic() + LOCK_TIMEOUT_S
             for (y, m, d), pairs in sorted(by_day.items()):
                 files = DayFiles(self.logdir, y, m, d)
                 files.ensure_dir()
-                stack.enter_context(self._DayLock(self.statedir, files.key))
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise LockTimeout(
+                        'gave up acquiring day locks after %ds (%d days)'
+                        % (LOCK_TIMEOUT_S, len(by_day)))
+                stack.enter_context(
+                    self._DayLock(self.statedir, files.key, timeout=left))
                 days.append((files, pairs, (y, m, d)))
 
             # Phase 1: classify everything, write nothing.
@@ -816,13 +848,27 @@ class Store:
                 seen = self._load_index(files)
                 fresh, fresh_keys, outcomes = [], set(), {}
                 for i, rec in pairs:
-                    known = rec['utc'] in seen or rec['utc'] in fresh_keys
-                    if known:
+                    sq = rec.get('seq')
+                    if not isinstance(sq, int) or isinstance(sq, bool):
+                        sq = None
+                    if rec['utc'] in fresh_keys:
                         outcomes[i] = DUPLICATE
                         continue
-                    sq = rec.get('seq')
-                    if (cursor is not None and isinstance(sq, int)
-                            and not isinstance(sq, bool) and sq <= cursor):
+                    if rec['utc'] in seen:
+                        held = seen[rec['utc']]
+                        if held is not None and sq is not None and held != sq:
+                            # Same instant, different sequence. Acknowledging
+                            # it would let one stored observation be walked
+                            # forward through the cursor a number at a time.
+                            outcomes[i] = CONFLICT
+                            conflicts.append(
+                                '%s is already held under seq %s, not seq %s'
+                                % (rec.get('obs_ts'), held, sq))
+                            continue
+                        outcomes[i] = DUPLICATE
+                        continue
+                    if (cursor is not None and sq is not None
+                            and sq <= cursor):
                         # New data wearing a sequence number we have already
                         # acknowledged: a collector reinstalled with a reset
                         # counter, or a second collector on this station.
@@ -844,7 +890,10 @@ class Store:
                 for _files, _fresh, outcomes in plans:
                     for i, outcome in outcomes.items():
                         disp[i] = outcome
-                details.extend(conflicts[:5])
+                # Conflicts first: the caller reports details[0], and an
+                # unrelated schema rejection earlier in the batch would
+                # otherwise explain the 409 with the wrong reason.
+                details[:0] = conflicts[:5]
                 return 0, 0, rejected, details, disp
 
             # Phase 2: commit.

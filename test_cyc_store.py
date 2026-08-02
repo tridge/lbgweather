@@ -16,7 +16,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, DayFiles, StoreError, CorruptionError,  # noqa: E402
-                       LockTimeout, parse_obs_ts, utc_key, CSV_FIELDS)
+                       LockTimeout, parse_obs_ts, utc_key, CSV_FIELDS,
+                       LOCK_TIMEOUT_S)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAILURES = []
@@ -949,6 +950,65 @@ def test_wind_logger_reports_a_dropped_sample():
               'an unpersistable latch is declared, not silently zeroed (%s)'
               % doc.get('csv_latch_unavailable'))
 
+        # A CORRUPT but writable latch must not be overwritten with zeros:
+        # that would turn "cannot tell" into a confident clean state and stop
+        # anything alarming.
+        latch = os.path.join(fail_dir, 'f.json')
+        with open(latch, 'w') as fh:
+            fh.write('[]')                      # valid JSON, not an object
+        r = subprocess.run([sys.executable, '-c', main_src],
+                           capture_output=True, text=True, timeout=60)
+        check(open(latch).read() == '[]',
+              'the unreadable latch is left alone, not clobbered (%r)'
+              % open(latch).read()[:40])
+        doc = json.load(open(status))
+        check(doc.get('csv_latch_unavailable') is True,
+              'and the status says we cannot tell (%s)'
+              % doc.get('csv_latch_unavailable'))
+
+
+
+def test_lock_budget_is_bounded_across_days():
+    print('\n== a many-day request cannot hold locks for ever ==')
+    with Tmp() as t:
+        s = t.store()
+        # More days than a single request may lock at once.
+        many = [obs('2026-0%d-1%dT10:00:00+10:00' % (1 + (i // 9), i % 9),
+                    i + 1)
+                for i in range(40)]
+        raised = ''
+        try:
+            s.put(many)
+        except StoreError as e:
+            raised = str(e)
+        check('the limit is' in raised,
+              'a request spanning too many days is refused with an actionable '
+              'message (%r)' % raised[:70])
+
+        # And the acquisition budget is ONE deadline, not per day: with a day
+        # already locked, the whole call gives up in about LOCK_TIMEOUT_S, not
+        # LOCK_TIMEOUT_S x days.
+        f = DayFiles(t.logs, 2026, 7, 31)
+        f.ensure_dir()
+        held = s._DayLock(t.state, f.key)
+        held.__enter__()
+        try:
+            batch = [obs('2026-07-30T10:00:00+10:00', 1),
+                     obs('2026-07-31T10:00:00+10:00', 2),
+                     obs('2026-08-01T10:00:00+10:00', 3)]
+            t0 = time.time()
+            try:
+                t.store().put(batch)
+                took, timed_out = time.time() - t0, False
+            except LockTimeout:
+                took, timed_out = time.time() - t0, True
+            check(timed_out, 'the contended request gives up')
+            check(took < LOCK_TIMEOUT_S * 2,
+                  'within one budget rather than one per day (%.1fs for 3 '
+                  'days, budget %ds)' % (took, LOCK_TIMEOUT_S))
+        finally:
+            held.__exit__(None, None, None)
+
 
 def main():
     for fn in [test_format_contract, test_replay_and_first_write_wins,
@@ -970,6 +1030,7 @@ def main():
                test_wind_logger_shares_the_day_lock,
                test_truncated_jsonl_does_not_read_as_repaired,
                test_wind_logger_reports_a_dropped_sample,
+               test_lock_budget_is_bounded_across_days,
                test_adoption_is_atomic,
                test_adoption_rejects_damaged_input,
                test_adoption_rejects_impossible_local_times,
