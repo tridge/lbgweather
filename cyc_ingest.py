@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, TZ, parse_obs_ts, utc_key,  # noqa: E402
                        StoreError, CorruptionError, LockTimeout, DURABLE,
-                       DUPLICATE, _fsync_dir)
+                       DUPLICATE, CONFLICT, _fsync_dir)
 
 SCHEME = 'v1'
 MAX_BODY = 2 * 1024 * 1024
@@ -459,51 +459,49 @@ class Handler(BaseHTTPRequestHandler):
             # rather than fall back to somebody else's tree.
             return self.fail(403, 'station_not_configured')
 
-        # A sequence conflict must be caught BEFORE anything is written. A
-        # collector reinstalled with a reset counter sends new data wearing an
-        # old number; if we store it and decide afterwards, its retry comes
-        # back as an ordinary duplicate and walks straight through the replay
-        # branch. Refusing the first delivery is not enough -- there must be
-        # nothing on disk for the second one to match.
-        cursor_now = self.server.last_ack(station)
-        if cursor_now is not None:
-            known = store.knows(obs)
-            for o, already in zip(obs, known):
-                sq = o.get('seq') if isinstance(o, dict) else None
-                if is_int(sq) and sq <= cursor_now and not already:
-                    return self.fail(
-                        409, 'seq_conflict',
-                        detail='seq %s is at or below the acknowledged cursor '
-                               '%s but is not a record we hold: a collector '
-                               'reset or a second collector on this station'
-                               % (sq, cursor_now))
-
-        try:
-            accepted, dup, rejected, details, disp = store.put(obs)
-        except LockTimeout as e:
-            self.log_message('day lock busy: %s', e)
-            return self.fail(503, 'busy', retry_after=5)
-        except CorruptionError as e:
-            self.log_message('CORRUPTION: %s', e)
-            return self.fail(500, 'storage_corrupt')
-        except StoreError as e:
-            return self.fail(400, 'bad_schema', detail=str(e))
-        except OSError as e:
-            self.log_message('storage error: %s', e)
-            return self.fail(500, 'storage_error')
-
-        # One transaction: read the cursor, decide, write it back. Split, two
-        # concurrent requests would both measure contiguity against the same
-        # cursor and both advance past it.
+        # ONE transaction per station: read the cursor, store, decide, commit
+        # the cursor. Splitting these let two concurrent requests both measure
+        # against the same cursor, both store, and the loser's conflict end up
+        # on disk -- after which its retry was an ordinary duplicate and was
+        # acknowledged. There is one collector per station, so serialising a
+        # station's writes costs nothing real.
         with self.server.cursor_lock(station):
+            cursor_now = self.server.last_ack(station)
+            try:
+                accepted, dup, rejected, details, disp = store.put(
+                    obs, cursor=cursor_now)
+            except LockTimeout as e:
+                # Busy is NOT a conflict. Conflating them turned transient
+                # contention into a 409 that reads as a permanent protocol
+                # violation and stalled a healthy collector.
+                self.log_message('day lock busy: %s', e)
+                return self.fail(503, 'busy', retry_after=5)
+            except CorruptionError as e:
+                self.log_message('CORRUPTION: %s', e)
+                return self.fail(500, 'storage_corrupt')
+            except StoreError as e:
+                return self.fail(400, 'bad_schema', detail=str(e))
+            except OSError as e:
+                self.log_message('storage error: %s', e)
+                return self.fail(500, 'storage_error')
+
+            if CONFLICT in disp:
+                # Nothing was stored, so a retry cannot become a duplicate.
+                return self.fail(
+                    409, 'seq_conflict',
+                    detail=(details[0] if details else
+                            'a sequence at or below the acknowledged cursor '
+                            'is not a record we hold'))
+
             ack_seq, newest_utc, gaps, seq_problem = ack_from_dispositions(
-                obs, disp, last_ack=self.server.last_ack(station),
+                obs, disp, last_ack=cursor_now,
                 loss_from=loss_from, loss_to=loss_to)
             if seq_problem:
                 details.append(seq_problem)
             committed = self.server.record(
                 station, accepted, dup, rejected, newest_utc, ack_seq,
                 collector or {}, gaps=gaps)
+
         if not committed:
             # The observations ARE durable; only the cursor is not. Refusing
             # to acknowledge is the safe half: the collector retries, the

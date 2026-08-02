@@ -26,6 +26,7 @@ readings), so a string key would delete an hour of history every April.
 """
 
 import collections
+import contextlib
 import csv
 import fcntl
 import io
@@ -60,6 +61,7 @@ LOCK_TIMEOUT_S = 10
 STORED = 'stored'
 DUPLICATE = 'duplicate'
 REJECTED = 'rejected'
+CONFLICT = 'conflict'
 DURABLE = (STORED, DUPLICATE)
 
 
@@ -724,46 +726,19 @@ class Store:
             pass
         self._index.pop(files.key, None)   # force reload with the new signature
 
-    def knows(self, observations):
-        """Per input: is this observation's instant ALREADY on disk?
-
-        Read-only. The receiver needs this before storing anything, to tell a
-        genuine replay of acknowledged history from a sequence conflict. Both
-        arrive as a low sequence number; the difference is that the replay is
-        already stored and the conflict is new data wearing an old number.
-
-        Deciding that after the write is too late: the conflict is stored, and
-        its retry then looks exactly like a duplicate.
-        """
-        out = [False] * len(observations)
-        by_day = {}
-        for i, obs in enumerate(observations):
-            if not isinstance(obs, dict):
-                continue
-            try:
-                dt = parse_obs_ts(obs.get('obs_ts'))
-            except StoreError:
-                continue
-            y, m, d = local_date(dt)
-            by_day.setdefault((y, m, d), []).append((i, utc_key(dt)))
-
-        for (y, m, d), pairs in by_day.items():
-            files = DayFiles(self.logdir, y, m, d)
-            try:
-                with self._DayLock(self.statedir, files.key, timeout=2):
-                    seen = self._load_index(files)
-            except (LockTimeout, OSError, CorruptionError):
-                continue          # unknown; the caller treats that as not-known
-            for i, key in pairs:
-                out[i] = key in seen
-        return out
-
-    def put(self, observations):
+    def put(self, observations, cursor=None):
         """Store observations. Returns (accepted, duplicates, rejected, details,
         dispositions).
 
+        `cursor` is the highest sequence the caller has acknowledged. A record
+        whose seq is at or below it, and whose instant we do NOT already hold,
+        is a CONFLICT: new data wearing a number we have already promised was
+        safe. Any conflict refuses the WHOLE request and writes nothing --
+        detecting it after the write is useless, because the retry then looks
+        like an ordinary duplicate.
+
         `dispositions` has one entry per INPUT observation, in input order,
-        each STORED, DUPLICATE or REJECTED. A UTC key set is not good enough:
+        each STORED, DUPLICATE, CONFLICT or REJECTED. A UTC key set is not good enough:
         two inputs can share an instant, and then a rejected one is
         indistinguishable from the durable one that happens to occupy its
         slot -- which let a caller acknowledge a record that was never stored.
@@ -814,11 +789,67 @@ class Store:
         accepted = 0
         duplicates = 0
 
-        for (y, m, d), pairs in sorted(by_day.items()):
-            files = DayFiles(self.logdir, y, m, d)
-            files.ensure_dir()
-            with self._DayLock(self.statedir, files.key):
-                a, dup, outcomes = self._put_day(files, pairs, (y, m, d))
+        # Every day this request touches is locked for the WHOLE operation,
+        # acquired in sorted order so two requests can never deadlock. One
+        # pass, not two: the old arrangement locked every day to look, then
+        # locked them all again to write, which both doubled the work and
+        # created the window between looking and writing. The
+        # conflict decision and the write have to be one transaction: checking
+        # first and writing afterwards leaves a window in which a concurrent
+        # request advances the cursor, and the loser's conflict is already on
+        # disk by the time it is refused -- after which its retry is an
+        # ordinary duplicate and walks straight through.
+        with contextlib.ExitStack() as stack:
+            days = []
+            for (y, m, d), pairs in sorted(by_day.items()):
+                files = DayFiles(self.logdir, y, m, d)
+                files.ensure_dir()
+                stack.enter_context(self._DayLock(self.statedir, files.key))
+                days.append((files, pairs, (y, m, d)))
+
+            # Phase 1: classify everything, write nothing.
+            plans = []
+            conflicts = []
+            for files, pairs, daydate in days:
+                self._repair_torn_tail(files)
+                self.adopt_legacy_csv(files, *daydate)
+                seen = self._load_index(files)
+                fresh, fresh_keys, outcomes = [], set(), {}
+                for i, rec in pairs:
+                    known = rec['utc'] in seen or rec['utc'] in fresh_keys
+                    if known:
+                        outcomes[i] = DUPLICATE
+                        continue
+                    sq = rec.get('seq')
+                    if (cursor is not None and isinstance(sq, int)
+                            and not isinstance(sq, bool) and sq <= cursor):
+                        # New data wearing a sequence number we have already
+                        # acknowledged: a collector reinstalled with a reset
+                        # counter, or a second collector on this station.
+                        outcomes[i] = CONFLICT
+                        conflicts.append(
+                            'seq %s is at or below the acknowledged cursor %s '
+                            'but %s is not a record we hold'
+                            % (sq, cursor, rec.get('obs_ts')))
+                        continue
+                    fresh_keys.add(rec['utc'])
+                    outcomes[i] = STORED
+                    fresh.append(rec)
+                plans.append((files, fresh, outcomes))
+
+            if conflicts:
+                # Nothing is written. There must be nothing on disk for a
+                # retry of the conflicting record to match, or the retry
+                # becomes a duplicate and is acknowledged.
+                for _files, _fresh, outcomes in plans:
+                    for i, outcome in outcomes.items():
+                        disp[i] = outcome
+                details.extend(conflicts[:5])
+                return 0, 0, rejected, details, disp
+
+            # Phase 2: commit.
+            for files, fresh, outcomes in plans:
+                a, dup = self._write_day(files, fresh, outcomes)
                 accepted += a
                 duplicates += dup
                 for i, outcome in outcomes.items():
@@ -826,35 +857,15 @@ class Store:
 
         return accepted, duplicates, rejected, details, disp
 
-    def _put_day(self, files, pairs, daydate):
-        self._repair_torn_tail(files)
-        # Adopt any pre-existing CSV before it can be rewritten from a JSONL
-        # that does not yet describe it.
-        self.adopt_legacy_csv(files, *daydate)
-
-        seen = self._load_index(files)
-
-        fresh = []
-        fresh_keys = set()
-        outcomes = {}
-        for i, rec in pairs:
-            if rec['utc'] in seen or rec['utc'] in fresh_keys:
-                # Either already on disk, or an earlier input in this same
-                # batch claimed the instant. Both are duplicates of something
-                # durable, but only the FIRST claimant is the record on disk.
-                outcomes[i] = DUPLICATE
-                continue
-            fresh_keys.add(rec['utc'])
-            outcomes[i] = STORED
-            fresh.append(rec)
-
+    def _write_day(self, files, fresh, outcomes):
+        """Commit one day's classified records. Caller holds the day lock."""
         dup_count = sum(1 for v in outcomes.values() if v is DUPLICATE)
 
         if not fresh:
             # Nothing new. If an earlier request died between the JSONL and CSV
             # writes, this is when we notice and repair.
             self.reconcile(files)
-            return 0, dup_count, outcomes
+            return 0, dup_count
 
         # 1. Durable first. The index is NOT updated until this returns: if the
         #    append fails (ENOSPC is a live risk on these machines) the records
@@ -882,7 +893,7 @@ class Store:
             self._write_csv_atomic(files, want)
         _crash_point('after-csv')
 
-        return len(fresh), dup_count, outcomes
+        return len(fresh), dup_count
 
     # ----------------------------------------------------------------- status
 

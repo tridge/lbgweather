@@ -581,8 +581,12 @@ def test_concurrent_posts_do_not_deadlock_or_lose_records():
 
         def fire(i):
             try:
-                results[i] = h.post('/ingest/obs',
-                                    doc([obs(stamp(i), i + 1)]))
+                # No seq: these exercise concurrent STORAGE, not the cursor
+                # protocol. Concurrent out-of-order sequences from one station
+                # are a conflict by design and are tested separately.
+                o = obs(stamp(i), i + 1)
+                del o['seq']
+                results[i] = h.post('/ingest/obs', doc([o]))
             except Exception as e:
                 results[i] = ('exc', repr(e))
                 print('       request %d raised: %r' % (i, e))
@@ -621,7 +625,9 @@ def test_concurrent_posts_do_not_deadlock_or_lose_records():
 
         # Retrying the shed ones must succeed and complete the set.
         for i in shed:
-            code, _ = h.post('/ingest/obs', doc([obs(stamp(i), i + 1)]))
+            o = obs(stamp(i), i + 1)
+            del o['seq']
+            code, _ = h.post('/ingest/obs', doc([o]))
             check(code == 200, 'shed request %d succeeds on retry' % i)
         stored = h.srv.stores[STATION]._read_jsonl(f)
         check(len(stored) == n,
@@ -682,10 +688,10 @@ def test_status_never_regresses_under_concurrent_writers():
         results = [None] * 20
 
         def fire(i):
-            results[i] = h.post(
-                '/ingest/obs',
-                doc([obs('2026-07-31T%02d:%02d:03+10:00'
-                         % (10 + i // 60, i % 60), i + 1)]))
+            o = obs('2026-07-31T%02d:%02d:03+10:00'
+                    % (10 + i // 60, i % 60), i + 1)
+            del o['seq']            # storage/status race, not cursor protocol
+            results[i] = h.post('/ingest/obs', doc([o]))
         ts = [threading.Thread(target=fire, args=(i,)) for i in range(20)]
         for t in ts:
             t.start()
@@ -698,9 +704,12 @@ def test_status_never_regresses_under_concurrent_writers():
 
         vals = [v for v in seen if v is not None]
         # Without this the test could pass having observed nothing at all.
-        check(len(vals) >= 10 and len(set(vals)) > 1,
-              'the watcher actually saw the document change (%d reads, %d '
-              'distinct values)' % (len(vals), len(set(vals))))
+        # Guards against the whole test passing having observed nothing. The
+        # bar is distinct VALUES, not read count: the posts got faster and a
+        # read-count threshold made this flaky for no good reason.
+        check(len(set(vals)) >= 3,
+              'the watcher actually saw the document change repeatedly '
+              '(%d reads, %d distinct values)' % (len(vals), len(set(vals))))
         codes = [r[0] if r else None for r in results]
         # 20 concurrent against a cap of 16 means some are legitimately shed.
         served = codes.count(200)
@@ -843,7 +852,7 @@ def test_busy_carries_retry_after():
         import cyc_store
         orig = cyc_store.Store.put
 
-        def busy(self, observations):
+        def busy(self, observations, cursor=None):
             raise cyc_store.LockTimeout('busy for the test')
         cyc_store.Store.put = busy
         try:
@@ -1131,6 +1140,76 @@ def test_a_reset_collector_cannot_get_through_by_retrying():
               % (code, body.get('ack_seq')))
 
 
+def test_concurrent_conflicts_cannot_launder_through_the_race():
+    print('\n== two requests racing the same cursor ==')
+    with Harness() as h:
+        for i in range(5):
+            h.post('/ingest/obs',
+                   doc([obs('2026-07-31T10:0%d:03+10:00' % i, i + 1)]))
+        check(h.srv.last_ack(STATION) == 5, 'cursor at 5')
+
+        # Both carry seq 6 with DIFFERENT observations. Exactly one may win.
+        # When the check ran outside the cursor lock, both preflighted against
+        # cursor 5, both stored, the first advanced to 6, and the loser's
+        # record was already on disk -- so its retry came back a duplicate and
+        # was acknowledged. A sequential test cannot see that.
+        results = {}
+
+        def fire(tag, minute):
+            results[tag] = h.post(
+                '/ingest/obs',
+                doc([obs('2026-07-31T12:%02d:00+10:00' % minute, 6)]))
+
+        ta = threading.Thread(target=fire, args=('a', 10))
+        tb = threading.Thread(target=fire, args=('b', 20))
+        ta.start(); tb.start(); ta.join(timeout=30); tb.join(timeout=30)
+
+        codes = sorted(r[0] for r in results.values())
+        check(codes == [200, 409],
+              'exactly one wins and the other is refused (got %s)' % codes)
+
+        import cyc_store
+        recs = h.srv.stores[STATION]._read_jsonl(
+            cyc_store.DayFiles(h.logs, 2026, 7, 31))
+        noon = [r['local'] for r in recs if r['local'].startswith('2026-07-31 12')]
+        check(len(noon) == 1,
+              'only the winner is on disk - the loser stored NOTHING, so its '
+              'retry cannot become a duplicate (%s)' % noon)
+        check(h.srv.last_ack(STATION) == 6, 'cursor advanced exactly once')
+
+        # The loser retries. It must still be refused.
+        loser_minute = 20 if noon[0].endswith('10:00') else 10
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T12:%02d:00+10:00'
+                                     % loser_minute, 6)]))
+        check(code == 409,
+              'the loser is still refused on retry (got %s)' % code)
+        check(h.srv.last_ack(STATION) == 6, 'and the cursor is unmoved')
+
+
+def test_busy_storage_is_not_reported_as_a_conflict():
+    print('\n== a busy day lock is 503, never 409 ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        import cyc_store
+        real = cyc_store.Store.put
+
+        def busy(self, observations, cursor=None):
+            raise cyc_store.LockTimeout('day lock held for the test')
+        cyc_store.Store.put = busy
+        try:
+            code, body = h.post('/ingest/obs',
+                                doc([obs('2026-07-31T09:00:00+10:00', 1)]))
+        finally:
+            cyc_store.Store.put = real
+        # This used to read as a conflict because the old preflight could not
+        # tell "not present" from "could not look", so transient contention
+        # looked like a collector reset and stalled a healthy collector.
+        check(code == 503 and body.get('error') == 'busy',
+              'contention is retryable, not a protocol violation (got %s %s)'
+              % (code, body.get('error')))
+
+
 def test_ack_withheld_when_the_cursor_cannot_be_persisted():
     print('\n== never acknowledge what we could not write down ==')
     with Harness() as h:
@@ -1299,6 +1378,8 @@ def main():
     test_retry_degraded_distinguishes_transient_from_permanent()
     test_sequence_conflicts_are_not_laundered()
     test_a_reset_collector_cannot_get_through_by_retrying()
+    test_concurrent_conflicts_cannot_launder_through_the_race()
+    test_busy_storage_is_not_reported_as_a_conflict()
     test_ack_withheld_when_the_cursor_cannot_be_persisted()
     test_every_degraded_day_gets_a_turn()
     test_warm_loss_range_must_match_both_ends()
