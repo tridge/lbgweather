@@ -4,6 +4,7 @@
 import requests
 import csv
 import fcntl
+import math
 import json
 import os
 import sys
@@ -173,6 +174,10 @@ def note_failure(logged):
             raise TypeError('latch is not an object')
         count = int(doc.get('count', 0))
         last = float(doc.get('last_epoch', 0))
+        if count < 0 or not math.isfinite(last) or last < 0:
+            # 'nan' and friends parse happily and then blow up at int() when
+            # the status document is built.
+            raise ValueError('latch values out of range')
     except FileNotFoundError:
         count, last = 0, 0
     except (OSError, ValueError, TypeError, AttributeError):
@@ -180,14 +185,17 @@ def note_failure(logged):
         # whether a failure is outstanding.
         readable, count, last = False, 0, 0
 
+    if not readable and logged:
+        # A CLEAN minute must not write: zeroing here would overwrite the
+        # record we could not read and turn "cannot tell" into a confident
+        # clean state. Leave it and let the status document say so.
+        return 0, 0, False
     if not readable:
-        # Do NOT write. Writing zeros here would overwrite the very record we
-        # could not read, turn unknown into a confident clean state, and clear
-        # csv_latch_unavailable so nothing alarms. Leave it alone and let the
-        # status document say we cannot tell.
-        if not logged:
-            count, last = 1, now
-        return count, last, False
+        # A FAILING minute is different. We have a fact worth recording and
+        # the old contents are unreadable anyway, so start a fresh record
+        # rather than lose the failure entirely -- losing it is what the latch
+        # exists to prevent. The count is incremented below like any other.
+        count, last = 0, 0
 
     if logged:
         if not count or now - last > FAIL_WINDOW_S:

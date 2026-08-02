@@ -277,6 +277,30 @@ def test_dropped_samples_alarm():
               % w.health().get('severity'))
 
 
+
+def test_unreadable_latch_during_a_failure_still_alarms():
+    print('\n== a failing minute is recorded even if the latch was corrupt ==')
+    with Watch() as w:
+        # The logger could not read the old latch AND could not log. It wrote
+        # a fresh record rather than losing the failure, so the count is there
+        # for us to see even though the previous contents were unreadable.
+        import time as _t
+        w.set_age(60, csv_write_failed=True, csv_failures_recent=1,
+                  csv_last_failure_epoch=int(_t.time()),
+                  csv_latch_unavailable=False)
+        out = w.run()
+        check(w.mailed(out), 'the failure alarms')
+
+        # And the case where it could not write either: unknown, which is
+        # also an alarm.
+        w.set_age(60, csv_write_failed=False, csv_failures_recent=0,
+                  csv_latch_unavailable=True)
+        out = w.run()
+        check(w.health().get('severity') == 'alarm',
+              'an unavailable latch is a fault, not a pass (%s)'
+              % w.health().get('severity'))
+
+
 def main():
     for fn in [test_episode_lifecycle, test_episode_survives_a_dip_to_warn,
                test_undelivered_alarm_is_not_discarded,
@@ -286,7 +310,8 @@ def main():
                test_status_document_is_never_modified,
                test_losing_the_state_file_does_not_disarm,
                test_marker_absent_means_never_deployed,
-               test_dropped_samples_alarm]:
+               test_dropped_samples_alarm,
+               test_unreadable_latch_during_a_failure_still_alarms]:
         fn()
     print()
     if FAILURES:
