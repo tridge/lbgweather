@@ -857,9 +857,13 @@ def test_duplicate_instant_in_one_batch():
                                                 obs(ts, 2, wind=9.9)]))
         check(body['accepted'] == 1 and body['duplicates'] == 1,
               'one stored, one recognised as the same instant')
+        # Correct under the transport-cursor model: the sequence is the
+        # collector's position in its OWN spool, and two spool entries that
+        # dedup onto one instant are both accounted for. Acknowledging only
+        # the first would make the collector resend an entry for ever.
         check(body['ack_seq'] == 2,
-              'both acknowledged - the second is durable in the sense that '
-              'the instant is on disk (got %s)' % body['ack_seq'])
+              'both spool entries are acknowledged, because both are '
+              'accounted for by the record on disk (got %s)' % body['ack_seq'])
         import cyc_store
         recs = h.srv.stores[STATION]._read_jsonl(
             cyc_store.DayFiles(h.logs, 2026, 7, 31))
@@ -1240,6 +1244,17 @@ def test_one_stored_record_cannot_walk_the_cursor():
         check(code == 400,
               'an observation without a seq is refused outright (got %s)'
               % code)
+        import cyc_store as _cs
+        f0 = _cs.DayFiles(h.logs, 2026, 7, 31)
+        stamps = [r['local'] for r in h.srv.stores[STATION]._read_jsonl(f0)]
+        check('2026-07-31 13:00:00' not in stamps,
+              'and the instant did NOT get stored on the way to the 400 (%s)'
+              % [x for x in stamps if x.startswith('2026-07-31 13')])
+
+        code, _ = h.post('/ingest/obs', doc([obs(T, -1)]))
+        check(code == 400,
+              'a negative seq is refused too, matching the ack contract '
+              '(got %s)' % code)
 
         # Route 2: store the instant under seq 7 (ahead of the cursor, so it
         # stores but is not acknowledged), then re-send it as seq 6 to advance
@@ -1250,17 +1265,93 @@ def test_one_stored_record_cannot_walk_the_cursor():
               'seq 7 stores but is not acknowledged over the gap (%s %s)'
               % (code, body.get('ack_seq')))
 
+        # Under the transport-cursor model seq 6 here is the collector saying
+        # its spool entry 6 also resolves to T. 6 is cursor+1, so it advances.
+        # That is not laundering: only one record is on disk either way, and
+        # the cursor is the collector's own bookkeeping.
         code, body = h.post('/ingest/obs', doc([obs(T, 6)]))
-        check(code == 409,
-              'naming that instant as seq 6 is a conflict, not a duplicate '
-              '(got %s %s)' % (code, body.get('error')))
-        check(h.srv.last_ack(STATION) == 5, 'and the cursor did not move')
+        check(code == 200 and body['ack_seq'] == 6,
+              'seq 6 naming that instant advances the cursor (got %s %s)'
+              % (code, body.get('ack_seq')))
 
-        # The honest replay -- same instant, same seq -- is still fine.
-        code, body = h.post('/ingest/obs', doc([obs(T, 7)]))
-        check(code == 200,
-              'the same instant under its OWN seq is still a duplicate (%s)'
+        # What must NOT pass: re-using an acknowledged sequence for a
+        # DIFFERENT observation. That is a reset collector.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T14:30:00+10:00', 6)]))
+        check(code == 409 and 'different observation' in
+              (body.get('detail') or ''),
+              'seq 6 naming a DIFFERENT instant is refused (got %s %s)'
+              % (code, body.get('detail')))
+        check(h.srv.last_ack(STATION) == 6, 'and the cursor did not move')
+
+        # The honest replay -- same seq, same instant -- is still fine.
+        code, body = h.post('/ingest/obs', doc([obs(T, 6)]))
+        check(code == 200 and body['ack_seq'] == 6,
+              'the same sequence naming the same instant is a duplicate (%s)'
               % code)
+
+
+def test_the_transport_cursor_model():
+    print('\n== the sequence is a transport cursor, the instant is identity ==')
+    with Harness() as h:
+        import cyc_store
+        # A legacy day: rows adopted from the CSV carry NO sequence at all.
+        f = cyc_store.DayFiles(h.logs, 2026, 7, 31)
+        f.ensure_dir()
+        inst = int(utc_key(parse_obs_ts('2026-07-31T08:00:00+10:00')))
+        with open(f.jsonl, 'w') as fh:
+            fh.write(json.dumps({'utc': inst, 'local': '2026-07-31 08:00:00',
+                                 'obs_ts': '2026-07-31T08:00:00+10:00',
+                                 'src': 'legacy', 'station': 'cyc1'}) + '\n')
+
+        # A collector posting an instant the legacy import already holds must
+        # be able to make progress. Under an (instant, seq) identity rule this
+        # was a hard 409 on the cutover day -- the day guaranteed to be full
+        # of sequence-less rows.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T08:00:00+10:00', 1)]))
+        check(code == 200 and body['duplicates'] == 1,
+              'a legacy row is a duplicate, not a conflict (got %s %s)'
+              % (code, body.get('error')))
+        check(body['ack_seq'] == 1, 'and the spool entry is acknowledged')
+
+        # Overlapping archive backfill: a record covering an instant a LOOP
+        # record already reported. The plan calls this a no-op; it must not
+        # be a protocol violation just because it carries its own sequence.
+        h.post('/ingest/obs', doc([obs('2026-07-31T09:00:00+10:00', 2)]))
+        o = obs('2026-07-31T09:00:00+10:00', 3)
+        o['src'] = 'archive'
+        code, body = h.post('/ingest/obs', doc([o]))
+        check(code == 200 and body['duplicates'] == 1 and body['ack_seq'] == 3,
+              'overlapping archive backfill dedups and is acknowledged '
+              '(got %s %s)' % (code, body.get('ack_seq')))
+
+        # What the ledger is FOR: a sequence already acknowledged may not come
+        # back meaning something else.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T15:00:00+10:00', 3)]))
+        check(code == 409 and 'different observation' in
+              (body.get('detail') or ''),
+              'reusing an acknowledged sequence for other data is refused '
+              '(got %s %s)' % (code, body.get('detail')))
+
+        # And a replay far below the window cannot be verified, so it is
+        # refused rather than guessed.
+        h.srv.ledgers[STATION].pop(1, None)
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T08:00:00+10:00', 1)]))
+        check(code == 409 and 'too old to verify' in (body.get('detail') or ''),
+              'an unverifiable old sequence is refused with a resume point '
+              '(got %s %s)' % (code, body.get('detail')))
+
+        # The ledger is persisted alongside the cursor.
+        cur = json.load(open(os.path.join(h.state, STATION, 'cursor.json')))
+        check(isinstance(cur.get('ledger'), dict) and cur['ledger'],
+              'the ledger survives a restart (%s)' % list(cur.get('ledger', {}))[:4])
+        last, gaps, ledger = h.srv.load_cursor(STATION)
+        check(ledger.get(3) == int(utc_key(parse_obs_ts(
+            '2026-07-31T09:00:00+10:00'))),
+            'and reloads with the right instant for each sequence')
 
 
 def test_busy_storage_is_not_reported_as_a_conflict():
@@ -1274,8 +1365,10 @@ def test_busy_storage_is_not_reported_as_a_conflict():
             raise cyc_store.LockTimeout('day lock held for the test')
         cyc_store.Store.put = busy
         try:
+            # An ADVANCING request, so it reaches storage rather than being
+            # answered by the ledger check first.
             code, body = h.post('/ingest/obs',
-                                doc([obs('2026-07-31T09:00:00+10:00', 1)]))
+                                doc([obs('2026-07-31T10:05:00+10:00', 2)]))
         finally:
             cyc_store.Store.put = real
         # This used to read as a conflict because the old preflight could not
@@ -1456,6 +1549,7 @@ def main():
     test_a_reset_collector_cannot_get_through_by_retrying()
     test_concurrent_conflicts_cannot_launder_through_the_race()
     test_one_stored_record_cannot_walk_the_cursor()
+    test_the_transport_cursor_model()
     test_busy_storage_is_not_reported_as_a_conflict()
     test_ack_withheld_when_the_cursor_cannot_be_persisted()
     test_every_degraded_day_gets_a_turn()

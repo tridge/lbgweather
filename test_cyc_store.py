@@ -950,14 +950,32 @@ def test_wind_logger_reports_a_dropped_sample():
               'an unpersistable latch is declared, not silently zeroed (%s)'
               % doc.get('csv_latch_unavailable'))
 
-        # A CORRUPT but writable latch must not be overwritten with zeros:
-        # that would turn "cannot tell" into a confident clean state and stop
-        # anything alarming.
+        # A corrupt latch during a FAILING minute: we have a fact worth
+        # recording and the old contents are unreadable anyway, so start a
+        # fresh record rather than lose the failure. Losing it is precisely
+        # what the latch exists to prevent.
         latch = os.path.join(fail_dir, 'f.json')
         with open(latch, 'w') as fh:
             fh.write('[]')                      # valid JSON, not an object
         r = subprocess.run([sys.executable, '-c', main_src],
                            capture_output=True, text=True, timeout=60)
+        doc = json.load(open(status))
+        check(doc.get('csv_failures_recent') == 1,
+              'the failing minute is recorded despite the corrupt latch (%s)'
+              % doc.get('csv_failures_recent'))
+        check(json.load(open(latch)).get('count') == 1,
+              'and the latch now holds a usable record')
+
+        # A corrupt latch during a CLEAN minute is the opposite: writing zeros
+        # would turn "cannot tell" into a confident clean state.
+        with open(latch, 'w') as fh:
+            fh.write('[]')
+        clean_src = main_src.replace('"/proc/cannot-create-this"',
+                                     repr(os.path.join(t.d, 'goodlock')))
+        r = subprocess.run([sys.executable, '-c', clean_src],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0, 'the clean run logged successfully (rc=%s)'
+              % r.returncode)
         check(open(latch).read() == '[]',
               'the unreadable latch is left alone, not clobbered (%r)'
               % open(latch).read()[:40])
@@ -988,14 +1006,21 @@ def test_lock_budget_is_bounded_across_days():
         # And the acquisition budget is ONE deadline, not per day: with a day
         # already locked, the whole call gives up in about LOCK_TIMEOUT_S, not
         # LOCK_TIMEOUT_S x days.
-        f = DayFiles(t.logs, 2026, 7, 31)
-        f.ensure_dir()
-        held = s._DayLock(t.state, f.key)
-        held.__enter__()
+        # THREE contended locks, not one. With a single contended day the old
+        # per-day implementation aborts after one wait and passes too, so that
+        # version of this test proved nothing about the shared budget.
+        keys = ['2026-07-29', '2026-07-30', '2026-07-31']
+        held = []
         try:
-            batch = [obs('2026-07-30T10:00:00+10:00', 1),
-                     obs('2026-07-31T10:00:00+10:00', 2),
-                     obs('2026-08-01T10:00:00+10:00', 3)]
+            for k in keys:
+                DayFiles(t.logs, *[int(x) for x in k.split('-')]).ensure_dir()
+                lk = s._DayLock(t.state, k)
+                lk.__enter__()
+                held.append(lk)
+
+            batch = [obs('2026-07-29T10:00:00+10:00', 1),
+                     obs('2026-07-30T10:00:00+10:00', 2),
+                     obs('2026-07-31T10:00:00+10:00', 3)]
             t0 = time.time()
             try:
                 t.store().put(batch)
@@ -1003,11 +1028,14 @@ def test_lock_budget_is_bounded_across_days():
             except LockTimeout:
                 took, timed_out = time.time() - t0, True
             check(timed_out, 'the contended request gives up')
-            check(took < LOCK_TIMEOUT_S * 2,
-                  'within one budget rather than one per day (%.1fs for 3 '
-                  'days, budget %ds)' % (took, LOCK_TIMEOUT_S))
+            # Per-day timeouts would be 3 x LOCK_TIMEOUT_S here. One budget is
+            # LOCK_TIMEOUT_S total however many days are contended.
+            check(took < LOCK_TIMEOUT_S * 1.5,
+                  'ONE budget for three contended days (%.1fs; per-day would '
+                  'be ~%ds)' % (took, LOCK_TIMEOUT_S * 3))
         finally:
-            held.__exit__(None, None, None)
+            for lk in reversed(held):
+                lk.__exit__(None, None, None)
 
 
 def main():

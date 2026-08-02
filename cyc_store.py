@@ -322,11 +322,10 @@ class Store:
     def _load_index(self, files):
         """UTC instant -> the seq it was stored under (or None).
 
-        A set of instants was not enough. The instant is the dedup key, but it
-        is NOT the whole identity: a record already on disk under seq 7 must
-        not be re-acknowledged as seq 6 just because the instant matches, or a
-        caller can walk the cursor forward one number at a time using a single
-        stored observation.
+        The instant is the dedup key. The seq is carried for diagnostics and
+        for callers that want to know how a record arrived; it is NOT part of
+        the identity, because a legacy row has no sequence and an archive
+        record may cover an instant a LOOP record already reported.
         """
         sig = self._sig(files.jsonl)
         cached = self._index.get(files.key)
@@ -855,16 +854,17 @@ class Store:
                         outcomes[i] = DUPLICATE
                         continue
                     if rec['utc'] in seen:
-                        held = seen[rec['utc']]
-                        if held is not None and sq is not None and held != sq:
-                            # Same instant, different sequence. Acknowledging
-                            # it would let one stored observation be walked
-                            # forward through the cursor a number at a time.
-                            outcomes[i] = CONFLICT
-                            conflicts.append(
-                                '%s is already held under seq %s, not seq %s'
-                                % (rec.get('obs_ts'), held, sq))
-                            continue
+                        # The INSTANT is the identity. The sequence is the
+                        # collector's transport cursor over its spool, and
+                        # several spool entries may legitimately collapse onto
+                        # one instant -- an archive record covering a minute a
+                        # LOOP record already reported, or a legacy row adopted
+                        # from the CSV with no sequence at all. Treating
+                        # (instant, seq) as identity broke both of those.
+                        #
+                        # What must not pass is a sequence reused for DIFFERENT
+                        # data. That is checked against the seq->instant ledger
+                        # by the caller, which is where the cursor lives.
                         outcomes[i] = DUPLICATE
                         continue
                     if (cursor is not None and sq is not None

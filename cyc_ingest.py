@@ -57,6 +57,9 @@ SHED_QUEUE = 256
 # Degraded days rechecked per heartbeat. Bounded so a pile of bad days
 # cannot hold the heartbeat past the shutdown join.
 RETRY_PER_BEAT = 4
+# How far back a collector may replay a sequence. Beyond this we can no
+# longer say what that sequence meant, so it is refused rather than guessed.
+LEDGER_KEEP = 500
 MAX_NONCES = 20000
 MAX_FAIL_IPS = 4096
 
@@ -457,11 +460,17 @@ class Handler(BaseHTTPRequestHandler):
         # cursor -- a record admitted with no sequence at all being used to
         # move the cursor forward.
         for o in obs:
-            if isinstance(o, dict) and not is_int(o.get('seq')):
+            if not isinstance(o, dict):
+                continue
+            sq = o.get('seq')
+            # Non-negative, matching what the ACK contract will accept. They
+            # disagreed: a negative seq was stored, could never be
+            # acknowledged, and became a permanent retry.
+            if not is_int(sq) or sq < 0:
                 return self.fail(400, 'bad_schema',
-                                 detail='every observation needs an integer '
-                                        'seq; %r has %r'
-                                        % (o.get('obs_ts'), o.get('seq')))
+                                 detail='every observation needs a '
+                                        'non-negative integer seq; %r has %r'
+                                        % (o.get('obs_ts'), sq))
         if len(obs) > MAX_OBS:
             return self.fail(413, 'too_large')
 
@@ -479,6 +488,38 @@ class Handler(BaseHTTPRequestHandler):
         # station's writes costs nothing real.
         with self.server.cursor_lock(station):
             cursor_now = self.server.last_ack(station)
+            ledger = self.server.ledgers.setdefault(station, {})
+
+            # A sequence at or below the cursor is a replay, and a replay must
+            # name the SAME instant it named when we acknowledged it. The
+            # sequence is the collector's transport cursor, so several entries
+            # may dedup onto one instant -- but one entry may not mean two
+            # different observations. That is what a reset collector does.
+            for o in obs:
+                if not isinstance(o, dict):
+                    continue
+                sq = o.get('seq')
+                if not is_int(sq) or cursor_now is None or sq > cursor_now:
+                    continue
+                try:
+                    inst = utc_key(parse_obs_ts(o.get('obs_ts')))
+                except StoreError:
+                    continue
+                known = ledger.get(sq)
+                if known is None:
+                    return self.fail(
+                        409, 'seq_conflict',
+                        detail='seq %s is at or below the acknowledged cursor '
+                               '%s and is too old to verify; the collector '
+                               'should resume from %s'
+                               % (sq, cursor_now, cursor_now + 1))
+                if known != inst:
+                    return self.fail(
+                        409, 'seq_conflict',
+                        detail='seq %s was acknowledged for a different '
+                               'observation; this is a collector reset or a '
+                               'second collector on this station' % sq)
+
             try:
                 accepted, dup, rejected, details, disp = store.put(
                     obs, cursor=cursor_now)
@@ -510,6 +551,24 @@ class Handler(BaseHTTPRequestHandler):
                 loss_from=loss_from, loss_to=loss_to)
             if seq_problem:
                 details.append(seq_problem)
+            if ack_seq is not None:
+                # Record what each newly acknowledged sequence referred to,
+                # then prune: only a recent window can be replayed, and an
+                # unbounded ledger would be rewritten on every request.
+                for o, d in zip(obs, disp):
+                    if d not in DURABLE or not isinstance(o, dict):
+                        continue
+                    sq = o.get('seq')
+                    if not is_int(sq) or sq > ack_seq:
+                        continue
+                    try:
+                        ledger[sq] = utc_key(parse_obs_ts(o.get('obs_ts')))
+                    except StoreError:
+                        pass
+                floor = ack_seq - LEDGER_KEEP
+                for k in [k for k in ledger if k < floor]:
+                    del ledger[k]
+
             committed = self.server.record(
                 station, accepted, dup, rejected, newest_utc, ack_seq,
                 collector or {}, gaps=gaps)
@@ -565,10 +624,12 @@ class Server(ThreadingHTTPServer):
         # Seed here, not in main(): a Server constructed anywhere -- including
         # in a test standing in for a restart -- must come up with the same
         # cursor the previous process left behind.
+        self.ledgers = {}
         for name in stores:
-            last_ack, gaps = self.load_cursor(name)
+            last_ack, gaps, ledger = self.load_cursor(name)
             self.stats_by_station[name].last_seq = last_ack
             self.stats_by_station[name].seq_gaps = gaps
+            self.ledgers[name] = ledger
         # obs_age_s must keep growing when the producer dies, or a dead feed
         # looks frozen-but-fresh -- the exact failure this project exists to
         # remove. The producer refreshes its own document; nothing else may
@@ -790,13 +851,17 @@ class Server(ThreadingHTTPServer):
             with open(self.cursor_path(station)) as f:
                 doc = json.load(f)
         except FileNotFoundError:
-            return None, 0                      # genuinely fresh
+            return None, 0, {}                  # genuinely fresh
         except (OSError, ValueError) as e:
             # Unreadable is NOT the same as absent. Starting from a cold
             # cursor would accept any sequence the collector offered next.
             raise CursorError('%s: %s' % (self.cursor_path(station), e))
         if not isinstance(doc, dict):
             raise CursorError('%s: not an object' % self.cursor_path(station))
+        ledger = doc.get('ledger')
+        if ledger is not None and not isinstance(ledger, dict):
+            raise CursorError('%s: ledger is %r'
+                              % (self.cursor_path(station), type(ledger)))
         last = doc.get('last_ack')
         gaps = doc.get('seq_gaps')
         if last is not None and (not is_int(last) or last < 0):
@@ -807,9 +872,17 @@ class Server(ThreadingHTTPServer):
             # went missing.
             raise CursorError('%s: seq_gaps is %r'
                               % (self.cursor_path(station), gaps))
-        return (last if is_int(last) else None, gaps if is_int(gaps) else 0)
+        clean = {}
+        for k, v in (ledger or {}).items():
+            try:
+                clean[int(k)] = int(v)
+            except (TypeError, ValueError):
+                raise CursorError('%s: ledger entry %r -> %r'
+                                  % (self.cursor_path(station), k, v))
+        return (last if is_int(last) else None, gaps if is_int(gaps) else 0,
+                clean)
 
-    def save_cursor(self, station, last_ack, gaps):
+    def save_cursor(self, station, last_ack, gaps, ledger=None):
         """Commit the cursor. Returns True only if it is genuinely on disk.
 
         The caller must not acknowledge anything this fails to persist. A
@@ -828,7 +901,13 @@ class Server(ThreadingHTTPServer):
         try:
             with os.fdopen(fd, 'w') as f:
                 json.dump({'station': station, 'last_ack': last_ack,
-                           'seq_gaps': gaps, 'written_at': now_iso()}, f)
+                           'seq_gaps': gaps, 'written_at': now_iso(),
+                           # Which instant each recent sequence referred to
+                           # when we acknowledged it. A collector reinstalled
+                           # with a reset counter reuses a sequence for
+                           # different data; this is what notices.
+                           'ledger': {str(k): v for k, v in
+                                      (ledger or {}).items()}}, f)
                 f.write('\n')
                 f.flush()
                 os.fsync(f.fileno())
@@ -876,7 +955,8 @@ class Server(ThreadingHTTPServer):
             # A replay at or below the cursor changes nothing. Rewriting the
             # file anyway meant a read-only state directory turned an
             # acknowledgement that needed no write into a permanent 500.
-            if changed and not self.save_cursor(station, new_last, new_gaps):
+            if changed and not self.save_cursor(station, new_last, new_gaps,
+                                                self.ledgers.get(station)):
                 return False
         st.record(accepted, dup, rejected, newest_utc, seq, collector,
                   gaps=gaps)
