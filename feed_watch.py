@@ -40,6 +40,8 @@ WARN_AGE_S = 600
 ALARM_AGE_S = 1800
 LAG_WARN_S = 120
 SEQ_GAP_WARN = 5
+# Long enough that a one-minute drop cannot fall between two runs.
+CSV_FAIL_WINDOW_S = 900
 AUTH_FAIL_WARN = 20
 BACKLOG_WARN = 60
 REMINDER_S = 86400
@@ -168,7 +170,17 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
         problems.append('%d authentication failures in the last hour '
                         '- a key mismatch, or someone probing' % auth)
 
-    if status.get('csv_write_failed'):
+    recent_fails = status.get('csv_failures_recent')
+    last_fail = status.get('csv_last_failure_epoch')
+    if (isinstance(recent_fails, int) and recent_fails > 0
+            and isinstance(last_fail, (int, float))
+            and now - last_fail < CSV_FAIL_WINDOW_S):
+        severity = 'alarm'
+        problems.append('%d sample(s) dropped in the last %d minutes - the '
+                        'logger could not take the day lock. The feed is '
+                        'healthy and nothing is being recorded'
+                        % (recent_fails, CSV_FAIL_WINDOW_S // 60))
+    elif status.get('csv_write_failed'):
         # The feed is fine and we are dropping it on the floor. That is an
         # alarm, not a warning: every sample in this window is gone.
         severity = 'alarm'

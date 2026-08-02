@@ -22,6 +22,10 @@ STATUS_FILE = "status.json"
 LOCK_DIR = os.environ.get(
     'CYC_LOCK_DIR', os.path.expanduser("~/var/cyc_ingest/cyc1"))
 LOCK_TIMEOUT_S = 10
+FAIL_WINDOW_S = 900
+# Latched failure record. A transient boolean cleared by the next good minute
+# can fall entirely between two watchdog runs.
+FAIL_FILE = os.path.join(LOCK_DIR, "logger_failures.json")
 
 # Conversion factors
 MPH_TO_KNOTS = 0.868976
@@ -146,6 +150,38 @@ def log_data(data):
         return False
     return True
 
+def note_failure(logged):
+    """Latch a dropped sample so a 2-minute watchdog cannot miss it.
+
+    Returns (count, last_epoch) for the recent failure window. The
+    counter is cleared only after FAIL_WINDOW_S of clean running, not
+    by the very next successful minute.
+    """
+    now = time.time()
+    try:
+        with open(FAIL_FILE) as f:
+            doc = json.load(f)
+        count = int(doc.get('count', 0))
+        last = float(doc.get('last_epoch', 0))
+    except (OSError, ValueError, TypeError):
+        count, last = 0, 0
+    if logged:
+        if not count or now - last > FAIL_WINDOW_S:
+            count, last = 0, 0
+    else:
+        count += 1
+        last = now
+    try:
+        os.makedirs(os.path.dirname(FAIL_FILE), exist_ok=True)
+        tmp = FAIL_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'count': count, 'last_epoch': last}, f)
+        os.replace(tmp, FAIL_FILE)
+    except OSError:
+        pass                # best effort; status still carries it
+    return count, last
+
+
 def write_status(weather_json, logged=True):
     """Record the feed's OWN timestamp so staleness is detectable.
 
@@ -166,6 +202,7 @@ def write_status(weather_json, logged=True):
         return
     generated = weather_json.get('generated_at')
     now = time.time()
+    fail_count, fail_last = note_failure(logged)
 
     doc = {
         'station': 'cyc1',
@@ -185,6 +222,10 @@ def write_status(weather_json, logged=True):
         # green while every sample is dropped -- the same silent failure, one
         # step further down the pipe.
         'csv_write_failed': not logged,
+        # Latched, so a failure lasting one minute is still visible to a
+        # watchdog that only runs every two.
+        'csv_failures_recent': fail_count,
+        'csv_last_failure_epoch': int(fail_last) or None,
     }
     tmp = STATUS_FILE + '.tmp'
     try:

@@ -900,6 +900,37 @@ def test_wind_logger_reports_a_dropped_sample():
         check(not glob.glob(os.path.join(t.logs, '*', '*', '*.csv')),
               'and wrote NOTHING unlocked')
 
+        # main() is what cron runs, and it is main() that has to exit non-zero
+        # and publish the failure. Testing log_data alone proved neither.
+        fail_dir = os.path.join(t.d, 'lockfail')
+        os.makedirs(fail_dir, exist_ok=True)
+        status = os.path.join(t.d, 'status.json')
+        main_src = (
+            'import os, sys, json; sys.path.insert(0, %r); '
+            'os.environ["CYC_LOCK_DIR"] = "/proc/cannot-create-this"; '
+            'import wind_logger as wl; '
+            'wl.LOG_BASE_DIR = %r; wl.STATUS_FILE = %r; '
+            'wl.FAIL_FILE = %r; '
+            'wl.fetch_weather = lambda: {"sensors": [{"data": [{'
+            '"ts": 1785500000, "wind_speed": 1.0, '
+            '"wind_speed_10_min_avg": 1.0, "wind_dir": 90, '
+            '"wind_gust_10_min": 2.0, "temp_out": 50.0, "hum_out": 50}]}], '
+            '"generated_at": 1785500001}; '
+            'sys.exit(wl.main())'
+            % (wl_dir, t.logs, status, os.path.join(fail_dir, 'f.json')))
+        r = subprocess.run([sys.executable, '-c', main_src],
+                           capture_output=True, text=True, timeout=60)
+        check(r.returncode != 0,
+              'main() exits non-zero so cron can see it (rc=%s, %s)'
+              % (r.returncode, r.stderr.strip()[:120]))
+        doc = json.load(open(status))
+        check(doc.get('csv_write_failed') is True,
+              'status records the failure (%s)' % doc.get('csv_write_failed'))
+        check(doc.get('csv_failures_recent', 0) >= 1,
+              'and latches a count so a 2-minute watchdog cannot miss a '
+              '1-minute failure (%s)' % doc.get('csv_failures_recent'))
+        check(doc.get('csv_last_failure_epoch'), 'with a timestamp')
+
 
 def main():
     for fn in [test_format_contract, test_replay_and_first_write_wins,

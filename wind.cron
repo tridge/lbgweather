@@ -7,7 +7,11 @@ exec /usr/bin/flock -n /home/lbgweather/var/wind-cron.lock -c '
 cd $HOME/wind
 (
     date -Is
-    python3 wind_logger.py
+    # A non-zero exit here means a sample was DROPPED, not merely that the
+    # fetch failed. Report it: the subshell status is the last command, so
+    # without this the failure is invisible in cron mail.
+    python3 wind_logger.py || echo "WIND LOGGER FAILED rc=$?"
+
     python3 bom_logger.py
     # Shadow-feed the new ingest receiver from the same cloud data, so the
     # whole server half runs on real data while production is untouched.

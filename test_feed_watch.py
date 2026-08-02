@@ -235,19 +235,37 @@ def test_marker_absent_means_never_deployed():
 def test_dropped_samples_alarm():
     print('\n== a healthy feed we are failing to record is an alarm ==')
     with Watch() as w:
-        w.set_age(60, csv_write_failed=True)
+        import time as _t
+        w.set_age(60, csv_write_failed=True, csv_failures_recent=2,
+                  csv_last_failure_epoch=int(_t.time()))
         out = w.run()
         check(w.mailed(out),
               'a dropped sample alarms even though the observation is fresh')
-        check('DROPPED' in out or 'DROPPED' in w.health().get(
-            'problems', [''])[0],
-            'and says what is actually wrong (%s)' % w.health().get('problems'))
+        check('dropped' in (w.health().get('problems') or [''])[0].lower(),
+              'and says what is actually wrong (%s)' % w.health().get('problems'))
         check(w.health().get('severity') == 'alarm', 'severity is alarm')
+
+        # THE CASE THAT MATTERED: the transient flag has already been cleared
+        # by a good minute, but the latched count means the watchdog still
+        # sees the failure it would otherwise have run straight past.
+        w.set_age(60, csv_write_failed=False, csv_failures_recent=2,
+                  csv_last_failure_epoch=int(_t.time()) - 60)
+        out = w.run()
+        check(w.health().get('severity') == 'alarm',
+              'a failure that ended before this run is still caught (%s)'
+              % w.health().get('severity'))
+
+        # Stale enough, and it clears.
+        w.set_age(60, csv_write_failed=False, csv_failures_recent=2,
+                  csv_last_failure_epoch=int(_t.time()) - 5000)
+        out = w.run()
+        check(w.health().get('severity') == 'ok',
+              'and clears once the failure window has passed')
 
         w.set_age(60, csv_write_failed=False)
         out = w.run()
         check(w.health().get('severity') == 'ok',
-              'and clears once logging resumes')
+              'a clean status is ok')
 
 
 def main():
