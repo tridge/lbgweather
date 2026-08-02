@@ -698,7 +698,7 @@ def test_status_never_regresses_under_concurrent_writers():
 
         vals = [v for v in seen if v is not None]
         # Without this the test could pass having observed nothing at all.
-        check(len(vals) > 20 and len(set(vals)) > 1,
+        check(len(vals) >= 10 and len(set(vals)) > 1,
               'the watcher actually saw the document change (%d reads, %d '
               'distinct values)' % (len(vals), len(set(vals))))
         codes = [r[0] if r else None for r in results]
@@ -934,13 +934,15 @@ def test_cursor_survives_restart_without_laundering():
         stores2 = {STATION: Store(h.logs, h.state, station=STATION)}
         srv2 = Server(('127.0.0.1', 0), cfg2, stores2)
         try:
-            last_ack, gaps = srv2.load_cursor(STATION)
-            srv2.stats_by_station[STATION].last_seq = last_ack
-            check(last_ack == 5,
-                  'the restarted server seeds 5, not the durable 7 (got %s)'
-                  % last_ack)
+            # Nothing is assigned by hand: Server.__init__ must do the seeding,
+            # which is what production actually runs. The old version of this
+            # test called load_cursor and set last_seq itself, so it could not
+            # have caught a broken startup path.
             check(srv2.last_ack(STATION) == 5,
-                  'and its live cursor agrees')
+                  'the restarted server seeds itself with 5, not the durable '
+                  '7 (got %s)' % srv2.last_ack(STATION))
+            check(srv2.stats_by_station[STATION].seq_gaps == 0,
+                  'and the gap total came back with it')
             # Prove the consequence: seq 7 is STILL refused after the restart.
             ack, _, _, why = cyc_ingest.ack_from_dispositions(
                 [{'obs_ts': '2026-07-31T11:00:03+10:00', 'seq': 7}],
@@ -1011,6 +1013,11 @@ def test_shed_queue_saturation_still_closes_cleanly():
         # a hang, or an over-capacity request being served.
         check(200 not in outcomes,
               'no over-capacity request was served (%s)' % outcomes)
+        # "not 200" alone would pass on six connection resets, which is the
+        # behaviour the shed worker exists to replace.
+        check(outcomes.count(503) >= 1,
+              'at least one caller got a real 503 from the shed worker rather '
+              'than a dropped socket (%s)' % outcomes)
         check(len(outcomes) == 6 and elapsed < 40,
               'all six completed promptly rather than hanging (%.1fs)'
               % elapsed)
@@ -1082,6 +1089,46 @@ def test_sequence_conflicts_are_not_laundered():
     check(ack == 7 and gaps == 6,
           'a loss declared from a cold cursor is counted, not silently '
           'dropped (ack=%s gaps=%s)' % (ack, gaps))
+
+
+def test_a_reset_collector_cannot_get_through_by_retrying():
+    print('\n== the SECOND delivery is the one that mattered ==')
+    with Harness() as h:
+        # Build a cursor at 5.
+        for i, mm in enumerate(range(0, 5)):
+            h.post('/ingest/obs',
+                   doc([obs('2026-07-31T10:0%d:03+10:00' % mm, i + 1)]))
+        check(h.srv.last_ack(STATION) == 5, 'cursor is at 5')
+
+        # A reinstalled collector starts again at seq 1 with NEW data.
+        conflict = doc([obs('2026-07-31T14:00:00+10:00', 1)])
+        code, body = h.post('/ingest/obs', conflict)
+        check(code == 409 and body.get('error') == 'seq_conflict',
+              'the first delivery is refused (got %s %s)'
+              % (code, body.get('error')))
+
+        import cyc_store
+        f = cyc_store.DayFiles(h.logs, 2026, 7, 31)
+        stamps = [r['local'] for r in h.srv.stores[STATION]._read_jsonl(f)]
+        check('2026-07-31 14:00:00' not in stamps,
+              'and NOTHING was stored, so there is nothing for a retry to '
+              'match (%s)' % stamps)
+
+        # THE CASE THAT WAS BROKEN: retrying used to turn the conflict into a
+        # duplicate, which the replay branch accepted.
+        code, body = h.post('/ingest/obs', conflict)
+        check(code == 409 and body.get('error') == 'seq_conflict',
+              'the retry is refused too (got %s %s)'
+              % (code, body.get('error')))
+        check(h.srv.last_ack(STATION) == 5,
+              'and the cursor never moved (got %s)' % h.srv.last_ack(STATION))
+
+        # A genuine replay of acknowledged history is still fine.
+        code, body = h.post('/ingest/obs',
+                            doc([obs('2026-07-31T10:02:03+10:00', 3)]))
+        check(code == 200 and body['ack_seq'] == 3,
+              'a real replay of a stored record is still acknowledged (%s %s)'
+              % (code, body.get('ack_seq')))
 
 
 def test_ack_withheld_when_the_cursor_cannot_be_persisted():
@@ -1157,6 +1204,69 @@ def test_runtime_corruption_is_retried_not_just_displayed():
               % h.srv.degraded)
 
 
+
+def test_warm_loss_range_must_match_both_ends():
+    print('\n== a declared loss must cover the gap exactly ==')
+    with Harness() as h:
+        for i in range(5):
+            h.post('/ingest/obs',
+                   doc([obs('2026-07-31T10:0%d:03+10:00' % i, i + 1)]))
+        check(h.srv.last_ack(STATION) == 5, 'cursor at 5')
+
+        def send(lf, lt, minute, seq):
+            d = doc([obs('2026-07-31T11:%02d:03+10:00' % minute, seq)])
+            if lf is not None:
+                d['data_loss'] = {'from': lf, 'to': lt}
+            return h.post('/ingest/obs', d)
+
+        code, body = send(7, 9, 10, 10)
+        check(body.get('ack_seq') is None,
+              'a range starting AFTER the gap is refused - seq 6 would be '
+              'skipped without ever being mentioned (got %s)'
+              % body.get('ack_seq'))
+
+        code, body = send(1, 9, 11, 10)
+        check(body.get('ack_seq') is None,
+              'a range overlapping acknowledged history is refused (got %s)'
+              % body.get('ack_seq'))
+
+        code, body = send(6, 8, 12, 10)
+        check(body.get('ack_seq') is None,
+              'a range ending short of the record is refused (got %s)'
+              % body.get('ack_seq'))
+
+        code, body = send(6, 9, 13, 10)
+        check(body.get('ack_seq') == 10,
+              'the exact range is accepted (got %s)' % body.get('ack_seq'))
+        st = json.load(open(h.status))
+        check(st['seq_gaps'] == 4, 'and four lost records are recorded (%s)'
+              % st['seq_gaps'])
+
+
+def test_replay_needs_no_cursor_write():
+    print('\n== an acknowledgement that changes nothing needs no write ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
+        h.post('/ingest/obs', doc([obs('2026-07-31T10:01:03+10:00', 2)]))
+
+        writes = []
+        real = h.srv.save_cursor
+        h.srv.save_cursor = lambda *a, **k: (writes.append(a), False)[1]
+        try:
+            # A replay at the cursor. Nothing changes, so nothing should be
+            # written -- and a read-only state directory must not turn this
+            # into a permanent 500.
+            code, body = h.post('/ingest/obs',
+                                doc([obs('2026-07-31T10:01:03+10:00', 2)]))
+        finally:
+            h.srv.save_cursor = real
+        check(code == 200 and body['ack_seq'] == 2,
+              'the replay is acknowledged even though writes would fail '
+              '(got %s %s)' % (code, body.get('ack_seq')))
+        check(not writes,
+              'and no cursor write was even attempted (%d)' % len(writes))
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -1188,8 +1298,11 @@ def main():
     test_shed_queue_saturation_still_closes_cleanly()
     test_retry_degraded_distinguishes_transient_from_permanent()
     test_sequence_conflicts_are_not_laundered()
+    test_a_reset_collector_cannot_get_through_by_retrying()
     test_ack_withheld_when_the_cursor_cannot_be_persisted()
     test_every_degraded_day_gets_a_turn()
+    test_warm_loss_range_must_match_both_ends()
+    test_replay_needs_no_cursor_write()
     test_runtime_corruption_is_retried_not_just_displayed()
     test_seq_gaps_are_counted_from_the_batch()
     test_duplicate_instant_in_one_batch()

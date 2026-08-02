@@ -724,6 +724,40 @@ class Store:
             pass
         self._index.pop(files.key, None)   # force reload with the new signature
 
+    def knows(self, observations):
+        """Per input: is this observation's instant ALREADY on disk?
+
+        Read-only. The receiver needs this before storing anything, to tell a
+        genuine replay of acknowledged history from a sequence conflict. Both
+        arrive as a low sequence number; the difference is that the replay is
+        already stored and the conflict is new data wearing an old number.
+
+        Deciding that after the write is too late: the conflict is stored, and
+        its retry then looks exactly like a duplicate.
+        """
+        out = [False] * len(observations)
+        by_day = {}
+        for i, obs in enumerate(observations):
+            if not isinstance(obs, dict):
+                continue
+            try:
+                dt = parse_obs_ts(obs.get('obs_ts'))
+            except StoreError:
+                continue
+            y, m, d = local_date(dt)
+            by_day.setdefault((y, m, d), []).append((i, utc_key(dt)))
+
+        for (y, m, d), pairs in by_day.items():
+            files = DayFiles(self.logdir, y, m, d)
+            try:
+                with self._DayLock(self.statedir, files.key, timeout=2):
+                    seen = self._load_index(files)
+            except (LockTimeout, OSError, CorruptionError):
+                continue          # unknown; the caller treats that as not-known
+            for i, key in pairs:
+                out[i] = key in seen
+        return out
+
     def put(self, observations):
         """Store observations. Returns (accepted, duplicates, rejected, details,
         dispositions).

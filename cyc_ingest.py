@@ -459,6 +459,25 @@ class Handler(BaseHTTPRequestHandler):
             # rather than fall back to somebody else's tree.
             return self.fail(403, 'station_not_configured')
 
+        # A sequence conflict must be caught BEFORE anything is written. A
+        # collector reinstalled with a reset counter sends new data wearing an
+        # old number; if we store it and decide afterwards, its retry comes
+        # back as an ordinary duplicate and walks straight through the replay
+        # branch. Refusing the first delivery is not enough -- there must be
+        # nothing on disk for the second one to match.
+        cursor_now = self.server.last_ack(station)
+        if cursor_now is not None:
+            known = store.knows(obs)
+            for o, already in zip(obs, known):
+                sq = o.get('seq') if isinstance(o, dict) else None
+                if is_int(sq) and sq <= cursor_now and not already:
+                    return self.fail(
+                        409, 'seq_conflict',
+                        detail='seq %s is at or below the acknowledged cursor '
+                               '%s but is not a record we hold: a collector '
+                               'reset or a second collector on this station'
+                               % (sq, cursor_now))
+
         try:
             accepted, dup, rejected, details, disp = store.put(obs)
         except LockTimeout as e:
@@ -533,6 +552,13 @@ class Server(ThreadingHTTPServer):
         # or two concurrent requests evaluate contiguity against the same value
         # and both advance it.
         self._cursor_locks = {name: threading.Lock() for name in stores}
+        # Seed here, not in main(): a Server constructed anywhere -- including
+        # in a test standing in for a restart -- must come up with the same
+        # cursor the previous process left behind.
+        for name in stores:
+            last_ack, gaps = self.load_cursor(name)
+            self.stats_by_station[name].last_seq = last_ack
+            self.stats_by_station[name].seq_gaps = gaps
         # obs_age_s must keep growing when the producer dies, or a dead feed
         # looks frozen-but-fresh -- the exact failure this project exists to
         # remove. The producer refreshes its own document; nothing else may
@@ -543,6 +569,7 @@ class Server(ThreadingHTTPServer):
         self.shed_q = queue.Queue(maxsize=cfg.get('shed_queue',
                                                    SHED_QUEUE))
         self._shed_closed = False
+        self._shed_gate = threading.Lock()
         self._retry_cursor = 0
         self._shedder = threading.Thread(target=self._shed_worker, daemon=True)
         self._shedder.start()
@@ -568,7 +595,8 @@ class Server(ThreadingHTTPServer):
         # sentinel goes to the back of the queue, so a full queue or a slow
         # peer would otherwise leave the worker and its sockets alive after
         # server_close returned.
-        self._shed_closed = True
+        with self._shed_gate:
+            self._shed_closed = True
         while True:
             try:
                 pending = self.shed_q.get_nowait()
@@ -611,8 +639,11 @@ class Server(ThreadingHTTPServer):
         # permanent failures for ever and starved everything after them.
         keys = sorted(self.degraded)
         start = self._retry_cursor % len(keys)
-        window = (keys + keys)[start:start + RETRY_PER_BEAT]
-        self._retry_cursor = (start + RETRY_PER_BEAT) % len(keys)
+        # Wrap, but never check the same day twice in one beat: with fewer
+        # entries than the window, (keys + keys) repeated them.
+        n = min(RETRY_PER_BEAT, len(keys))
+        window = [keys[(start + i) % len(keys)] for i in range(n)]
+        self._retry_cursor = (start + n) % len(keys)
         for key in window:
             name, _, day = key.partition('/')
             store = self.stores.get(name)
@@ -654,12 +685,16 @@ class Server(ThreadingHTTPServer):
             # closing here would block the accept loop -- exactly when we are
             # already over capacity -- and closing on a half-sent request body
             # sends RST, which discards the 503 the client never got to read.
-            try:
-                if self._shed_closed:
-                    raise queue.Full
-                self.shed_q.put_nowait(request)
-            except queue.Full:
-                self.shutdown_request(request)
+            # The check and the insertion must be one step, or server_close
+            # can drain the queue and add its sentinel in between and this
+            # request is stranded behind it.
+            with self._shed_gate:
+                try:
+                    if self._shed_closed:
+                        raise queue.Full
+                    self.shed_q.put_nowait(request)
+                except queue.Full:
+                    self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
@@ -754,9 +789,14 @@ class Server(ThreadingHTTPServer):
             raise CursorError('%s: not an object' % self.cursor_path(station))
         last = doc.get('last_ack')
         gaps = doc.get('seq_gaps')
-        if last is not None and not is_int(last):
+        if last is not None and (not is_int(last) or last < 0):
             raise CursorError('%s: last_ack is %r'
                               % (self.cursor_path(station), last))
+        if gaps is not None and (not is_int(gaps) or gaps < 0):
+            # Silently zeroing this lost the record of how much data we know
+            # went missing.
+            raise CursorError('%s: seq_gaps is %r'
+                              % (self.cursor_path(station), gaps))
         return (last if is_int(last) else None, gaps if is_int(gaps) else 0)
 
     def save_cursor(self, station, last_ack, gaps):
@@ -784,7 +824,11 @@ class Server(ThreadingHTTPServer):
                 os.fsync(f.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
-            _fsync_dir(d)          # the rename itself has to survive a crash
+            # The rename itself has to survive a crash. If THIS fails the new
+            # cursor may be on disk while memory still holds the old one, so
+            # report failure and let the caller withhold the acknowledgement:
+            # a cursor ahead of memory only ever costs a duplicate retry.
+            _fsync_dir(d)
             return True
         except OSError as e:
             sys.stderr.write('cursor write failed for %s: %s\n' % (station, e))
@@ -818,7 +862,11 @@ class Server(ThreadingHTTPServer):
                 new_last = seq if st.last_seq is None else max(seq,
                                                                st.last_seq)
                 new_gaps = st.seq_gaps + gaps
-            if not self.save_cursor(station, new_last, new_gaps):
+                changed = (new_last != st.last_seq or new_gaps != st.seq_gaps)
+            # A replay at or below the cursor changes nothing. Rewriting the
+            # file anyway meant a read-only state directory turned an
+            # acknowledgement that needed no write into a permanent 500.
+            if changed and not self.save_cursor(station, new_last, new_gaps):
                 return False
         st.record(accepted, dup, rejected, newest_utc, seq, collector,
                   gaps=gaps)
@@ -968,15 +1016,25 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
     in_batch = None
     loss_used = False
 
-    def take_loss(upto):
-        """Consume a declared loss range ending just before `upto`."""
+    def take_loss(upto, after):
+        """Consume a declared loss range covering EXACTLY (after, upto).
+
+        Both ends matter. Checking only the end let a declaration of 7..9
+        against cursor 5 authorise a jump to 10 while seq 6 was never
+        mentioned, and 1..9 overlap history that was already acknowledged.
+        `after` is None only from a cold cursor, where there is no history to
+        overlap and only the end can be checked.
+        """
         nonlocal gaps, loss_used
-        if (not loss_used and is_int(loss_from) and is_int(loss_to)
-                and loss_to == upto - 1 and loss_to >= loss_from):
-            gaps += loss_to - loss_from + 1
-            loss_used = True
-            return True
-        return False
+        if loss_used or not (is_int(loss_from) and is_int(loss_to)):
+            return False
+        if loss_to != upto - 1 or loss_to < loss_from:
+            return False
+        if after is not None and loss_from != after + 1:
+            return False
+        gaps += loss_to - loss_from + 1
+        loss_used = True
+        return True
 
     for o, d in zip(obs, disp):
         if d not in DURABLE:
@@ -998,7 +1056,7 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
             # First sequence this station has ever had acknowledged. A loss
             # declared against that first record still has to be counted;
             # ignoring it recorded the gap as zero and the loss vanished.
-            take_loss(sq)
+            take_loss(sq, None)
             cursor = sq
         elif sq == cursor + 1:
             cursor = sq                                # the ordinary case
@@ -1013,7 +1071,7 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
                     'seq %s is at or below the cursor %s but is newly stored: '
                     'a reset or a second collector' % (sq, cursor))
                 break
-        elif take_loss(sq):
+        elif take_loss(sq, cursor):
             cursor = sq
         else:
             problem = problem or (
@@ -1121,7 +1179,14 @@ def main(argv=None):
             sys.stderr.write('DEGRADED reconcile_all(%s): %s\n' % (name, e))
 
     cfg['degraded'] = degraded
-    srv = Server((args.host, args.port), cfg, stores)
+    try:
+        srv = Server((args.host, args.port), cfg, stores)
+    except CursorError as e:
+        raise SystemExit(
+            'cursor unreadable: %s\n'
+            'Refusing to start: a cold cursor would accept whatever sequence '
+            'the collector offered next. Fix or delete the file deliberately.'
+            % e)
 
     # Seed from storage before serving. Stats are in-memory, so without this a
     # restart makes status.json report "no observation has ever been recorded"
@@ -1139,23 +1204,13 @@ def main(argv=None):
                              % (name,
                                 datetime.fromtimestamp(st.last_obs_utc, TZ)
                                 .isoformat(timespec='seconds')))
-        # The CURSOR comes from its own file, never from storage: a durable
-        # record is not necessarily an acknowledged one, and inferring the
-        # cursor from the newest observation would launder a record we
-        # explicitly refused to acknowledge.
-        try:
-            last_ack, gaps = srv.load_cursor(name)
-        except CursorError as e:
-            raise SystemExit(
-                'cursor for %s is unreadable: %s\n'
-                'Refusing to start: a cold cursor would accept whatever '
-                'sequence the collector offered next. Fix or delete the file '
-                'deliberately.' % (name, e))
-        st.last_seq = last_ack
-        st.seq_gaps = gaps
-        if last_ack is not None:
+        # The cursor was seeded by Server.__init__ from its own file, never
+        # from storage: a durable record is not necessarily an acknowledged
+        # one, and inferring it from the newest observation would launder a
+        # record we explicitly refused to acknowledge.
+        if st.last_seq is not None:
             sys.stderr.write('seeded %s cursor: last_ack=%s seq_gaps=%s\n'
-                             % (name, last_ack, gaps))
+                             % (name, st.last_seq, st.seq_gaps))
 
     srv.write_status()
     sys.stderr.write('cyc-ingest listening on %s:%d, stations: %s\n'
