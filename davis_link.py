@@ -56,6 +56,10 @@ class Link:
         self.crc_errors = 0
         self.timeouts = 0
         self.wakeups = 0
+        # Whether this console is giving us LOOP2. Set by loop_packets once the
+        # LPS/LOOP question is settled, so callers can wait for the richer
+        # packet instead of emitting a half-populated observation.
+        self.loop2_available = None
 
     # ----------------------------------------------------------------- io
 
@@ -128,6 +132,7 @@ class Link:
                 want_loop2 = False
         else:
             self.command('LOOP %d' % count)
+        self.loop2_available = want_loop2
 
         for _ in range(count):
             raw = self._read_exact(LOOP_SIZE, PACKET_TIMEOUT_S)
