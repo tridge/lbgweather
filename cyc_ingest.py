@@ -195,6 +195,20 @@ class Stats:
         self.last_seq = None
         self.seq_gaps = 0
         self.collector = {}
+        # The newest full upstream row, for the club-facing document, and the
+        # instant it belongs to -- kept separately from last_obs_utc so a
+        # backfill cannot replace current conditions with older readings.
+        self.last_v2 = None
+        self.last_v2_meta = None
+        self.last_v2_utc = None
+
+    def record_v2(self, row, meta, obs_utc):
+        with self.lock:
+            if self.last_v2_utc is not None and obs_utc <= self.last_v2_utc:
+                return          # older than what we are already showing
+            self.last_v2 = row
+            self.last_v2_meta = meta
+            self.last_v2_utc = obs_utc
 
     def record(self, a, d, r, obs_utc, seq, collector, gaps=0):
         """Fold one request's outcome in.
@@ -245,12 +259,20 @@ class Handler(BaseHTTPRequestHandler):
             return xff.split(',')[-1].strip()
         return self.client_address[0]
 
-    def respond(self, code, payload, retry_after=None):
+    def respond(self, code, payload, retry_after=None, cache_seconds=None):
         body = json.dumps(payload).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Cache-Control', 'no-store')
+        if cache_seconds:
+            # A public document a third-party page polls. Brief caching is
+            # fine; it must be far shorter than the feed cadence so the gap
+            # between ts and generated_at stays meaningful.
+            self.send_header('Cache-Control', 'public, max-age=%d'
+                             % cache_seconds)
+            self.send_header('Access-Control-Allow-Origin', '*')
+        else:
+            self.send_header('Cache-Control', 'no-store')
         if retry_after is not None:
             # Tell a transiently-refused caller when to come back rather than
             # leaving it to guess or to give up.
@@ -358,9 +380,45 @@ class Handler(BaseHTTPRequestHandler):
     # -------------------------------------------------------------- routing
 
     def do_GET(self):
-        if self.path.rstrip('/') == '/ingest/health':
+        path = self.path.rstrip('/')
+        if path == '/ingest/health':
             return self.health()
+        if path in ('/ingest/current.json', '/ingest/current'):
+            return self.current()
         self.fail(404, 'not_found')
+
+    def current(self):
+        """The club's page, in WeatherLink-v2 shape.
+
+        Served rather than written to a file on purpose. The v2 document has no
+        age field: staleness is generated_at minus ts, so a document whose
+        generated_at is frozen at the moment the producer died reads as fresh
+        for ever. Computing generated_at per request makes that gap honest,
+        which is the whole failure this project exists to remove.
+
+        Public and unauthenticated, like the Davis endpoint it replaces.
+        """
+        st = self.server.stats_by_station.get(self.server.primary)
+        with st.lock:
+            row = st.last_v2
+            meta = st.last_v2_meta
+            obs_epoch = st.last_obs_utc
+        if not row or not meta or obs_epoch is None:
+            # Better a clear failure than a well-formed document full of nulls
+            # that a consumer would render as real weather.
+            return self.fail(503, 'no_observation',
+                             detail='no observation with a v2 payload yet')
+        self.respond(200, {
+            'station_id': meta.get('station_id'),
+            'station_id_uuid': meta.get('station_id_uuid'),
+            'sensors': [{
+                'lsid': meta.get('lsid'),
+                'sensor_type': meta.get('sensor_type'),
+                'data_structure_type': meta.get('data_structure_type'),
+                'data': [row],
+            }],
+            'generated_at': int(time.time()),
+        }, cache_seconds=30)
 
     def do_POST(self):
         body, err = self.read_body()
@@ -571,6 +629,8 @@ class Handler(BaseHTTPRequestHandler):
             committed = self.server.record(
                 station, accepted, dup, rejected, newest_utc, ack_seq,
                 collector or {}, gaps=gaps, ledger=next_ledger)
+            if committed:
+                self.server.note_v2(station, obs, disp, newest_utc)
 
         if not committed:
             # The observations ARE durable; only the cursor is not. Refusing
@@ -977,6 +1037,43 @@ class Server(ThreadingHTTPServer):
             self.write_status()
         return True
 
+    def note_v2(self, station, obs, disp, newest_utc):
+        """Keep the newest durable v2 row for the club-facing document.
+
+        Newest by INSTANT, not by arrival: a backfill posted after a live
+        reading must not replace the current conditions with older ones.
+        """
+        st = self.stats_by_station.get(station)
+        if st is None or newest_utc is None:
+            return
+        for o, d in zip(obs, disp):
+            if d not in DURABLE or not isinstance(o, dict):
+                continue
+            if not isinstance(o.get('v2'), dict):
+                continue
+            try:
+                if utc_key(parse_obs_ts(o.get('obs_ts'))) != newest_utc:
+                    continue
+            except StoreError:
+                continue
+            meta = o.get('v2_meta')
+            st.record_v2(o['v2'], meta if isinstance(meta, dict) else {},
+                         newest_utc)
+            return
+
+    def seed_v2(self, station, store):
+        """Reload the newest v2 row after a restart, so the club's page does
+        not go blank for a whole feed cycle every time we deploy."""
+        try:
+            last = store.last_observation()
+        except Exception:
+            return
+        if isinstance(last, dict) and isinstance(last.get('v2'), dict):
+            meta = last.get('v2_meta')
+            self.stats_by_station[station].record_v2(
+                last['v2'], meta if isinstance(meta, dict) else {},
+                int(last['utc']))
+
     def snapshot(self, station=None):
         st = self.stats_by_station[station or self.primary]
         with st.lock:
@@ -1330,6 +1427,7 @@ def main(argv=None):
             last = None
         if last:
             st.last_obs_utc = int(last['utc'])
+            srv.seed_v2(name, store)
             sys.stderr.write('seeded %s from storage: last observation %s\n'
                              % (name,
                                 datetime.fromtimestamp(st.last_obs_utc, TZ)

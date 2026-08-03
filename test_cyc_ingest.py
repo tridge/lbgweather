@@ -1653,6 +1653,89 @@ def test_replay_needs_no_cursor_write():
               'and no cursor write was even attempted (%d)' % len(writes))
 
 
+
+def _v2_obs(ts, seq, temp_f=57.8):
+    o = obs(ts, seq)
+    o['v2'] = {'ts': int(utc_key(parse_obs_ts(ts))), 'temp_out': temp_f,
+               'wind_speed': 5, 'wind_dir': 245, 'hum_out': 49,
+               'solar_rad': None, 'uv': None, 'bar': 30.283}
+    o['v2_meta'] = {'station_id': 147797,
+                    'station_id_uuid': 'ecf22183-b7f1-489d-8d9c-c8d624ca0e37',
+                    'lsid': 565836, 'sensor_type': 34,
+                    'data_structure_type': 2}
+    return o
+
+
+def test_club_current_json():
+    print('\n== the club-facing WeatherLink-v2 document ==')
+    with Harness() as h:
+        code, body = h.get('/ingest/current.json')
+        check(code == 503 and body.get('error') == 'no_observation',
+              'with no data it fails clearly rather than serving nulls that '
+              'would render as real weather (got %s)' % code)
+
+        h.post('/ingest/obs', doc([_v2_obs('2026-07-31T10:00:03+10:00', 1)]))
+        code, body = h.get('/ingest/current.json')
+        check(code == 200, 'served once an observation exists')
+        check(body.get('station_id') == 147797
+              and body.get('station_id_uuid') ==
+              'ecf22183-b7f1-489d-8d9c-c8d624ca0e37',
+              'station identity matches the Davis document it replaces')
+        sensor = body['sensors'][0]
+        check(sensor['lsid'] == 565836 and sensor['sensor_type'] == 34
+              and sensor['data_structure_type'] == 2,
+              'sensor identity matches too')
+        check(sensor['data'][0]['temp_out'] == 57.8,
+              'the upstream row is passed through verbatim')
+        check('solar_rad' in sensor['data'][0]
+              and sensor['data'][0]['solar_rad'] is None,
+              'absent sensors stay null rather than being dropped')
+
+        # THE POINT of serving rather than writing a file: staleness is
+        # generated_at minus ts, so generated_at must be now, not whenever the
+        # producer last managed to write.
+        first = body['generated_at']
+        obs_ts = sensor['data'][0]['ts']
+        time.sleep(1.2)
+        code, body2 = h.get('/ingest/current.json')
+        check(body2['generated_at'] > first,
+              'generated_at advances between requests (%s -> %s)'
+              % (first, body2['generated_at']))
+        check(body2['sensors'][0]['data'][0]['ts'] == obs_ts,
+              'while ts stays put, so the gap between them IS the staleness')
+
+        # A backfill must not overwrite current conditions with older data.
+        h.post('/ingest/obs', doc([_v2_obs('2026-07-31T09:00:00+10:00', 2,
+                                           temp_f=40.0)]))
+        code, body3 = h.get('/ingest/current.json')
+        check(body3['sensors'][0]['data'][0]['temp_out'] == 57.8,
+              'an older backfilled row does not become the current reading '
+              '(got %s)' % body3['sensors'][0]['data'][0]['temp_out'])
+
+        # A newer one does.
+        h.post('/ingest/obs', doc([_v2_obs('2026-07-31T10:15:00+10:00', 3,
+                                           temp_f=61.0)]))
+        code, body4 = h.get('/ingest/current.json')
+        check(body4['sensors'][0]['data'][0]['temp_out'] == 61.0,
+              'a newer row does (got %s)'
+              % body4['sensors'][0]['data'][0]['temp_out'])
+
+
+def test_club_current_survives_restart():
+    print('\n== the club page does not blank on every deploy ==')
+    with Harness() as h:
+        h.post('/ingest/obs', doc([_v2_obs('2026-07-31T10:00:03+10:00', 1)]))
+        srv2 = Server(('127.0.0.1', 0), dict(h.srv.cfg),
+                      {STATION: Store(h.logs, h.state, station=STATION)})
+        try:
+            srv2.seed_v2(STATION, srv2.stores[STATION])
+            st = srv2.stats_by_station[STATION]
+            check(st.last_v2 is not None and st.last_v2['temp_out'] == 57.8,
+                  'a restarted server reloads the newest v2 row from storage')
+        finally:
+            srv2.server_close()
+
+
 def main():
     test_happy_path()
     test_replay_and_nonce()
@@ -1688,6 +1771,8 @@ def main():
     test_concurrent_conflicts_cannot_launder_through_the_race()
     test_one_stored_record_cannot_walk_the_cursor()
     test_the_transport_cursor_model()
+    test_club_current_json()
+    test_club_current_survives_restart()
     test_busy_storage_is_not_reported_as_a_conflict()
     test_ack_withheld_when_the_cursor_cannot_be_persisted()
     test_large_declared_loss_retry_retains_the_whole_request()

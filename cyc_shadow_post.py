@@ -86,6 +86,22 @@ def fetch_weather(timeout=15):
         return json.loads(r.read().decode('utf-8'))
 
 
+def v2_envelope(weather):
+    """The identifying fields of the WeatherLink-v2 document, without data.
+
+    Carried so the receiver can rebuild a byte-compatible document for the
+    club's page without having to know these constants itself.
+    """
+    sensor = weather['sensors'][0]
+    return {
+        'station_id': weather.get('station_id'),
+        'station_id_uuid': weather.get('station_id_uuid'),
+        'lsid': sensor.get('lsid'),
+        'sensor_type': sensor.get('sensor_type'),
+        'data_structure_type': sensor.get('data_structure_type'),
+    }
+
+
 def to_observation(weather, seq):
     """Build one observation from the feed, keyed on ITS timestamp."""
     data = weather['sensors'][0]['data'][0]
@@ -110,6 +126,13 @@ def to_observation(weather, seq):
         'hum_in': data.get('hum_in'),
         'rain_day_mm': data.get('rain_day_mm'),
         'rain_rate_mmh': data.get('rain_rate_mm'),
+        # The whole upstream row, verbatim. The club's page consumes a
+        # WeatherLink-v2 document with 68 imperial fields; carrying it lets the
+        # receiver serve that shape unchanged, so the club's integration can
+        # move off the Davis cloud before the collector exists. Costs a few KB
+        # a day and keeps fidelity the CSV has no columns for.
+        'v2': data,
+        'v2_meta': v2_envelope(weather),
     }
 
 
