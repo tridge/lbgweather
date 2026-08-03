@@ -190,6 +190,17 @@ def test_auth_failure_key_matches_the_receiver():
               'the old name is not silently accepted as an alias')
 
 
+def test_sequence_gaps_name_missing_spool_positions():
+    print('\n== sequence gaps describe the transport cursor ==')
+    with Watch() as w:
+        w.set_age(60, seq_gaps=6)
+        w.run()
+        problems = w.health().get('problems', [])
+        check(any('spool positions declared missing' in p for p in problems),
+              'the alarm does not claim each missing sequence was a distinct '
+              'observation (%s)' % problems)
+
+
 def test_status_document_is_never_modified():
     print('\n== the producer owns the status document ==')
     with Watch() as w:
@@ -307,6 +318,7 @@ def main():
                test_future_dated_is_an_alarm, test_missing_status,
                test_lag_threshold_is_per_source,
                test_auth_failure_key_matches_the_receiver,
+               test_sequence_gaps_name_missing_spool_positions,
                test_status_document_is_never_modified,
                test_losing_the_state_file_does_not_disarm,
                test_marker_absent_means_never_deployed,

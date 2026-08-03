@@ -13,6 +13,7 @@ import shutil
 import sys
 import time
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, DayFiles, StoreError, CorruptionError,  # noqa: E402
@@ -1011,12 +1012,30 @@ def test_lock_budget_is_bounded_across_days():
         # version of this test proved nothing about the shared budget.
         keys = ['2026-07-29', '2026-07-30', '2026-07-31']
         held = []
+        released = []
+        releasers = []
         try:
             for k in keys:
                 DayFiles(t.logs, *[int(x) for x in k.split('-')]).ensure_dir()
                 lk = s._DayLock(t.state, k)
                 lk.__enter__()
                 held.append(lk)
+                released.append(threading.Event())
+
+            # Release the locks at 3, 6 and 12 seconds. A shared 10-second
+            # budget times out waiting for the third. Giving each day a fresh
+            # 10 seconds acquires all three at 12 seconds and therefore fails
+            # the timed_out assertion below.
+            def release_later(i, delay):
+                time.sleep(delay)
+                held[i].__exit__(None, None, None)
+                released[i].set()
+
+            for i, delay in enumerate((3, 6, 12)):
+                th = threading.Thread(target=release_later,
+                                      args=(i, delay), daemon=True)
+                th.start()
+                releasers.append(th)
 
             batch = [obs('2026-07-29T10:00:00+10:00', 1),
                      obs('2026-07-30T10:00:00+10:00', 2),
@@ -1028,14 +1047,15 @@ def test_lock_budget_is_bounded_across_days():
             except LockTimeout:
                 took, timed_out = time.time() - t0, True
             check(timed_out, 'the contended request gives up')
-            # Per-day timeouts would be 3 x LOCK_TIMEOUT_S here. One budget is
-            # LOCK_TIMEOUT_S total however many days are contended.
-            check(took < LOCK_TIMEOUT_S * 1.5,
-                  'ONE budget for three contended days (%.1fs; per-day would '
-                  'be ~%ds)' % (took, LOCK_TIMEOUT_S * 3))
+            check(LOCK_TIMEOUT_S * 0.8 < took < LOCK_TIMEOUT_S * 1.3,
+                  'ONE budget expires near %ds across staged contention '
+                  '(%.1fs)' % (LOCK_TIMEOUT_S, took))
         finally:
-            for lk in reversed(held):
-                lk.__exit__(None, None, None)
+            for th in releasers:
+                th.join(timeout=13)
+            for i, lk in enumerate(held):
+                if not released[i].is_set():
+                    lk.__exit__(None, None, None)
 
 
 def main():

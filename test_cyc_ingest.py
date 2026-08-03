@@ -515,7 +515,8 @@ def test_hmac_against_a_fixed_vector():
 
 def test_shadow_only_advances_on_a_real_ack():
     print('\n== the shadow poster advances only on a real acknowledgement ==')
-    from cyc_shadow_post import acknowledged
+    import cyc_shadow_post as shadow
+    acknowledged = shadow.acknowledged
     check(acknowledged(200, {'ok': True, 'accepted': 1, 'rejected': 0,
                              'ack_seq': 7}, 7), 'accepted and acknowledged')
     check(acknowledged(200, {'ok': True, 'accepted': 0, 'duplicates': 1,
@@ -529,6 +530,32 @@ def test_shadow_only_advances_on_a_real_ack():
     check(not acknowledged(200, {'ok': False, 'rejected': 0, 'ack_seq': 7}, 7),
           'ok:false is not an acknowledgement')
     check(not acknowledged(503, {}, 7), 'a 503 is not an acknowledgement')
+
+    check(shadow.resume_cursor(
+        409, {'server_cursor': 20, 'resume_seq': 21}) == 20,
+        'a structured too-old response supplies a validated resume cursor')
+    check(shadow.resume_cursor(
+        409, {'server_cursor': 20, 'resume_seq': 22}) is None,
+        'an inconsistent resume point is ignored')
+
+    old = (shadow.load_key, shadow.load_state, shadow.fetch_weather,
+           shadow.post, shadow.save_state)
+    saved = {}
+    try:
+        shadow.load_key = lambda *_: b'x' * 32
+        shadow.load_state = lambda *_: {'seq': 7}
+        shadow.fetch_weather = lambda: {
+            'sensors': [{'data': [{'ts': 1785456000}]}]}
+        shadow.post = lambda *_a, **_k: (
+            409, {'server_cursor': 20, 'resume_seq': 21})
+        shadow.save_state = lambda _path, state: saved.update(state)
+        shadow.main(['--keyfile', 'unused', '--state', 'unused', '--quiet'])
+    finally:
+        (shadow.load_key, shadow.load_state, shadow.fetch_weather,
+         shadow.post, shadow.save_state) = old
+    check(saved.get('seq') == 20 and 'last_obs_epoch' not in saved,
+          'the shadow advances only its transport cursor and retries the '
+          'observation under resume_seq')
 
 
 
@@ -833,9 +860,9 @@ def test_seq_gaps_are_counted_from_the_batch():
         check(body['ack_seq'] == 6, 'the batch is acknowledged to 6')
         st = json.load(open(h.status))
         # Deriving gaps from last_seq and the final ack counted 6 - 4 - 1 = 1
-        # lost observation even though the batch delivered 5 AND 6.
+        # missing position even though the batch delivered 5 AND 6.
         check(st['seq_gaps'] == 0,
-              'a contiguous batch reports no lost observations (got %s)'
+              'a contiguous batch reports no missing spool positions (got %s)'
               % st['seq_gaps'])
 
         # A real, declared loss IS counted.
@@ -845,7 +872,8 @@ def test_seq_gaps_are_counted_from_the_batch():
         check(body['ack_seq'] == 10, 'the declared jump is acknowledged')
         st = json.load(open(h.status))
         check(st['seq_gaps'] == 3,
-              'and the three dropped observations are recorded (got %s)'
+              'and the three declared missing spool positions are recorded '
+              '(got %s)'
               % st['seq_gaps'])
 
 
@@ -877,7 +905,7 @@ def test_busy_carries_retry_after():
         import cyc_store
         orig = cyc_store.Store.put
 
-        def busy(self, observations, cursor=None):
+        def busy(self, observations, cursor=None, verified_replays=None):
             raise cyc_store.LockTimeout('busy for the test')
         cyc_store.Store.put = busy
         try:
@@ -1005,6 +1033,15 @@ def test_malformed_data_loss_stores_nothing():
         d['data_loss'] = {'from': 9, 'to': 2}
         code, _ = h.post('/ingest/obs', d)
         check(code == 400, 'to < from rejected (got %s)' % code)
+
+        # A declared-lost position cannot also appear later in the request.
+        # Reject the out-of-order batch before storage rather than letting ACK
+        # processing count seq 2 as lost and then encounter seq 2 itself.
+        d = doc([obs('2026-07-31T10:02:03+10:00', 3),
+                 obs('2026-07-31T10:01:03+10:00', 2)])
+        d['data_loss'] = {'from': 1, 'to': 2}
+        code, _ = h.post('/ingest/obs', d)
+        check(code == 400, 'out-of-order data_loss batch is rejected')
 
         # Nothing may have been written on the way to any of those 400s.
         import cyc_store
@@ -1335,23 +1372,47 @@ def test_the_transport_cursor_model():
               'reusing an acknowledged sequence for other data is refused '
               '(got %s %s)' % (code, body.get('detail')))
 
-        # And a replay far below the window cannot be verified, so it is
-        # refused rather than guessed.
-        h.srv.ledgers[STATION].pop(1, None)
+        # Fill a REAL ledger window. This used to delete the live entry by
+        # hand, which could pass even if pruning never ran.
+        base = int(utc_key(parse_obs_ts('2026-07-31T10:00:00+10:00')))
+        fill = [obs(datetime.fromtimestamp(base + i, TZ).isoformat(
+                    timespec='seconds'), i + 4) for i in range(500)]
+        code, body = h.post('/ingest/obs', doc(fill))
+        check(code == 200 and body.get('ack_seq') == 503,
+              '500 advancing entries fill the retained ledger window')
+        check(len(h.srv.ledgers[STATION]) == cyc_ingest.LEDGER_KEEP
+              and 1 not in h.srv.ledgers[STATION],
+              'count-based pruning removes the genuinely oldest entry')
+
+        # A replay below that retained window cannot be verified, so it is
+        # refused rather than guessed, with an actionable structured cursor.
         code, body = h.post('/ingest/obs',
                             doc([obs('2026-07-31T08:00:00+10:00', 1)]))
         check(code == 409 and 'too old to verify' in (body.get('detail') or ''),
               'an unverifiable old sequence is refused with a resume point '
               '(got %s %s)' % (code, body.get('detail')))
+        check(body.get('server_cursor') == 503
+              and body.get('resume_seq') == 504,
+              'the resume point is machine-readable (%s, %s)'
+              % (body.get('server_cursor'), body.get('resume_seq')))
 
-        # The ledger is persisted alongside the cursor.
+        # The ledger is persisted alongside the cursor and seeded by the same
+        # construction path production uses after a restart.
         cur = json.load(open(os.path.join(h.state, STATION, 'cursor.json')))
         check(isinstance(cur.get('ledger'), dict) and cur['ledger'],
               'the ledger survives a restart (%s)' % list(cur.get('ledger', {}))[:4])
-        last, gaps, ledger = h.srv.load_cursor(STATION)
-        check(ledger.get(3) == int(utc_key(parse_obs_ts(
-            '2026-07-31T09:00:00+10:00'))),
-            'and reloads with the right instant for each sequence')
+        srv2 = Server(('127.0.0.1', 0), dict(h.srv.cfg), {
+            STATION: Store(h.logs, h.state, station=STATION)})
+        try:
+            check(srv2.last_ack(STATION) == 503,
+                  'a replacement Server seeds the persisted cursor')
+            expect = int(utc_key(parse_obs_ts(
+                datetime.fromtimestamp(base + 499, TZ).isoformat(
+                    timespec='seconds'))))
+            check(srv2.ledgers[STATION].get(503) == expect,
+                  'and seeds the persisted seq-to-instant mapping')
+        finally:
+            srv2.server_close()
 
 
 def test_busy_storage_is_not_reported_as_a_conflict():
@@ -1361,7 +1422,7 @@ def test_busy_storage_is_not_reported_as_a_conflict():
         import cyc_store
         real = cyc_store.Store.put
 
-        def busy(self, observations, cursor=None):
+        def busy(self, observations, cursor=None, verified_replays=None):
             raise cyc_store.LockTimeout('day lock held for the test')
         cyc_store.Store.put = busy
         try:
@@ -1384,6 +1445,7 @@ def test_ack_withheld_when_the_cursor_cannot_be_persisted():
     with Harness() as h:
         h.post('/ingest/obs', doc([obs('2026-07-31T10:00:03+10:00', 1)]))
         before = json.load(open(os.path.join(h.state, STATION, 'cursor.json')))
+        live_before = dict(h.srv.ledgers[STATION])
 
         real = h.srv.save_cursor
         h.srv.save_cursor = lambda *a, **k: False
@@ -1403,6 +1465,9 @@ def test_ack_withheld_when_the_cursor_cannot_be_persisted():
               % (before['last_ack'], after['last_ack']))
         check(h.srv.last_ack(STATION) == before['last_ack'],
               'and neither did the in-memory one, so they still agree')
+        check(h.srv.ledgers[STATION] == live_before,
+              'the live ledger is rolled back with the cursor; failed seq 2 '
+              'was not published in memory')
 
         # The observation IS durable, so the retry is a duplicate -- and now
         # that the cursor can be written, it is acknowledged.
@@ -1411,6 +1476,78 @@ def test_ack_withheld_when_the_cursor_cannot_be_persisted():
         check(code == 200 and body['ack_seq'] == 2,
               'the retry succeeds once the cursor can commit (got %s %s)'
               % (code, body.get('ack_seq')))
+
+
+def test_large_declared_loss_retry_retains_the_whole_request():
+    print('\n== a large declared loss cannot prune its own retry mappings ==')
+    with Harness() as h:
+        first = obs('2026-07-31T10:00:03+10:00', 5)
+        h.post('/ingest/obs', doc([first]))
+        jumped = obs('2026-07-31T10:01:03+10:00', 1000000)
+        request = doc([first, jumped])
+        request['data_loss'] = {'from': 6, 'to': 999999}
+
+        code, body = h.post('/ingest/obs', request)
+        check(code == 200 and body.get('ack_seq') == 1000000,
+              'the declared jump is acknowledged')
+        check(5 in h.srv.ledgers[STATION]
+              and 1000000 in h.srv.ledgers[STATION],
+              'both mappings from the just-acknowledged request survive '
+              'count-based pruning')
+
+        # Simulate a lost HTTP response by replaying the complete request.
+        code, body = h.post('/ingest/obs', request)
+        check(code == 200 and body.get('ack_seq') == 1000000
+              and body.get('duplicates') == 2,
+              'the whole request is re-acknowledged after a lost response '
+              '(got %s %s)' % (code, body.get('ack_seq')))
+        check(h.srv.snapshot()['seq_gaps'] == 999994,
+              'the declared missing positions are counted only once')
+
+
+def test_ledger_verified_replay_repairs_missing_storage():
+    print('\n== a verified replay repairs server-side durability loss ==')
+    with Harness() as h:
+        record = obs('2026-07-31T10:00:03+10:00', 1)
+        h.post('/ingest/obs', doc([record]))
+        for suffix in ('jsonl', 'csv'):
+            os.unlink(os.path.join(h.logs, '2026', '07', '31.' + suffix))
+        h.srv.stores[STATION]._index.clear()
+
+        code, body = h.post('/ingest/obs', doc([record]))
+        check(code == 200 and body.get('accepted') == 1
+              and body.get('ack_seq') == 1,
+              'the ledger-verified low sequence restores the missing row '
+              'instead of returning a client 409')
+        check(os.path.exists(os.path.join(
+            h.logs, '2026', '07', '31.jsonl')),
+            'the replay recreated durable storage')
+
+
+def test_persisted_ledger_validation_is_strict():
+    print('\n== malformed persisted ledger state fails closed ==')
+    with Harness() as h:
+        path = os.path.join(h.state, STATION, 'cursor.json')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cases = [
+            ('boolean instant', {'1': True}),
+            ('float instant', {'1': 1.0}),
+            ('numeric-string instant', {'1': '1'}),
+            ('negative instant', {'1': -1}),
+            ('non-canonical key', {'01': 1}),
+            ('negative key', {'-1': 1}),
+            ('key past last_ack', {'11': 1}),
+        ]
+        for label, ledger in cases:
+            with open(path, 'w') as f:
+                json.dump({'station': STATION, 'last_ack': 10,
+                           'seq_gaps': 0, 'ledger': ledger}, f)
+            raised = False
+            try:
+                h.srv.load_cursor(STATION)
+            except cyc_ingest.CursorError:
+                raised = True
+            check(raised, '%s is rejected' % label)
 
 
 def test_every_degraded_day_gets_a_turn():
@@ -1487,7 +1624,8 @@ def test_warm_loss_range_must_match_both_ends():
         check(body.get('ack_seq') == 10,
               'the exact range is accepted (got %s)' % body.get('ack_seq'))
         st = json.load(open(h.status))
-        check(st['seq_gaps'] == 4, 'and four lost records are recorded (%s)'
+        check(st['seq_gaps'] == 4,
+              'and four missing spool positions are recorded (%s)'
               % st['seq_gaps'])
 
 
@@ -1552,6 +1690,9 @@ def main():
     test_the_transport_cursor_model()
     test_busy_storage_is_not_reported_as_a_conflict()
     test_ack_withheld_when_the_cursor_cannot_be_persisted()
+    test_large_declared_loss_retry_retains_the_whole_request()
+    test_ledger_verified_replay_repairs_missing_storage()
+    test_persisted_ledger_validation_is_strict()
     test_every_degraded_day_gets_a_turn()
     test_warm_loss_range_must_match_both_ends()
     test_replay_needs_no_cursor_write()

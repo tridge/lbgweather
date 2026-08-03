@@ -173,6 +173,19 @@ def acknowledged(code, resp, seq):
             and resp.get('ack_seq') == seq)
 
 
+def resume_cursor(code, resp):
+    """Return a validated server cursor from a too-old replay response."""
+    if code != 409 or not isinstance(resp, dict):
+        return None
+    cursor = resp.get('server_cursor')
+    resume = resp.get('resume_seq')
+    if (not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0
+            or not isinstance(resume, int) or isinstance(resume, bool)
+            or resume != cursor + 1):
+        return None
+    return cursor
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--url', default=DEFAULT_URL)
@@ -222,6 +235,7 @@ def main(argv=None):
     }
 
     code, resp = post(args.url, key, args.station, doc)
+    requested_cursor = resume_cursor(code, resp)
     # A 200 is not an acknowledgement. The receiver reports per-record
     # outcomes in the body, and it can accept a request while refusing the
     # record inside it (pre-cutover, malformed, future-dated). Advancing the
@@ -238,6 +252,19 @@ def main(argv=None):
         if not args.quiet:
             print('shadow: %s accepted=%s duplicates=%s'
                   % (obs['obs_ts'], resp.get('accepted'), resp.get('duplicates')))
+    elif (requested_cursor is not None
+          and requested_cursor >= int(state.get('seq', 0))):
+        # The server no longer retains enough ledger to verify this old spool
+        # position. Advance only the transport cursor; leaving last_obs_epoch
+        # untouched makes the same observation retry under resume_seq.
+        cursor = requested_cursor
+        state['seq'] = cursor
+        state['last_error_epoch'] = int(time.time())
+        state['last_error'] = ('server requested resume from seq %s'
+                               % (cursor + 1))
+        save_state(args.state, state)
+        print('shadow: server cursor is %s; retrying observation as seq %s'
+              % (cursor, cursor + 1), file=sys.stderr)
     else:
         # Do NOT advance the cursor: the observation must be retried.
         print('shadow: not acknowledged: HTTP %s %s' % (code, resp),

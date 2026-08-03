@@ -160,7 +160,8 @@ def evaluate(status, now, warn_age=WARN_AGE_S, alarm_age=ALARM_AGE_S,
     gaps = status.get('seq_gaps')
     if isinstance(gaps, int) and gaps > SEQ_GAP_WARN:
         severity = 'alarm' if severity == 'alarm' else 'warn'
-        problems.append('%d observations lost in transit (sequence gaps)' % gaps)
+        problems.append('%d spool positions declared missing (sequence gaps)'
+                        % gaps)
 
     # Key name must track the receiver's. It was renamed on one side only
     # once, and authentication failures became invisible here.

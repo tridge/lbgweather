@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cyc_store import (Store, TZ, parse_obs_ts, utc_key,  # noqa: E402
                        StoreError, CorruptionError, LockTimeout, DURABLE,
-                       DUPLICATE, CONFLICT, _fsync_dir)
+                       DUPLICATE, RESTORED, CONFLICT, _fsync_dir)
 
 SCHEME = 'v1'
 MAX_BODY = 2 * 1024 * 1024
@@ -459,6 +459,7 @@ class Handler(BaseHTTPRequestHandler):
         # WITH a sequence then classifies as a duplicate and advances the
         # cursor -- a record admitted with no sequence at all being used to
         # move the cursor forward.
+        previous_seq = None
         for o in obs:
             if not isinstance(o, dict):
                 continue
@@ -471,6 +472,12 @@ class Handler(BaseHTTPRequestHandler):
                                  detail='every observation needs a '
                                         'non-negative integer seq; %r has %r'
                                         % (o.get('obs_ts'), sq))
+            if previous_seq is not None and sq <= previous_seq:
+                return self.fail(
+                    400, 'bad_schema',
+                    detail='observation seq %s does not increase after %s'
+                           % (sq, previous_seq))
+            previous_seq = sq
         if len(obs) > MAX_OBS:
             return self.fail(413, 'too_large')
 
@@ -489,13 +496,14 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.cursor_lock(station):
             cursor_now = self.server.last_ack(station)
             ledger = self.server.ledgers.setdefault(station, {})
+            verified_replays = set()
 
             # A sequence at or below the cursor is a replay, and a replay must
             # name the SAME instant it named when we acknowledged it. The
             # sequence is the collector's transport cursor, so several entries
             # may dedup onto one instant -- but one entry may not mean two
             # different observations. That is what a reset collector does.
-            for o in obs:
+            for i, o in enumerate(obs):
                 if not isinstance(o, dict):
                     continue
                 sq = o.get('seq')
@@ -512,17 +520,21 @@ class Handler(BaseHTTPRequestHandler):
                         detail='seq %s is at or below the acknowledged cursor '
                                '%s and is too old to verify; the collector '
                                'should resume from %s'
-                               % (sq, cursor_now, cursor_now + 1))
+                               % (sq, cursor_now, cursor_now + 1),
+                        server_cursor=cursor_now,
+                        resume_seq=cursor_now + 1)
                 if known != inst:
                     return self.fail(
                         409, 'seq_conflict',
                         detail='seq %s was acknowledged for a different '
                                'observation; this is a collector reset or a '
                                'second collector on this station' % sq)
+                verified_replays.add(i)
 
             try:
                 accepted, dup, rejected, details, disp = store.put(
-                    obs, cursor=cursor_now)
+                    obs, cursor=cursor_now,
+                    verified_replays=verified_replays)
             except LockTimeout as e:
                 # Busy is NOT a conflict. Conflating them turned transient
                 # contention into a 409 that reads as a permanent protocol
@@ -552,26 +564,13 @@ class Handler(BaseHTTPRequestHandler):
             if seq_problem:
                 details.append(seq_problem)
             if ack_seq is not None:
-                # Record what each newly acknowledged sequence referred to,
-                # then prune: only a recent window can be replayed, and an
-                # unbounded ledger would be rewritten on every request.
-                for o, d in zip(obs, disp):
-                    if d not in DURABLE or not isinstance(o, dict):
-                        continue
-                    sq = o.get('seq')
-                    if not is_int(sq) or sq > ack_seq:
-                        continue
-                    try:
-                        ledger[sq] = utc_key(parse_obs_ts(o.get('obs_ts')))
-                    except StoreError:
-                        pass
-                floor = ack_seq - LEDGER_KEEP
-                for k in [k for k in ledger if k < floor]:
-                    del ledger[k]
+                next_ledger = candidate_ledger(ledger, obs, disp, ack_seq)
+            else:
+                next_ledger = dict(ledger)
 
             committed = self.server.record(
                 station, accepted, dup, rejected, newest_utc, ack_seq,
-                collector or {}, gaps=gaps)
+                collector or {}, gaps=gaps, ledger=next_ledger)
 
         if not committed:
             # The observations ARE durable; only the cursor is not. Refusing
@@ -874,11 +873,22 @@ class Server(ThreadingHTTPServer):
                               % (self.cursor_path(station), gaps))
         clean = {}
         for k, v in (ledger or {}).items():
-            try:
-                clean[int(k)] = int(v)
-            except (TypeError, ValueError):
+            if not isinstance(k, str) or not k.isascii() or not k.isdigit():
                 raise CursorError('%s: ledger entry %r -> %r'
                                   % (self.cursor_path(station), k, v))
+            try:
+                sq = int(k)
+            except ValueError:
+                raise CursorError('%s: ledger entry %r -> %r'
+                                  % (self.cursor_path(station), k, v))
+            if str(sq) != k:
+                raise CursorError('%s: ledger entry %r -> %r'
+                                  % (self.cursor_path(station), k, v))
+            if (not is_int(v) or v < 0 or last is None or sq > last):
+                raise CursorError('%s: ledger entry %r -> %r is outside '
+                                  'last_ack %r'
+                                  % (self.cursor_path(station), k, v, last))
+            clean[sq] = v
         return (last if is_int(last) else None, gaps if is_int(gaps) else 0,
                 clean)
 
@@ -938,26 +948,28 @@ class Server(ThreadingHTTPServer):
             return st.last_seq
 
     def record(self, station, accepted, dup, rejected, newest_utc, seq,
-               collector, gaps=0):
+               collector, gaps=0, ledger=None):
         st = self.stats_by_station.get(station)
         if st is None:
             return False
-        if seq is not None or gaps:
-            # Persist BEFORE advancing in memory, so a failed write leaves the
-            # in-memory cursor and the on-disk cursor agreeing. Advancing
-            # first would leave them divergent until the next restart silently
-            # rewound us.
-            with st.lock:
-                new_last = seq if st.last_seq is None else max(seq,
-                                                               st.last_seq)
-                new_gaps = st.seq_gaps + gaps
-                changed = (new_last != st.last_seq or new_gaps != st.seq_gaps)
-            # A replay at or below the cursor changes nothing. Rewriting the
-            # file anyway meant a read-only state directory turned an
-            # acknowledgement that needed no write into a permanent 500.
-            if changed and not self.save_cursor(station, new_last, new_gaps,
-                                                self.ledgers.get(station)):
-                return False
+        live_ledger = self.ledgers.get(station, {})
+        next_ledger = live_ledger if ledger is None else ledger
+        # cursor_lock serialises this transaction, and st.lock protects the
+        # snapshot from status readers. Persist the complete candidate before
+        # publishing any part of it in memory.
+        with st.lock:
+            new_last = (st.last_seq if seq is None else seq if st.last_seq is None
+                        else max(seq, st.last_seq))
+            new_gaps = st.seq_gaps + gaps
+            changed = (new_last != st.last_seq or new_gaps != st.seq_gaps
+                       or next_ledger != live_ledger)
+        # A replay that changes nothing needs no cursor write, so read-only
+        # state does not prevent a lost-response duplicate being re-ACKed.
+        if changed and not self.save_cursor(station, new_last, new_gaps,
+                                            next_ledger):
+            return False
+        if changed:
+            self.ledgers[station] = next_ledger
         st.record(accepted, dup, rejected, newest_utc, seq, collector,
                   gaps=gaps)
         # Only the primary station owns the public status document.
@@ -1057,6 +1069,34 @@ def is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def candidate_ledger(current, obs, disp, ack_seq):
+    """Build the next ledger without mutating the committed live mapping."""
+    candidate = dict(current)
+    protected = set()
+    if ack_seq is not None:
+        for o, d in zip(obs, disp):
+            if d not in DURABLE or not isinstance(o, dict):
+                continue
+            sq = o.get('seq')
+            if not is_int(sq) or sq > ack_seq:
+                continue
+            try:
+                candidate[sq] = utc_key(parse_obs_ts(o.get('obs_ts')))
+            except StoreError:
+                continue
+            protected.add(sq)
+
+    # Retain by entry count, not numeric distance. A declared loss can jump the
+    # cursor by millions; every mapping in the just-committed request must
+    # remain available when its HTTP response is lost and the request retries.
+    keep = set(protected)
+    for sq in sorted(candidate, reverse=True):
+        if len(keep) >= LEDGER_KEEP:
+            break
+        keep.add(sq)
+    return {sq: candidate[sq] for sq in sorted(keep)}
+
+
 def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
                           loss_to=None):
     """Highest safely-acknowledgeable seq, the newest durable instant, gaps.
@@ -1079,8 +1119,8 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
 
     A collector that drops spool files must SAY SO, by declaring
     `data_loss: {from, to}`. That authorises exactly one jump over exactly that
-    range, and the skipped count is recorded as seq_gaps so the loss is in the
-    record rather than inferred from silence.
+    range, and the skipped count is recorded as seq_gaps: declared missing
+    spool positions, not a count of distinct observations.
 
     Durability is taken per input, never from a set of UTC instants: two inputs
     can share an instant, and a set cannot say which of them is on disk.
@@ -1156,7 +1196,7 @@ def ack_from_dispositions(obs, disp, last_ack=None, loss_from=None,
             # sequence conflict -- a collector reinstalled with a reset
             # counter, or a second collector on the same station. Ack it and
             # the reset is laundered and the numbering silently collides.
-            if d != DUPLICATE:
+            if d not in (DUPLICATE, RESTORED):
                 problem = problem or (
                     'seq %s is at or below the cursor %s but is newly stored: '
                     'a reset or a second collector' % (sq, cursor))

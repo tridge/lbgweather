@@ -61,10 +61,11 @@ MAX_DAYS_PER_REQUEST = 32
 # Per-input outcomes returned by put(). Strings so they survive JSON and read
 # clearly in logs.
 STORED = 'stored'
+RESTORED = 'restored'
 DUPLICATE = 'duplicate'
 REJECTED = 'rejected'
 CONFLICT = 'conflict'
-DURABLE = (STORED, DUPLICATE)
+DURABLE = (STORED, RESTORED, DUPLICATE)
 
 
 class StoreError(Exception):
@@ -739,7 +740,7 @@ class Store:
             pass
         self._index.pop(files.key, None)   # force reload with the new signature
 
-    def put(self, observations, cursor=None):
+    def put(self, observations, cursor=None, verified_replays=None):
         """Store observations. Returns (accepted, duplicates, rejected, details,
         dispositions).
 
@@ -750,17 +751,24 @@ class Store:
         detecting it after the write is useless, because the retry then looks
         like an ordinary duplicate.
 
+        `verified_replays` contains input indices whose old sequence is known
+        from the persisted ledger to name this instant. If such an instant is
+        missing, it is restored instead of blaming the collector for server-side
+        durability loss.
+
         `dispositions` has one entry per INPUT observation, in input order,
-        each STORED, DUPLICATE, CONFLICT or REJECTED. A UTC key set is not good enough:
-        two inputs can share an instant, and then a rejected one is
-        indistinguishable from the durable one that happens to occupy its
-        slot -- which let a caller acknowledge a record that was never stored.
+        each STORED, RESTORED, DUPLICATE, CONFLICT or REJECTED. A UTC key set
+        is not good enough: two inputs can share an instant, and then a
+        rejected one is indistinguishable from the durable one that happens
+        to occupy its slot -- which let a caller acknowledge a record that was
+        never stored.
 
         Idempotent: first write wins, so replay, retry-after-lost-ACK and
         overlapping backfill are no-ops. That also means an `archive` record (an
         interval average) can never overwrite a `loop` record.
         """
         by_day = {}
+        verified_replays = set(verified_replays or ())
         rejected = 0
         details = []
         now = datetime.now(TZ).timestamp()
@@ -869,6 +877,11 @@ class Store:
                         continue
                     if (cursor is not None and sq is not None
                             and sq <= cursor):
+                        if i in verified_replays:
+                            fresh_keys.add(rec['utc'])
+                            outcomes[i] = RESTORED
+                            fresh.append(rec)
+                            continue
                         # New data wearing a sequence number we have already
                         # acknowledged: a collector reinstalled with a reset
                         # counter, or a second collector on this station.
