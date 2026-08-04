@@ -33,6 +33,18 @@ MAX_AGE_S = 30 * 24 * 3600
 
 
 def _fsync_dir(path):
+    """Flush the directory entry so a rename survives a power cut.
+
+    Not possible on Windows: os.open() on a directory raises PermissionError,
+    and there is no portable equivalent. The collector runs on Windows, so this
+    is a real reduction in durability there -- an entry may exist in the cache
+    but not the directory across a hard power loss. It is acceptable because
+    the consequence is a LOST entry, never a corrupt or mis-sequenced one: the
+    sequence is the filename, so a directory entry either arrived whole or did
+    not arrive. A lost tail is re-collected; a mis-sequenced one would not be.
+    """
+    if os.name == 'nt':
+        return
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
