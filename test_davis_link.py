@@ -47,7 +47,43 @@ def test_wakeup():
     check('did not answer' in raised, 'a console that never answers raises')
     check('setup or numeric-entry screen' in raised,
           'and names the non-USB cause, which reads identically otherwise')
-    check(took < 8, 'bounded: gave up in %.1fs rather than blocking' % took)
+    # The number that matters is not "fast" but "well inside the watchdog's
+    # 120s staleness limit", so a wedged wakeup is still caught by a heartbeat
+    # gap rather than by this. The robust wakeup deliberately costs more: it
+    # settles and flushes between attempts.
+    check(took < 20,
+          'bounded: gave up in %.1fs, far inside the 120s staleness limit'
+          % took)
+
+
+def test_chatty_wakeup_does_not_shift_every_read():
+    print('\n== a console that answers a wakeup more than once ==')
+    # THE FAILURE FROM THE FIRST CAPTURE RUN. The console woke at 19200 and
+    # then every command returned b'\n' where its ACK belonged, because the
+    # surplus LF CR from the wakeup was still in the stream. The old simulator
+    # emitted exactly one LF CR -- the same assumption the link made -- so the
+    # tests agreed with the code and both were wrong about the hardware.
+    c = FakeConsole(fault=Fault(chatty_wakeup=True, wakeup_echo_extra=3))
+    link = Link(c)
+    check(link.wake() is True, 'the wakeup still succeeds')
+
+    stats = link.rx_check()
+    check(stats['total_received'] == 7311,
+          'and the NEXT command reads its own response, not leftover wakeup '
+          'bytes (%s)' % stats.get('total_received'))
+
+    packets = list(link.loop_packets(count=4))
+    check(len(packets) == 4,
+          'LOOP streaming works too, where a one-byte shift would corrupt '
+          'every packet (%d)' % len(packets))
+    check(link.crc_errors == 0,
+          'and nothing was mis-framed into a CRC error (%d)' % link.crc_errors)
+
+    c2 = FakeConsole(fault=Fault(chatty_wakeup=True, wakeup_echo_extra=8))
+    link2 = Link(c2)
+    link2.wake()
+    check(link2.eeprom(0x2D, 1)[0] == 30,
+          'even with a very chatty console, EEBRD reads its own value')
 
 
 def test_loop_stream():
@@ -239,7 +275,8 @@ def test_baud_candidates():
 
 
 def main():
-    for fn in [test_wakeup, test_loop_stream,
+    for fn in [test_wakeup, test_chatty_wakeup_does_not_shift_every_read,
+               test_loop_stream,
                test_corrupt_packets_are_skipped_not_fatal,
                test_silence_is_bounded, test_dropped_bytes,
                test_lps_refused_falls_back, test_eeprom_reads,

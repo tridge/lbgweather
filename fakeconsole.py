@@ -29,7 +29,8 @@ class Fault:
                  refuse_lps=False, sleep_before_reply=0.0,
                  declining_archive=False, wrong_resend_byte=False,
                  never_wake=False, garbage_prefix=b'',
-                 corrupt_resends=False):
+                 corrupt_resends=False, chatty_wakeup=False,
+                 wakeup_echo_extra=0):
         self.silent = silent
         self.drop_bytes = drop_bytes
         self.corrupt_crc_every = corrupt_crc_every
@@ -41,6 +42,13 @@ class Fault:
         self.garbage_prefix = garbage_prefix
         # A page that stays corrupt however often it is re-requested.
         self.corrupt_resends = corrupt_resends
+        # THE REAL CONSOLE'S BEHAVIOUR on the first capture run: it answers
+        # a wakeup with more than one LF CR, and the surplus shifts every
+        # later read by a byte so each command sees b'\n' instead of its
+        # ACK. The old simulator could not express this, which is why the
+        # bug survived every test and only appeared against hardware.
+        self.chatty_wakeup = chatty_wakeup
+        self.wakeup_echo_extra = wakeup_echo_extra
 
 
 class FakeConsole:
@@ -149,6 +157,9 @@ class FakeConsole:
                     continue
                 self.awake = True
                 self._emit(b'\n\r')
+                if self.fault.chatty_wakeup:
+                    # Surplus the host must discard before commanding.
+                    self._emit(b'\n\r' * max(1, self.fault.wakeup_echo_extra))
                 continue
             if b'\n' not in self.inbuf:
                 return

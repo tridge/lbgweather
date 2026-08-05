@@ -19,12 +19,18 @@ Two failure kinds are deliberately kept apart:
 
 import time
 
-from davis_protocol import (LOOP_SIZE, ARCHIVE_PAGE_SIZE, ACK, RESEND, CANCEL,
+from davis_protocol import (LOOP_SIZE, ARCHIVE_PAGE_SIZE, ACK, NAK, RESEND,
+                            CANCEL,
                             append_crc, crc_ok, decode_loop, decode_gettime,
                             decode_archive_page, encode_archive_stamp)
 
 WAKE_ATTEMPTS = 3
 WAKE_TIMEOUT_S = 1.2
+# Time for the console to answer the throwaway line feeds before we flush
+# them. Too short and their replies arrive after the flush, which is the
+# original bug.
+WAKE_SETTLE_S = 0.5
+WAKE_RETRY_S = 1.2
 CMD_TIMEOUT_S = 3.0
 PACKET_TIMEOUT_S = 5.0
 # The ~220 LOOP limit is undocumented -- weewx says "somewhere around 220" and
@@ -85,34 +91,78 @@ class Link:
         except Exception:
             pass
 
+    def _drain_output(self):
+        try:
+            self.port.reset_output_buffer()
+        except Exception:
+            pass
+
     # -------------------------------------------------------------- wakeup
 
     def wake(self):
-        """The console sleeps after ~2 minutes idle. A bare LF wakes it and it
-        answers LF CR."""
-        for attempt in range(WAKE_ATTEMPTS):
-            self._drain()
-            self.port.write(b'\n')
+        """Wake the console and leave the input stream EMPTY.
+
+        The obvious implementation -- send one LF, read the two-byte reply --
+        is wrong, and wrong in a way a simulator cannot show. A real console
+        that is asleep, or midway through a LOOP stream, answers with more than
+        one LF CR, and whatever is left over shifts every subsequent read by a
+        byte. The symptom is every command returning b'\n' where its ACK should
+        be, which is exactly what the console did on the first capture run.
+
+        So: send several line feeds, wait, discard ALL of it, then send one and
+        read the acknowledgement. The first three exist to be thrown away.
+        This is what weewx does, and its reason for doing it is the bug above.
+        """
+        for _attempt in range(WAKE_ATTEMPTS):
             try:
+                self._drain_output()
+                self._drain()
+                self.port.write(b'\n\n\n')
+                time.sleep(WAKE_SETTLE_S)
+                self._drain()               # discard the replies to those three
+                self.port.write(b'\n')
                 resp = self._read_exact(2, WAKE_TIMEOUT_S)
             except LinkError:
+                time.sleep(WAKE_RETRY_S)
                 continue
             if resp == b'\n\r':
                 self.wakeups += 1
                 return True
-            # Something else is in the stream; flush and try again.
+            time.sleep(WAKE_RETRY_S)
         raise NotAwake('console did not answer %d wakeups. If it is sitting in '
                        'a setup or numeric-entry screen it ignores serial '
                        'commands -- that is not a USB fault'
                        % WAKE_ATTEMPTS)
 
+    def _read_ack(self, what, timeout=CMD_TIMEOUT_S):
+        """Find the ACK, skipping framing bytes.
+
+        A flush cannot be relied on to leave the stream empty: the console's
+        replies to the throwaway wakeups can arrive after it, and then the
+        first byte read is a stale LF rather than the ACK. Scanning past LF and
+        CR is robust to any amount of that residue, where a timing-based flush
+        is only robust to the amount that happened to arrive in time.
+
+        A NAK is returned rather than skipped -- it is a real answer, and the
+        LOOP2 fallback depends on telling it apart from silence.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            b = self._read_exact(1, max(0.05, deadline - time.monotonic()))
+            if b in (b'\n', b'\r'):
+                continue                  # leftover framing; keep looking
+            if b == ACK:
+                return b
+            if b == NAK:
+                raise BadResponse('%s: console sent NAK' % what)
+            raise BadResponse('%s: expected ACK, got %r' % (what, b))
+        raise LinkError('%s: no ACK within %.1fs' % (what, timeout))
+
     def command(self, text, expect_ack=True, timeout=CMD_TIMEOUT_S):
         self.port.write(text.encode('ascii') + b'\n')
         if not expect_ack:
             return
-        resp = self._read_exact(1, timeout)
-        if resp != ACK:
-            raise BadResponse('%s: expected ACK, got %r' % (text, resp))
+        self._read_ack(text, timeout)
 
     # ---------------------------------------------------------------- loop
 

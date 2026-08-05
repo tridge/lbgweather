@@ -67,7 +67,7 @@ class Rig:
     def url(self):
         return 'http://127.0.0.1:%d/ingest/obs' % self.port
 
-    def collect(self, seconds=1.5, period=0.05, extra=None):
+    def collect(self, seconds=4.0, period=0.05, extra=None):
         cmd = [sys.executable, os.path.join(HERE, 'collect.py'), '--sim',
                '--spool', self.spooldir,
                '--heartbeat', os.path.join(self.d, 'hb.json'),
@@ -93,7 +93,7 @@ class Rig:
 def test_end_to_end():
     print('\n== console -> spool -> receiver ==')
     with Rig() as r:
-        run = r.collect(seconds=2.5)
+        run = r.collect(seconds=4.0)
         check(run.returncode == 0, 'the collector exited cleanly (%s)'
               % run.returncode)
         pend = Spool(r.spooldir).pending()
@@ -125,7 +125,7 @@ def test_end_to_end():
 def test_heartbeat_is_written():
     print('\n== the heartbeat the watchdog reads ==')
     with Rig() as r:
-        r.collect(seconds=1.2)
+        r.collect(seconds=2.5)
         hb = json.load(open(os.path.join(r.d, 'hb.json')))
         check(hb.get('state') == 'stopped', 'final state recorded (%s)'
               % hb.get('state'))
@@ -139,7 +139,7 @@ def test_heartbeat_is_written():
 def test_shipper_stops_at_the_first_failure():
     print('\n== shipping stops rather than skipping ahead ==')
     with Rig() as r:
-        r.collect(seconds=2.5)
+        r.collect(seconds=4.0)
         pend = Spool(r.spooldir).pending()
         check(len(pend) >= 3, 'several entries queued (%d)' % len(pend))
 
@@ -161,7 +161,7 @@ def test_shipper_stops_at_the_first_failure():
 def test_declared_loss_is_sent_and_cleared():
     print('\n== a pruned spool declares its loss to the receiver ==')
     with Rig() as r:
-        r.collect(seconds=2.5)
+        r.collect(seconds=4.0)
         s = Spool(r.spooldir)
         pend = s.pending()
         check(len(pend) >= 3, 'entries queued (%d)' % len(pend))
@@ -187,7 +187,7 @@ def test_declared_loss_is_sent_and_cleared():
 def test_resume_when_the_spool_is_behind_the_cursor():
     print('\n== an entry older than the receiver can verify ==')
     with Rig() as r:
-        r.collect(seconds=2.0)
+        r.collect(seconds=4.0)
         r.ship()
         cursor = r.srv.last_ack(STATION)
         check(cursor > 0, 'the receiver has a cursor (%s)' % cursor)
