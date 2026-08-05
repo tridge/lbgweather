@@ -43,9 +43,48 @@ DISK_STOP_MB = 200
 BACKOFF = (2, 5, 15, 30, 60, 120)
 
 
+def _stderr(line):
+    """pythonw.exe has no console: sys.stderr is None, and writing to it raises
+    AttributeError. The scheduled tasks all run under pythonw, so an unguarded
+    write here would kill the process on its first log line."""
+    if sys.stderr is None:
+        return
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+_LOGGER = None
+
+
 def log(msg):
-    sys.stderr.write('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
-    sys.stderr.flush()
+    if _LOGGER is not None:
+        _LOGGER.info(msg)
+        return
+    _stderr('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
+
+def setup_log(path, quiet=False):
+    """Bounded logging. 1 MB x 4 keeps the worst case at 5 MB on a machine
+    that has run out of disk before."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+    logger = logging.getLogger(os.path.basename(path))
+    logger.setLevel(logging.INFO)
+    if path:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            h = RotatingFileHandler(path, maxBytes=1024 * 1024, backupCount=4)
+            h.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+            logger.addHandler(h)
+        except OSError as e:
+            sys.stderr.write('cannot open log %s: %s\n' % (path, e))
+    if not quiet and sys.stderr is not None:
+        s = logging.StreamHandler(sys.stderr)
+        s.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+        logger.addHandler(s)
+    return logger
 
 
 class Heartbeat:
@@ -357,7 +396,15 @@ def main(argv=None):
     p.add_argument('--sim', action='store_true',
                    help='drive the console simulator instead of a port')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--quiet', action='store_true',
+                   help='log to the file only, not to stderr')
+    p.add_argument('--log', default='C:\\cycwx\\log\\collect.log')
     args = p.parse_args(argv)
+
+    global _LOGGER
+    if args.log:
+        _LOGGER = setup_log(args.log,
+                            quiet=getattr(args, 'quiet', False))
 
     c = Collector(args)
     try:

@@ -29,10 +29,37 @@ KILL_GRACE_S = 5
 ACTIVE_STATES = ('ok', 'down', 'resync', 'clock_jump', 'disk_full')
 
 
+def _stderr(line):
+    """pythonw.exe has no console: sys.stderr is None, and writing to it raises
+    AttributeError. The scheduled tasks all run under pythonw, so an unguarded
+    write here would kill the process on its first log line."""
+    if sys.stderr is None:
+        return
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+_LOGFILE = None
+
+
 def log(msg):
-    sys.stderr.write('%s watchdog: %s\n'
-                     % (time.strftime('%Y-%m-%d %H:%M:%S'), msg))
-    sys.stderr.flush()
+    """Also to a file, because the scheduled task runs under pythonw as
+    SYSTEM: stderr goes nowhere, and a watchdog that kills the collector
+    without leaving a trace is worse than one that does not run."""
+    line = '%s watchdog: %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
+    _stderr(line)
+    if _LOGFILE:
+        try:
+            os.makedirs(os.path.dirname(_LOGFILE), exist_ok=True)
+            if os.path.exists(_LOGFILE) and os.path.getsize(_LOGFILE) > 512000:
+                os.replace(_LOGFILE, _LOGFILE + '.1')
+            with open(_LOGFILE, 'a') as f:
+                f.write(line)
+        except OSError:
+            pass
 
 
 def read_heartbeat(path):
@@ -110,7 +137,11 @@ def main(argv=None):
                    help='scheduled task to start after a kill')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--quiet', action='store_true')
+    p.add_argument('--log', default=r'C:\cycwx\log\watchdog.log')
     args = p.parse_args(argv)
+
+    global _LOGFILE
+    _LOGFILE = args.log
 
     doc, err = read_heartbeat(args.heartbeat)
     action, reason = evaluate(doc, err, time.time(), args.stale)
