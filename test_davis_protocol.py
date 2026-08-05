@@ -65,7 +65,7 @@ def build_loop2(**kw):
     struct.pack_into('<H', b, 16, kw.get('wind_dir', 245))
     struct.pack_into('<H', b, 18, kw.get('avg10', 130))     # 0.1 mph
     struct.pack_into('<H', b, 20, kw.get('avg2', 120))
-    struct.pack_into('<H', b, 22, kw.get('gust10', 190))
+    struct.pack_into('<H', b, 22, kw.get('gust10', 19))   # WHOLE mph
     struct.pack_into('<H', b, 24, kw.get('gust_dir', 250))
     struct.pack_into('<h', b, 30, kw.get('dew', 39))
     b[33] = kw.get('hum_out', 49)
@@ -156,15 +156,18 @@ def test_loop1():
 
 def test_loop2_is_the_csv_source():
     print('\n== LOOP2 offsets 18 and 22 are what the CSV columns mean ==')
-    p = build_loop2(avg10=130, gust10=190, avg2=120)
+    p = build_loop2(avg10=130, gust10=19, avg2=120)
     d = decode_loop2(p)
     check(d['kind'] == 'loop2', 'type 1 decodes as LOOP2')
     check(d['wind_avg_10min_mph'] == 13.0,
           'offset 18 is the 10-min average in 0.1 mph (%s)'
           % d['wind_avg_10min_mph'])
-    check(d['wind_gust_10min_mph'] == 19.0,
-          'offset 22 is the 10-min GUST in 0.1 mph (%s)'
+    check(d['wind_gust_10min_mph'] == 19,
+          'offset 22 is the 10-min GUST in WHOLE mph (%s)'
           % d['wind_gust_10min_mph'])
+    check(d['wind_gust_10min_mph'] > d['wind_avg_10min_mph'],
+          'and a gust above its own average, which is what caught the '
+          'tenths misreading on the real console')
     check(d['wind_avg_2min_mph'] == 12.0,
           'offset 20 is the 2-min average, which is NOT what the CSV means')
     check(d['dew_point_f'] == 39 and d['wind_chill_f'] == 53,
@@ -175,7 +178,7 @@ def test_loop2_is_the_csv_source():
     obs = observation_from_loop(None, d)
     check(obs['wind_avg_kt'] == mph_to_kt(13.0),
           'wind_avg_kt comes from offset 18')
-    check(obs['wind_gust_kt'] == mph_to_kt(19.0),
+    check(obs['wind_gust_kt'] == mph_to_kt(19),
           'wind_gust_kt comes from offset 22')
     check(obs['wind_kt'] == mph_to_kt(5), 'wind_kt is the instantaneous speed')
 

@@ -66,20 +66,35 @@ class Link:
         # LPS/LOOP question is settled, so callers can wait for the richer
         # packet instead of emitting a half-populated observation.
         self.loop2_available = None
+        self._timeout = None
 
     # ----------------------------------------------------------------- io
+
+    def _set_timeout(self, value):
+        """Change the port timeout only when it actually changes.
+
+        Assigning serial.Serial.timeout RECONFIGURES the port, and on the
+        PL2303 fitted here that discards whatever is already in the receive
+        buffer. Setting it on every read iteration therefore ate the ACK that
+        arrives immediately after a command: slow text replies survived,
+        because they landed after the last reconfiguration, while every
+        ACK-first command timed out with nothing at all. That one line made a
+        healthy console look like a dead one.
+        """
+        if self._timeout != value:
+            self.port.timeout = value
+            self._timeout = value
 
     def _read_exact(self, n, timeout):
         """Read n bytes or raise. Never blocks past `timeout` in total."""
         deadline = time.monotonic() + timeout
+        self._set_timeout(min(timeout, 0.5))
         buf = bytearray()
         while len(buf) < n:
-            left = deadline - time.monotonic()
-            if left <= 0:
+            if time.monotonic() >= deadline:
                 self.timeouts += 1
                 raise LinkError('timed out after %d of %d bytes'
                                 % (len(buf), n))
-            self.port.timeout = min(left, 0.5)
             chunk = self.port.read(n - len(buf))
             if chunk:
                 buf.extend(chunk)
@@ -226,8 +241,16 @@ class Link:
         return self.eeprom(0x2D, 1)[0]
 
     def rain_bucket_type(self):
-        """EEPROM 0x2B, low nibble: 0 = 0.01in, 1 = 0.2mm, 2 = 0.1mm."""
-        return self.eeprom(0x2B, 1)[0] & 0x0F
+        """EEPROM 0x2B SETUP_BITS, bits 4-5: 0 = 0.01in, 1 = 0.2mm, 2 = 0.1mm.
+
+        The low nibble holds other setup flags entirely; reading it as the
+        bucket type returned 13, which is not a bucket at all.
+        """
+        return (self.eeprom(0x2B, 1)[0] >> 4) & 0x03
+
+    def setup_bits(self):
+        """The whole 0x2B byte, for diagnosis."""
+        return self.eeprom(0x2B, 1)[0]
 
     def rx_check(self):
         """Radio statistics. Reported alongside, never mixed with, the serial
@@ -237,7 +260,7 @@ class Link:
         deadline = time.monotonic() + CMD_TIMEOUT_S
         buf = bytearray()
         while time.monotonic() < deadline and b'\n\r' not in bytes(buf[4:]):
-            self.port.timeout = 0.3
+            self._set_timeout(0.3)
             chunk = self.port.read(64)
             if chunk:
                 buf.extend(chunk)

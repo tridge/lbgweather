@@ -104,9 +104,10 @@ def probe(args):
             try:
                 v = link.eeprom(addr, 1)[0]
                 if name == 'rain_bucket_code':
-                    v &= 0x0F
-                    out('RAIN BUCKET: code %d (%s)'
-                        % (v, BUCKET.get(v, 'unknown')))
+                    raw = v
+                    v = (v >> 4) & 0x03
+                    out('RAIN BUCKET: code %d (%s)   [0x2B raw = 0x%02X]'
+                        % (v, BUCKET.get(v, 'unknown'), raw))
                 else:
                     out('ARCHIVE INTERVAL: %d minutes' % v)
                     out('  This sets the DMPAFT cadence and the backfill '

@@ -181,9 +181,14 @@ def decode_loop2(buf):
         'wind_mph': _u8(buf, 14),
         'wind_dir': _wind_dir(_u16(buf, 16)),
         # THE two fields the CSV's wind_avg_kt and wind_gust_kt columns mean.
+        # The averages are 0.1 mph; the GUST is whole mph. The spec reads as
+        # though offset 22 were tenths too, and decoding it that way produced a
+        # 10-minute gust of 2.6 mph beneath a 10-minute average of 17.4 -- which
+        # is impossible, and is how the real unit was caught. Offset 24 is the
+        # gust's DIRECTION, not another speed.
         'wind_avg_10min_mph': _tenths(_u16(buf, 18)),
         'wind_avg_2min_mph': _tenths(_u16(buf, 20)),
-        'wind_gust_10min_mph': _tenths(_u16(buf, 22)),
+        'wind_gust_10min_mph': _u16(buf, 22),
         'wind_gust_10min_dir': _wind_dir(_u16(buf, 24)),
         'dew_point_f': _s16_plain(buf, 30),
         'hum_out': _u8(buf, 33),

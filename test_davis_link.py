@@ -104,7 +104,7 @@ def test_loop_stream():
     obs = observation_from_loop(l1, l2)
     check(obs['wind_avg_kt'] == mph_to_kt(13.0),
           'the merged observation takes its 10-min average from LOOP2')
-    check(obs['wind_gust_kt'] == mph_to_kt(19.0),
+    check(obs['wind_gust_kt'] == mph_to_kt(19),
           'and its 10-min gust from LOOP2 offset 22')
 
 
@@ -172,13 +172,18 @@ def test_lps_refused_falls_back():
 
 def test_eeprom_reads():
     print('\n== EEPROM: archive interval and rain bucket ==')
-    c = FakeConsole(eeprom={0x2B: 0x01, 0x2D: 10})
+    # 0x9D is the REAL byte read from the station: bits 4-5 give bucket code
+    # 1 (0.2 mm), matching the documented collector. The low nibble is 0xD,
+    # which is not a bucket type at all -- reading it that way reported 13.
+    c = FakeConsole(eeprom={0x2B: 0x9D, 0x2D: 30})
     link = Link(c)
-    check(link.archive_interval_minutes() == 10,
-          'archive interval from 0x2D -- this sets the DMPAFT cadence and the '
-          'backfill horizon')
+    check(link.archive_interval_minutes() == 30,
+          'archive interval from 0x2D -- 30 minutes on this station, which '
+          'makes 2560 records 53 days of backfill')
     check(link.rain_bucket_type() == 1,
-          'rain bucket type from 0x2B low nibble (1 = 0.2mm, as installed)')
+          'rain bucket is bits 4-5 of 0x2B: code 1 = 0.2 mm (%s)'
+          % link.rain_bucket_type())
+    check(link.setup_bits() == 0x9D, 'and the whole byte is available to look at')
 
 
 def test_rxcheck_is_radio_not_serial():

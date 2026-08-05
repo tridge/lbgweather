@@ -239,7 +239,7 @@ class FakeConsole:
         else:
             struct.pack_into('<H', b, 18, v.get('avg10_tenths', 130))
             struct.pack_into('<H', b, 20, v.get('avg2_tenths', 120))
-            struct.pack_into('<H', b, 22, v.get('gust10_tenths', 190))
+            struct.pack_into('<H', b, 22, v.get('gust10_mph', 19))
             struct.pack_into('<H', b, 24, v.get('gust_dir', 250))
             struct.pack_into('<h', b, 30, v.get('dew', 39))
             struct.pack_into('<h', b, 35, v.get('heat', 56))
