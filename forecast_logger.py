@@ -13,6 +13,7 @@ import requests
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -259,6 +260,19 @@ def log_forecast(model_name, forecast_data):
     return True
 
 
+def write_json_atomic(path, obj):
+    """Write via a unique temp file so concurrent writers can't corrupt it."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(obj, f, separators=(',', ':'))
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
 def read_archive_lines(model_name, date):
     path = get_archive_path(model_name, datetime.combine(date, datetime.min.time()))
     if not os.path.exists(path):
@@ -300,11 +314,8 @@ def write_day_summary(date, fresh=None):
         return
     path = os.path.join(ARCHIVE_DIR, date.strftime('%Y'), date.strftime('%m'),
                         date.strftime('%d') + '.json')
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump({'updated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                   'models': models}, f, separators=(',', ':'))
-    os.replace(tmp, path)
+    write_json_atomic(path, {'updated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                             'models': models})
 
 
 def backfill_summaries():
@@ -366,10 +377,7 @@ def main():
         daily = resp.json()
         if daily.get('data'):
             os.makedirs(LATEST_DIR, exist_ok=True)
-            path = os.path.join(LATEST_DIR, 'bom_daily.json')
-            with open(path + '.tmp', 'w') as f:
-                json.dump(daily, f, separators=(',', ':'))
-            os.replace(path + '.tmp', path)
+            write_json_atomic(os.path.join(LATEST_DIR, 'bom_daily.json'), daily)
             print(f"  BOM daily: {len(daily['data'])} days")
     except Exception as e:
         print(f"  BOM daily error: {e}")
