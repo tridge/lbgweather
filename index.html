@@ -6,6 +6,27 @@
     <title>Lake Burley Griffin Wind</title>
     <link rel="icon" href="favicon.ico" sizes="any">
     <link rel="icon" href="favicon.png" type="image/png">
+    <script>
+        // Start today's data fetches before the chart library loads
+        (function() {
+            var d = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
+            var p = d.replace(/-/g, '/');
+            window._early = { date: d, fetches: {
+                csv: fetch('wind_logs/' + p + '.csv'),
+                summary: fetch('forecasts/archive/' + p + '.json')
+            }};
+        })();
+        // Return the early fetch for dateStr if there is one, otherwise fetch url
+        function earlyFetch(dateStr, key, url) {
+            var e = window._early;
+            if (e && e.date === dateStr && e.fetches[key]) {
+                var f = e.fetches[key];
+                delete e.fetches[key];
+                return f;
+            }
+            return fetch(url);
+        }
+    </script>
     <script src="js/chart.js"></script>
     <script src="js/chartjs-adapter-date-fns.js"></script>
     <script>
@@ -686,19 +707,15 @@
     <script>
         const isCompact = () => window.innerWidth <= 600;
         const BASE_URL = 'wind_logs';
-        const BOM_HOURLY_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly';
-        const OPEN_METEO_API = 'https://api.open-meteo.com/v1/forecast';
-        const CANBERRA_LAT = -35.29;
-        const CANBERRA_LON = 149.10;
 
         // Model configuration
         const MODELS = {
-            ecmwf: { name: 'ECMWF', color: '#0066cc', gustColor: '#004d99', omKey: 'ecmwf_ifs025' },
+            ecmwf: { name: 'ECMWF', color: '#0066cc', gustColor: '#004d99' },
             bom: { name: 'BOM', color: '#9b59b6', gustColor: '#8e44ad' },
-            gfs: { name: 'GFS', color: '#27ae60', gustColor: '#1e8449', omKey: 'gfs_seamless' },
-            icon: { name: 'ICON', color: '#e67e22', gustColor: '#d35400', omKey: 'icon_seamless' },
-            gem: { name: 'GEM', color: '#17a2b8', gustColor: '#117a8b', omKey: 'gem_seamless' },
-            jma: { name: 'JMA', color: '#e91e63', gustColor: '#c2185b', omKey: 'jma_seamless' }
+            gfs: { name: 'GFS', color: '#27ae60', gustColor: '#1e8449' },
+            icon: { name: 'ICON', color: '#e67e22', gustColor: '#d35400' },
+            gem: { name: 'GEM', color: '#17a2b8', gustColor: '#117a8b' },
+            jma: { name: 'JMA', color: '#e91e63', gustColor: '#c2185b' }
         };
 
         let windChart, directionChart, windRoseChart, tempChart;
@@ -750,7 +767,7 @@
             const [year, month, day] = dateStr.split('-');
             const url = `${BASE_URL}/${year}/${month}/${day}.csv`;
 
-            const response = await fetch(url);
+            const response = await earlyFetch(dateStr, 'csv', url);
             if (!response.ok) {
                 throw new Error(`No data available for ${dateStr}`);
             }
@@ -910,28 +927,6 @@
             }
         }
 
-        async function fetchBomForecast() {
-            try {
-                const response = await fetch(BOM_HOURLY_API);
-                if (!response.ok) return [];
-
-                const data = await response.json();
-                return data.data.map(h => ({
-                    time: new Date(h.time),
-                    wind_kt: h.wind?.speed_knot ?? null,
-                    gust_kt: h.wind?.gust_speed_knot ?? null,
-                    wind_dir: compassToDeg(h.wind?.direction),
-                    temp: h.temp ?? null,
-                    icon: h.icon_descriptor ?? null,
-                    is_night: h.is_night ?? false,
-                    rain_chance: h.rain?.chance ?? null,
-                }));
-            } catch (e) {
-                console.error('Failed to fetch BOM forecast:', e);
-                return [];
-            }
-        }
-
         function isPastDate(dateStr) {
             // Check if dateStr is before today (in Canberra timezone)
             const today = getTodayCanberra();
@@ -951,11 +946,49 @@
             return formatDate(date);
         }
 
+        function mapArchivedPoints(forecasts) {
+            return forecasts.map(f => ({
+                time: new Date(f.valid_time),
+                wind_kt: f.wind_kt,
+                gust_kt: f.gust_kt,
+                wind_dir: f.wind_dir,
+                temp: f.temp ?? null,
+                icon: f.icon ?? null,
+                is_night: f.is_night ?? false,
+                rain_chance: f.rain_chance ?? null,
+            })).filter(f => f.wind_kt !== null);
+        }
+
+        // Per-day summary (one forecast per model) written hourly by forecast_logger.py
+        const _summaryCache = {};
+        async function fetchDaySummary(dateStr) {
+            if (_summaryCache[dateStr]) return _summaryCache[dateStr];
+            const [year, month, day] = dateStr.split('-');
+            try {
+                const response = await earlyFetch(dateStr, 'summary',
+                    `forecasts/archive/${year}/${month}/${day}.json`);
+                if (!response.ok) return null;
+                const data = await response.json();
+                const results = {};
+                for (const [model, points] of Object.entries(data.models || {})) {
+                    const mapped = mapArchivedPoints(points);
+                    if (mapped.length > 0) results[model] = mapped;
+                }
+                // cache past days only; today and future are updated hourly
+                if (isPastDate(dateStr)) _summaryCache[dateStr] = results;
+                return results;
+            } catch (e) {
+                return null;
+            }
+        }
+
         async function fetchArchivedForecasts(dateStr) {
-            // Fetch archived forecasts from JSONL files for a past or future date
+            const summary = await fetchDaySummary(dateStr);
+            if (summary && Object.keys(summary).length > 0) return summary;
+
+            // Fall back to per-model JSONL files
             const [year, month, day] = dateStr.split('-');
             const results = {};
-            const isPast = isPastDate(dateStr);
 
             const models = ['ecmwf', 'bom', 'gfs', 'icon', 'gem', 'jma'];
             const fetchPromises = models.map(async (model) => {
@@ -1010,126 +1043,6 @@
             return results;
         }
 
-        async function fetchOpenMeteoForecasts(models) {
-            if (models.length === 0) return {};
-
-            const omModels = models
-                .filter(m => MODELS[m]?.omKey)
-                .map(m => MODELS[m].omKey);
-
-            if (omModels.length === 0) return {};
-
-            try {
-                const params = new URLSearchParams({
-                    latitude: CANBERRA_LAT,
-                    longitude: CANBERRA_LON,
-                    hourly: 'wind_speed_10m,wind_gusts_10m,wind_direction_10m',
-                    models: omModels.join(','),
-                    timezone: 'Australia/Sydney',
-                    forecast_days: 3
-                });
-
-                const response = await fetch(`${OPEN_METEO_API}?${params}`);
-                if (!response.ok) return {};
-
-                const data = await response.json();
-                const hourly = data.hourly || {};
-                const times = hourly.time || [];
-
-                const results = {};
-                const singleModel = omModels.length === 1;
-
-                models.forEach(model => {
-                    const omKey = MODELS[model]?.omKey;
-                    if (!omKey) return;
-
-                    // Single model: keys are "wind_speed_10m"
-                    // Multiple models: keys are "wind_speed_10m_gfs_seamless"
-                    const suffix = singleModel ? '' : `_${omKey}`;
-                    const winds = hourly[`wind_speed_10m${suffix}`] || [];
-                    const gusts = hourly[`wind_gusts_10m${suffix}`] || [];
-                    const dirs = hourly[`wind_direction_10m${suffix}`] || [];
-
-                    if (winds.length > 0) {
-                        results[model] = times.map((t, i) => ({
-                            time: new Date(t),
-                            wind_kt: kmhToKnots(winds[i]),
-                            gust_kt: kmhToKnots(gusts[i]),
-                            wind_dir: dirs[i] ?? null
-                        })).filter(f => f.wind_kt !== null);
-                    }
-                });
-
-                return results;
-            } catch (e) {
-                console.error('Failed to fetch Open-Meteo forecasts:', e);
-                return {};
-            }
-        }
-
-        async function fetchAllForecasts(dateStr) {
-            if (!dateStr) {
-                dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
-            }
-            const selected = getSelectedModels();
-            const results = {};
-
-            // Fetch BOM if selected - prefer archived (covers full day) over live (current hour onwards)
-            if (selected.includes('bom')) {
-                const archivedBom = await fetchArchivedBom(dateStr);
-                results.bom = archivedBom.length > 0 ? archivedBom : await fetchBomForecast();
-            }
-
-            // Fetch Open-Meteo models (live API covers from midnight)
-            const omModels = selected.filter(m => m !== 'bom');
-            if (omModels.length > 0) {
-                const omResults = await fetchOpenMeteoForecasts(omModels);
-                Object.assign(results, omResults);
-            }
-
-            return results;
-        }
-
-        async function fetchArchivedBom(dateStr) {
-            // Fetch archived BOM forecast for a specific date
-            const [year, month, day] = dateStr.split('-');
-            const url = `forecasts/archive/${year}/${month}/${day}_bom.jsonl`;
-            try {
-                const response = await fetch(url);
-                if (!response.ok) return [];
-
-                const text = await response.text();
-                const lines = text.trim().split('\n').filter(l => l);
-                if (lines.length === 0) return [];
-
-                // Pick line with most forecast points (best day coverage)
-                let bestLine = lines[0];
-                let bestCount = 0;
-                for (const line of lines) {
-                    try {
-                        const count = JSON.parse(line).forecasts?.length || 0;
-                        if (count > bestCount) {
-                            bestCount = count;
-                            bestLine = line;
-                        }
-                    } catch(e) {}
-                }
-                const forecast = JSON.parse(bestLine);
-                return (forecast.forecasts || []).map(f => ({
-                    time: new Date(f.valid_time),
-                    wind_kt: f.wind_kt,
-                    gust_kt: f.gust_kt,
-                    wind_dir: f.wind_dir,
-                    temp: f.temp ?? null,
-                    icon: f.icon ?? null,
-                    is_night: f.is_night ?? false,
-                    rain_chance: f.rain_chance ?? null,
-                })).filter(f => f.wind_kt !== null);
-            } catch (e) {
-                return [];
-            }
-        }
-
         function weatherEmoji(icon, isNight) {
             const map = {
                 'sunny': isNight ? '🌙' : '☀️',
@@ -1160,16 +1073,12 @@
             if (bomForecasts && bomForecasts.length > 0 && bomForecasts[0].icon) {
                 weatherData = bomForecasts;
             } else {
+                // latest BOM hourly forecast, written by forecast_logger.py
                 try {
-                    const resp = await fetch(BOM_HOURLY_API);
+                    const resp = await fetch('forecasts/latest/bom.json');
                     if (resp.ok) {
                         const data = await resp.json();
-                        weatherData = data.data.map(h => ({
-                            time: new Date(h.time),
-                            temp: h.temp ?? null,
-                            icon: h.icon_descriptor ?? null,
-                            is_night: h.is_night ?? false,
-                        }));
+                        weatherData = mapArchivedPoints(data.forecasts || []);
                     }
                 } catch (e) {}
             }
@@ -1243,8 +1152,7 @@
 
         async function refreshForecasts() {
             const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
-            const useLive = !isPastDate(dateStr) && !isFutureDate(dateStr);
-            forecastData = useLive ? await fetchAllForecasts(dateStr) : await fetchArchivedForecasts(dateStr);
+            forecastData = await fetchArchivedForecasts(dateStr);
             if (currentData.length > 0 || Object.keys(forecastData).length > 0) {
                 await fetchWeatherData(forecastData.bom || [], dateStr);
                 createWindChart(currentData, forecastData, dateStr);
@@ -1800,7 +1708,6 @@
             document.getElementById('error').style.display = 'none';
 
             const isFuture = isFutureDate(dateStr);
-            const isPast = isPastDate(dateStr);
 
             try {
                 let windData = [];
@@ -1815,10 +1722,9 @@
                     }
                 } else {
                     // Today or past: fetch observations and forecasts
-                    const useLive = !isPast;
                     [windData, forecasts] = await Promise.all([
                         fetchWindData(dateStr).catch(() => []),
-                        useLive ? fetchAllForecasts(dateStr) : fetchArchivedForecasts(dateStr)
+                        fetchArchivedForecasts(dateStr)
                     ]);
 
                     if (windData.length === 0 && Object.keys(forecasts).length === 0) {
@@ -1899,7 +1805,8 @@
         }
 
         // BOM Daily Forecast
-        const BOM_API = 'https://api.weather.bom.gov.au/v1/locations/r3dp5e0/forecasts/daily';
+        // fetched hourly from the BOM API by forecast_logger.py
+        const BOM_API = 'forecasts/latest/bom_daily.json';
 
         function convertWindToKnots(text) {
             // Convert wind speeds from km/h to knots in text
