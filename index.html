@@ -7,14 +7,19 @@
     <link rel="icon" href="favicon.ico" sizes="any">
     <link rel="icon" href="favicon.png" type="image/png">
     <script>
+        // Revalidate with the server (cheap 304 if unchanged); Apache sends no
+        // cache headers, so browsers otherwise reuse stale data for days
+        var NO_CACHE = { cache: 'no-cache' };
         // Start today's data fetches before the chart library loads
         (function() {
             var d = new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Sydney' });
             var p = d.replace(/-/g, '/');
             window._early = { date: d, fetches: {
-                csv: fetch('wind_logs/' + p + '.csv'),
-                summary: fetch('forecasts/archive/' + p + '.json')
+                csv: fetch('wind_logs/' + p + '.csv', NO_CACHE),
+                summary: fetch('forecasts/archive/' + p + '.json', NO_CACHE)
             }};
+            // mark handled; consumers still see the rejection
+            for (var k in window._early.fetches) window._early.fetches[k].catch(function() {});
         })();
         // Return the early fetch for dateStr if there is one, otherwise fetch url
         function earlyFetch(dateStr, key, url) {
@@ -24,7 +29,7 @@
                 delete e.fetches[key];
                 return f;
             }
-            return fetch(url);
+            return fetch(url, dateStr < window._early.date ? {} : NO_CACHE);
         }
     </script>
     <script src="js/chart.js"></script>
@@ -994,7 +999,7 @@
             const fetchPromises = models.map(async (model) => {
                 const url = `forecasts/archive/${year}/${month}/${day}_${model}.jsonl`;
                 try {
-                    const response = await fetch(url);
+                    const response = await fetch(url, isPastDate(dateStr) ? {} : NO_CACHE);
                     if (!response.ok) return;
 
                     const text = await response.text();
@@ -1075,7 +1080,7 @@
             } else {
                 // latest BOM hourly forecast, written by forecast_logger.py
                 try {
-                    const resp = await fetch('forecasts/latest/bom.json');
+                    const resp = await fetch('forecasts/latest/bom.json', NO_CACHE);
                     if (resp.ok) {
                         const data = await resp.json();
                         weatherData = mapArchivedPoints(data.forecasts || []);
@@ -1832,17 +1837,23 @@
             const forecastGrid = document.getElementById('forecastGrid');
 
             try {
-                const response = await fetch(BOM_API);
+                const response = await fetch(BOM_API, NO_CACHE);
                 if (!response.ok) throw new Error('Failed to fetch forecast');
 
                 const data = await response.json();
-                const days = data.data.slice(0, 5); // Show 5 days
+                // the cron copy may be stale, so drop past days and label by date
+                const today = getTodayCanberra();
+                const [ty, tm, td] = today.split('-').map(Number);
+                const tomorrow = new Date(Date.UTC(ty, tm - 1, td + 1)).toISOString().slice(0, 10);
+                const days = data.data.filter(d => formatDate(new Date(d.date)) >= today).slice(0, 5);
+                if (days.length === 0) throw new Error('BOM forecast is out of date');
 
-                forecastGrid.innerHTML = days.map((day, idx) => {
+                forecastGrid.innerHTML = days.map(day => {
                     const date = new Date(day.date);
-                    const dayName = idx === 0 ? 'Today' :
-                                   idx === 1 ? 'Tomorrow' :
-                                   date.toLocaleDateString('en-AU', { weekday: 'long' });
+                    const dateStr = formatDate(date);
+                    const dayName = dateStr === today ? 'Today' :
+                                   dateStr === tomorrow ? 'Tomorrow' :
+                                   date.toLocaleDateString('en-AU', { weekday: 'long', timeZone: 'Australia/Sydney' });
 
                     const windInfo = extractWindInfo(day.extended_text) || 'No wind forecast';
                     const rainChance = day.rain?.chance || 0;
@@ -1869,7 +1880,7 @@
         // Load lake closure status
         async function loadLakeClosureStatus() {
             try {
-                const response = await fetch('yarralumla_bay.html');
+                const response = await fetch('yarralumla_bay.html', NO_CACHE);
                 if (response.ok) {
                     const html = await response.text();
                     document.getElementById('lake-closure-container').innerHTML = html;
@@ -1975,7 +1986,7 @@
 
         async function loadWaterQuality() {
             try {
-                const response = await fetch('water_quality.json');
+                const response = await fetch('water_quality.json', NO_CACHE);
                 if (!response.ok) return;
                 const data = await response.json();
 
