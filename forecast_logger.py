@@ -12,6 +12,7 @@ historical data for long-term model accuracy comparison.
 import requests
 import json
 import os
+import sys
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,7 @@ OPEN_METEO_MODELS = {
 
 # BOM API (Australia)
 BOM_HOURLY_URL = "https://api.weather.bom.gov.au/v1/locations/r3dp5e/forecasts/hourly"
+BOM_DAILY_URL = "https://api.weather.bom.gov.au/v1/locations/r3dp5e0/forecasts/daily"
 
 # Compass direction to degrees
 COMPASS_TO_DEG = {
@@ -257,9 +259,80 @@ def log_forecast(model_name, forecast_data):
     return True
 
 
+def read_archive_lines(model_name, date):
+    path = get_archive_path(model_name, datetime.combine(date, datetime.min.time()))
+    if not os.path.exists(path):
+        return []
+    lines = []
+    with open(path) as f:
+        for line in f:
+            try:
+                lines.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return lines
+
+
+def write_day_summary(date, fresh=None):
+    """Write archive/YYYY/MM/DD.json holding one forecast per model for the day,
+    so the web UI needs one request instead of one per model plus live APIs.
+
+    Open-Meteo models use the fresh fetch if given, else the last archived line.
+    BOM uses the archived line with most points: its rolling window means later
+    issues lose the earlier hours of the day."""
+    models = {}
+    for model_name in list(OPEN_METEO_MODELS) + ['bom']:
+        if model_name != 'bom' and fresh and model_name in fresh:
+            points = group_forecasts_by_date(fresh[model_name]['forecasts']).get(date)
+            if points:
+                models[model_name] = points
+                continue
+        lines = read_archive_lines(model_name, date)
+        if not lines:
+            continue
+        if model_name == 'bom':
+            best = max(lines, key=lambda l: len(l.get('forecasts') or []))
+        else:
+            best = lines[-1]
+        if best.get('forecasts'):
+            models[model_name] = best['forecasts']
+    if not models:
+        return
+    path = os.path.join(ARCHIVE_DIR, date.strftime('%Y'), date.strftime('%m'),
+                        date.strftime('%d') + '.json')
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'updated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                   'models': models}, f, separators=(',', ':'))
+    os.replace(tmp, path)
+
+
+def backfill_summaries():
+    """Write day summaries for every date in the archive."""
+    dates = set()
+    for root, _, files in os.walk(ARCHIVE_DIR):
+        parts = os.path.relpath(root, ARCHIVE_DIR).split(os.sep)
+        if len(parts) != 2:
+            continue
+        for fn in files:
+            if fn.endswith('.jsonl'):
+                try:
+                    dates.add(datetime.strptime(f"{parts[0]}-{parts[1]}-{fn[:2]}", '%Y-%m-%d').date())
+                except ValueError:
+                    pass
+    for date in sorted(dates):
+        write_day_summary(date)
+    print(f"Wrote {len(dates)} day summaries")
+
+
 def main():
+    if '--backfill' in sys.argv:
+        backfill_summaries()
+        return
+
     print(f"Fetching forecasts at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+    om_forecasts = None
     # Fetch Open-Meteo forecasts (GFS, ICON, GEM, JMA)
     try:
         om_forecasts = fetch_open_meteo_forecasts()
@@ -285,6 +358,28 @@ def main():
             print("  BOM: no data available")
     except Exception as e:
         print(f"  BOM error: {e}")
+
+    # BOM daily forecast, served as-is so the web UI needs no third-party fetch
+    try:
+        resp = requests.get(BOM_DAILY_URL, timeout=10)
+        resp.raise_for_status()
+        daily = resp.json()
+        if daily.get('data'):
+            os.makedirs(LATEST_DIR, exist_ok=True)
+            path = os.path.join(LATEST_DIR, 'bom_daily.json')
+            with open(path + '.tmp', 'w') as f:
+                json.dump(daily, f, separators=(',', ':'))
+            os.replace(path + '.tmp', path)
+            print(f"  BOM daily: {len(daily['data'])} days")
+    except Exception as e:
+        print(f"  BOM daily error: {e}")
+
+    today = datetime.now(CANBERRA_TZ).date()
+    for i in range(FORECAST_DAYS):
+        try:
+            write_day_summary(today + timedelta(days=i), om_forecasts)
+        except Exception as e:
+            print(f"  summary error for {today + timedelta(days=i)}: {e}")
 
 
 if __name__ == '__main__':
