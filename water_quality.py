@@ -63,7 +63,9 @@ def extract_all_locations(html):
 
     Returns list of dicts with name, status, comments.
     """
-    pattern = r'<td>\s*(.*?)\s*</td>\s*<td>\s*(.*?)\s*</td>\s*<td>(.*?)</td>'
+    # NCA added attributes (headers="...") to the <td> tags in Oct 2026
+    pattern = (r'<td\b[^>]*>\s*(.*?)\s*</td>\s*<td\b[^>]*>\s*(.*?)\s*</td>'
+               r'\s*<td\b[^>]*>(.*?)</td>')
     matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
 
     locations = []

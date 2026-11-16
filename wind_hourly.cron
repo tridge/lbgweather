@@ -1,0 +1,44 @@
+#!/bin/bash
+cd $HOME/wind
+
+ALERT_TO=tridge60@gmail.com
+WQ_STATE=$HOME/var/water_quality.fails
+
+# Email after 3 consecutive failures (ignores one-off network blips), then
+# daily while still failing, and once more on recovery.
+alert() {
+    printf 'Subject: %s\nFrom: lbgweather@wstracker.org\nTo: %s\n\n%s\n' \
+        "$1" "$ALERT_TO" "$2" | /usr/sbin/sendmail -t
+}
+
+(
+    date
+    python3 forecast_logger.py
+
+    WQ_OUT=$(python3 water_quality.py 2>&1)
+    rc=$?
+    echo "$WQ_OUT"
+    fails=$(cat $WQ_STATE 2>/dev/null || echo 0)
+    if [ $rc -ne 0 ]; then
+        fails=$((fails + 1))
+        echo $fails > $WQ_STATE
+        if [ $fails -eq 3 ] || [ $((fails % 24)) -eq 3 -a $fails -gt 3 ]; then
+            alert "lbgweather: water_quality.py failing ($fails runs)" \
+"water_quality.py has failed $fails consecutive hourly runs (rc=$rc).
+The lake water quality map on lbgweather.au is stale.
+
+Last output:
+$WQ_OUT
+
+Log: ~lbgweather/wind/forecast.log"
+        fi
+    else
+        if [ $fails -ge 3 ]; then
+            alert "lbgweather: water_quality.py recovered" \
+"water_quality.py succeeded after $fails failed runs.
+
+$WQ_OUT"
+        fi
+        rm -f $WQ_STATE
+    fi
+) >> forecast.log 2>&1
