@@ -175,6 +175,69 @@
             font-size: 0.5em;
             color: #95a5a6;
         }
+        button.active {
+            background: #2c3e50;
+        }
+        /* Weekly forecast table */
+        .weekly-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .weekly-head h3 { margin: 0; color: #2c3e50; }
+        .weekly-step button { padding: 4px 10px; background: #bdc3c7; }
+        .weekly-step button.active { background: #3498db; }
+        .weekly-updated { color: #95a5a6; font-size: 12px; margin-left: auto; }
+        .weekly-scroll {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        .weekly-table {
+            border-collapse: collapse;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        .weekly-table th, .weekly-table td {
+            text-align: center;
+            padding: 3px 0;
+            min-width: 34px;
+        }
+        .weekly-table .wk-label {
+            position: sticky;
+            left: 0;
+            z-index: 2;
+            background: white;
+            text-align: right;
+            padding: 3px 8px 3px 0;
+            min-width: 72px;
+            color: #7f8c8d;
+            font-weight: normal;
+            font-size: 11px;
+            box-shadow: 1px 0 0 #eee;
+        }
+        .weekly-table .wk-day {
+            text-align: left;
+            padding: 4px 6px;
+            color: #2c3e50;
+            cursor: pointer;
+            border-left: 2px solid #ccc;
+        }
+        .weekly-table .wk-day.wk-nolink { cursor: default; }
+        .weekly-table .wk-day span {
+            position: sticky;
+            left: 80px;
+        }
+        .weekly-table .wk-start { border-left: 2px solid #ccc; }
+        .weekly-table .wk-night { background: #f0f2f5; }
+        .weekly-table .wk-hour { color: #7f8c8d; font-size: 11px; }
+        .weekly-table .wk-now { border-left: 2px dashed #e74c3c; }
+        .weekly-table .wk-icon { font-size: 18px; }
+        .weekly-table .wk-rain { color: #2e86de; font-size: 12px; }
+        .weekly-table .wk-wind { font-weight: 600; }
+        .weekly-table .wk-gust { font-size: 12px; }
+        .weekly-table .wk-dir span { display: inline-block; color: #34495e; font-size: 16px; font-weight: bold; }
         .chart-container {
             background: white;
             border-radius: 8px;
@@ -534,6 +597,7 @@
             <button id="nextDay">&rarr;</button>
         </div>
         <button id="today">Today</button>
+        <button id="weeklyBtn">Weekly</button>
         <input type="date" id="dateSelect" style="display: none;">
     </div>
 
@@ -576,6 +640,18 @@
 
     <div id="error" class="error" style="display: none;"></div>
     <div id="loading" class="loading">Loading wind data...</div>
+
+    <div id="weekly" class="chart-container" style="display: none;">
+        <div class="weekly-head">
+            <h3>Weekly Forecast</h3>
+            <select id="weeklyModel"></select>
+            <span class="weekly-step">
+                <button data-step="3">3h</button><button data-step="1">1h</button>
+            </span>
+            <span class="weekly-updated" id="weeklyUpdated"></span>
+        </div>
+        <div class="weekly-scroll" id="weeklyScroll"></div>
+    </div>
 
     <div id="content" style="display: none;">
         <div class="current-conditions">
@@ -712,6 +788,9 @@
     <script>
         const isCompact = () => window.innerWidth <= 600;
         const BASE_URL = 'wind_logs';
+        // sailing hours shown on the charts and the weekly table
+        const DAY_START_HOUR = 5;
+        const DAY_END_HOUR = 21;
 
         // Model configuration
         const MODELS = {
@@ -855,10 +934,10 @@
             const saved = localStorage.getItem('selectedModels');
             if (saved) {
                 try {
-                    return JSON.parse(saved);
-                } catch (e) {
-                    return ['bom'];
-                }
+                    const v = JSON.parse(saved);
+                    if (Array.isArray(v)) return v.filter(m => typeof m === 'string');
+                } catch (e) {}
+                return ['bom'];
             }
             return ['ecmwf', 'bom']; // Default
         }
@@ -1073,7 +1152,7 @@
         // Cache weather data so we can re-render on chart resize
         let _weatherCache = { data: [], dateStr: '' };
 
-        async function fetchWeatherData(bomForecasts, dateStr) {
+        async function fetchWeatherData(bomForecasts) {
             let weatherData = [];
             if (bomForecasts && bomForecasts.length > 0 && bomForecasts[0].icon) {
                 weatherData = bomForecasts;
@@ -1087,7 +1166,7 @@
                     }
                 } catch (e) {}
             }
-            _weatherCache = { data: weatherData, dateStr };
+            return weatherData;
         }
 
         function renderWeatherStrip() {
@@ -1159,7 +1238,7 @@
             const dateStr = document.getElementById('dateSelect').value || getTodayCanberra();
             forecastData = await fetchArchivedForecasts(dateStr);
             if (currentData.length > 0 || Object.keys(forecastData).length > 0) {
-                await fetchWeatherData(forecastData.bom || [], dateStr);
+                _weatherCache = { data: await fetchWeatherData(forecastData.bom || []), dateStr };
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
             }
@@ -1353,8 +1432,8 @@
                     scales: {
                         x: {
                             type: 'time',
-                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
-                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_START_HOUR, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_END_HOUR, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1468,8 +1547,8 @@
                     scales: {
                         x: {
                             type: 'time',
-                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
-                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_START_HOUR, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_END_HOUR, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1636,8 +1715,8 @@
                     scales: {
                         x: {
                             type: 'time',
-                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 5, 0),
-                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), 21, 0),
+                            min: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_START_HOUR, 0),
+                            max: new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate(), DAY_END_HOUR, 0),
                             time: {
                                 unit: 'hour',
                                 displayFormats: {
@@ -1694,7 +1773,10 @@
             });
         }
 
+        const weeklyShown = () => document.getElementById('weekly').style.display !== 'none';
+
         function showError(message) {
+            if (weeklyShown()) return;  // user switched to weekly during the load
             document.getElementById('loading').style.display = 'none';
             document.getElementById('content').style.display = 'none';
             document.getElementById('error').style.display = 'block';
@@ -1702,12 +1784,20 @@
         }
 
         function showContent() {
+            if (weeklyShown()) return;
             document.getElementById('loading').style.display = 'none';
             document.getElementById('error').style.display = 'none';
             document.getElementById('content').style.display = 'block';
         }
 
+        // bumped by each loadData and showWeekly; a load that is no longer
+        // the latest drops its results
+        let _loadGen = 0;
+
         async function loadData(dateStr) {
+            const gen = ++_loadGen;
+            const stale = () => gen !== _loadGen;
+            hideWeekly();
             document.getElementById('loading').style.display = 'block';
             document.getElementById('content').style.display = 'none';
             document.getElementById('error').style.display = 'none';
@@ -1721,6 +1811,7 @@
                 if (isFuture) {
                     // Future date: only forecasts, no observations
                     forecasts = await fetchArchivedForecasts(dateStr);
+                    if (stale()) return;
                     if (Object.keys(forecasts).length === 0) {
                         showError('No forecast data available for this date');
                         return;
@@ -1731,6 +1822,7 @@
                         fetchWindData(dateStr).catch(() => []),
                         fetchArchivedForecasts(dateStr)
                     ]);
+                    if (stale()) return;
 
                     if (windData.length === 0 && Object.keys(forecasts).length === 0) {
                         showError('No data available for this date');
@@ -1753,16 +1845,18 @@
                     clearStats();
                 }
 
-                await fetchWeatherData(forecastData.bom || [], dateStr);
+                const weatherData = await fetchWeatherData(forecastData.bom || []);
+                if (stale()) return;
+                _weatherCache = { data: weatherData, dateStr };
                 createWindChart(currentData, forecastData, dateStr);
                 createDirectionChart(currentData, forecastData, dateStr);
                 showContent();
 
                 // Update date display and nav buttons
-                updateDateDisplay(dateStr);
+                if (!weeklyShown()) updateDateDisplay(dateStr);
                 updateNavButtons(dateStr);
             } catch (error) {
-                showError(error.message);
+                if (!stale()) showError(error.message);
             }
         }
 
@@ -1807,6 +1901,213 @@
         function updateNavButtons(dateStr) {
             const maxDate = getMaxFutureDate();
             document.getElementById('nextDay').disabled = dateStr >= maxDate;
+        }
+
+        // Weekly forecast table (forecasts/latest/weekly.json, written hourly by
+        // forecast_logger.py). Times are Canberra wall-clock strings, so no Date parsing.
+        let _weekly = null;
+
+        function wkWindColor(kt) {
+            const scale = [[4, '#d6ecff'], [7, '#a6d8ff'], [10, '#6fe0e8'], [13, '#5ae27a'],
+                           [16, '#b8e83c'], [19, '#ffd42a'], [22, '#ffa424'], [25, '#ff6040'],
+                           [30, '#e8346e']];
+            for (const [max, c] of scale) if (kt < max) return c;
+            return '#b03ad8';
+        }
+
+        function wmoEmoji(code, isDay) {
+            if (code == null) return '';
+            if (code === 0) return isDay ? '☀️' : '🌙';
+            if (code === 1) return isDay ? '🌤️' : '🌙';
+            if (code === 2) return isDay ? '⛅' : '☁️';
+            if (code === 3) return '☁️';
+            if (code === 45 || code === 48) return '🌫️';
+            if (code >= 51 && code <= 57) return '🌦️';
+            if (code >= 61 && code <= 67) return '🌧️';
+            if ((code >= 71 && code <= 77) || code === 85 || code === 86) return '🌨️';
+            if (code >= 80 && code <= 82) return '🌦️';
+            if (code >= 95) return '⛈️';
+            return '';
+        }
+
+        function wkHourLabel(h) {
+            const ampm = h < 12 ? 'am' : 'pm';
+            return `${h % 12 || 12}<small>${ampm}</small>`;
+        }
+
+        function wkDayLabel(dateStr) {
+            const [y, m, d] = dateStr.split('-').map(Number);
+            const wd = new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-AU', { weekday: 'long', timeZone: 'UTC' });
+            return `${wd} ${d}`;
+        }
+
+        // Build columns: hourly, or every 3h (gust = max, rain = sum, worst weather code)
+        function wkColumns(times, m, step) {
+            const cols = [];
+            const n = times.length;
+            for (let i = 0; i < n; i++) {
+                const hour = parseInt(times[i].slice(11, 13));
+                if (hour < DAY_START_HOUR || hour > DAY_END_HOUR) continue;
+                if (step === 3 && (hour - DAY_START_HOUR) % 3 !== 0) continue;
+                if (m.wind[i] == null) continue;
+                const lo = step === 3 ? Math.max(0, i - 1) : i;
+                const hi = step === 3 ? Math.min(n - 1, i + 1) : i;
+                let gust = null, rain = 0, code = null;
+                for (let j = lo; j <= hi; j++) {
+                    if (m.gust?.[j] != null) gust = Math.max(gust ?? 0, m.gust[j]);
+                    // missing rain makes the total unknown, not dry
+                    rain = (rain == null || m.precip?.[j] == null) ? null : rain + m.precip[j];
+                    if (m.code?.[j] != null) code = Math.max(code ?? 0, m.code[j]);
+                }
+                cols.push({
+                    date: times[i].slice(0, 10), hour, time: times[i],
+                    wind: m.wind[i], gust, dir: m.dir[i], temp: m.temp[i],
+                    rain, code, isDay: m.day[i] === 1,
+                });
+            }
+            return cols;
+        }
+
+        function renderWeekly() {
+            const scroll = document.getElementById('weeklyScroll');
+            if (!_weekly) return;
+            const model = document.getElementById('weeklyModel').value;
+            const m = _weekly.models[model];
+            if (!m) { scroll.innerHTML = 'No data for this model'; return; }
+            const step = parseInt(localStorage.getItem('weeklyStep') || '3');
+            document.querySelectorAll('.weekly-step button').forEach(b =>
+                b.classList.toggle('active', parseInt(b.dataset.step) === step));
+
+            // Canberra wall-clock "YYYY-MM-DDTHH:MM" as minutes, to compare with the data
+            const wallMinutes = t => Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10),
+                                              +t.slice(11, 13), +t.slice(14, 16)) / 60000;
+            const nowStr = new Date().toLocaleString('sv-SE', { timeZone: 'Australia/Sydney' })
+                .slice(0, 16).replace(' ', 'T');
+            const nowMin = wallMinutes(nowStr);
+            const today = nowStr.slice(0, 10);
+
+            // a stale file (failed cron) would otherwise show past days as upcoming
+            const cols = wkColumns(_weekly.time, m, step).filter(c => c.date >= today);
+            if (cols.length === 0) { scroll.innerHTML = 'The weekly forecast is out of date'; return; }
+
+            // mark the column nearest now, if now is within its time step
+            let nowIdx = -1, best = Infinity;
+            cols.forEach((c, i) => {
+                const d = Math.abs(wallMinutes(c.time) - nowMin);
+                if (d < best) { best = d; nowIdx = i; }
+            });
+            if (best > step * 30) nowIdx = -1;
+            const scrollIdx = nowIdx >= 0 ? nowIdx : cols.findIndex(c => wallMinutes(c.time) > nowMin);
+
+            // day header spans
+            const days = [];
+            cols.forEach(c => {
+                if (!days.length || days[days.length - 1].date !== c.date) days.push({ date: c.date, n: 0 });
+                days[days.length - 1].n++;
+            });
+            const maxDate = getMaxFutureDate();
+            const r = v => v == null ? '' : Math.round(v);
+            const cls = (c, i, extra) => {
+                const k = [extra];
+                if (i === 0 || cols[i - 1].date !== c.date) k.push('wk-start');
+                if (!c.isDay) k.push('wk-night');
+                if (i === nowIdx) k.push('wk-now');
+                return k.filter(Boolean).join(' ');
+            };
+            const row = (label, fn, extra) =>
+                `<tr><th class="wk-label">${label}</th>${cols.map((c, i) => fn(c, i, cls(c, i, extra))).join('')}</tr>`;
+
+            let html = '<table class="weekly-table"><tr><th class="wk-label"></th>';
+            html += days.map(d => {
+                const link = d.date <= maxDate;
+                return `<th class="wk-day${link ? '' : ' wk-nolink'}" colspan="${d.n}" data-date="${d.date}"` +
+                       `${link ? ' title="Show this day"' : ''}><span>${wkDayLabel(d.date)}</span></th>`;
+            }).join('') + '</tr>';
+            html += row('Hours', (c, i, k) => `<td class="${k} wk-hour">${wkHourLabel(c.hour)}</td>`);
+            html += row('', (c, i, k) => `<td class="${k} wk-icon">${wmoEmoji(c.code, c.isDay)}</td>`);
+            html += row('Temp °C', (c, i, k) => `<td class="${k}">${r(c.temp)}°</td>`);
+            html += row('Rain mm', (c, i, k) =>
+                `<td class="${k} wk-rain">${c.rain != null && c.rain >= 0.1 ? c.rain.toFixed(1) : ''}</td>`);
+            html += row('Wind kt', (c, i, k) =>
+                `<td class="${k} wk-wind" style="background:${wkWindColor(c.wind)}">${r(c.wind)}</td>`);
+            html += row('Gusts kt', (c, i, k) => c.gust == null ? `<td class="${k}"></td>` :
+                `<td class="${k} wk-gust" style="background:${wkWindColor(c.gust)}">${r(c.gust)}</td>`);
+            // arrow points downwind, as on windy
+            html += row('Wind dir', (c, i, k) => c.dir == null ? `<td class="${k}"></td>` :
+                `<td class="${k} wk-dir" title="${c.dir}° ${degToCompass(c.dir)}">` +
+                `<span style="transform:rotate(${c.dir}deg)">↓</span></td>`);
+            html += '</table>';
+            scroll.innerHTML = html;
+
+            scroll.querySelectorAll('.wk-day:not(.wk-nolink)').forEach(th =>
+                th.addEventListener('click', () => loadData(th.dataset.date)));
+
+            // scroll so now (or the next sailing hour) is near the left edge
+            const nowCell = scrollIdx >= 0 ? scroll.querySelectorAll('tr:nth-child(2) td')[scrollIdx] : null;
+            if (nowCell) {
+                const label = scroll.querySelector('.wk-label').offsetWidth;
+                scroll.scrollLeft = Math.max(0, nowCell.offsetLeft - label - nowCell.offsetWidth);
+            }
+
+            const upd = new Date(_weekly.updated);
+            const ageHours = (Date.now() - upd.getTime()) / 3600000;
+            const updOpts = { timeZone: 'Australia/Sydney', hour: 'numeric', minute: '2-digit' };
+            if (formatDate(upd) !== today) Object.assign(updOpts, { weekday: 'short', day: 'numeric', month: 'short' });
+            const updEl = document.getElementById('weeklyUpdated');
+            updEl.textContent = `${MODELS[model].name} · updated ${upd.toLocaleString('en-AU', updOpts)}` +
+                (ageHours > 6 ? ' (out of date)' : '');
+            updEl.style.color = ageHours > 6 ? '#e74c3c' : '';
+        }
+
+        async function showWeekly() {
+            _loadGen++;
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('content').style.display = 'none';
+            document.querySelector('.model-selector').style.display = 'none';
+            document.getElementById('weekly').style.display = 'block';
+            document.getElementById('weeklyBtn').classList.add('active');
+            document.getElementById('dateDisplay').textContent = 'Next 8 days';
+            history.replaceState(null, '', '#weekly');
+
+            const scroll = document.getElementById('weeklyScroll');
+            try {
+                const resp = await fetch('forecasts/latest/weekly.json', NO_CACHE);
+                if (!resp.ok) throw new Error(resp.status);
+                _weekly = await resp.json();
+            } catch (e) {
+                if (!_weekly) { scroll.innerHTML = 'Unable to load weekly forecast'; return; }
+            }
+
+            const sel = document.getElementById('weeklyModel');
+            const available = Object.keys(MODELS).filter(k => _weekly.models?.[k]);
+            if (available.length === 0) { scroll.innerHTML = 'Unable to load weekly forecast'; return; }
+            const current = sel.value || localStorage.getItem('weeklyModel');
+            sel.innerHTML = available.map(k => `<option value="${k}">${MODELS[k].name}</option>`).join('');
+            const fromDaily = getSelectedModels().find(k => available.includes(k));
+            sel.value = available.includes(current) ? current : (fromDaily || available[0]);
+            renderWeekly();
+        }
+
+        function hideWeekly() {
+            if (document.getElementById('weekly').style.display === 'none') return;
+            document.getElementById('weekly').style.display = 'none';
+            document.querySelector('.model-selector').style.display = '';
+            document.getElementById('weeklyBtn').classList.remove('active');
+            if (location.hash === '#weekly') history.replaceState(null, '', location.pathname + location.search);
+        }
+
+        function initWeekly() {
+            document.getElementById('weeklyBtn').addEventListener('click', showWeekly);
+            document.getElementById('weeklyModel').addEventListener('change', e => {
+                localStorage.setItem('weeklyModel', e.target.value);
+                renderWeekly();
+            });
+            document.querySelectorAll('.weekly-step button').forEach(b =>
+                b.addEventListener('click', () => {
+                    localStorage.setItem('weeklyStep', b.dataset.step);
+                    renderWeekly();
+                }));
         }
 
         // BOM Daily Forecast
@@ -2102,6 +2403,7 @@
 
             // Initialize model checkboxes from localStorage
             initModelCheckboxes();
+            initWeekly();
 
             // Event listeners
             document.getElementById('prevDay').addEventListener('click', () => changeDay(-1));
@@ -2112,7 +2414,11 @@
             loadLakeClosureStatus();
             loadForecast();
             loadWaterQuality();
-            await loadData(today);
+            if (location.hash === '#weekly') {
+                showWeekly();
+            } else {
+                await loadData(today);
+            }
 
             // Scroll to hash target after async content has loaded
             if (window.location.hash) {
