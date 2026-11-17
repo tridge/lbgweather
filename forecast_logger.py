@@ -260,6 +260,52 @@ def log_forecast(model_name, forecast_data):
     return True
 
 
+WEEKLY_DAYS = 8
+WEEKLY_VARS = {
+    'wind': 'wind_speed_10m',
+    'gust': 'wind_gusts_10m',
+    'dir': 'wind_direction_10m',
+    'temp': 'temperature_2m',
+    'precip': 'precipitation',
+    'code': 'weather_code',
+    'day': 'is_day',
+}
+
+
+def fetch_weekly():
+    """Hourly multi-variable forecast for the web UI's weekly table.
+    Times are Canberra wall-clock strings; wind in knots."""
+    params = {
+        'latitude': CANBERRA_LAT,
+        'longitude': CANBERRA_LON,
+        'hourly': ','.join(WEEKLY_VARS.values()),
+        'models': ','.join(OPEN_METEO_MODELS.values()),
+        'timezone': 'Australia/Sydney',
+        'forecast_days': WEEKLY_DAYS,
+        'wind_speed_unit': 'kn',
+    }
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    hourly = resp.json().get('hourly', {})
+    times = hourly.get('time', [])
+    models = {}
+    for model_name, model_key in OPEN_METEO_MODELS.items():
+        m = {}
+        for short, var in WEEKLY_VARS.items():
+            vals = hourly.get(f'{var}_{model_key}') or []
+            if short in ('dir', 'code', 'day'):
+                vals = [None if v is None else int(v) for v in vals]
+            else:
+                vals = [None if v is None else round(v, 1) for v in vals]
+            m[short] = vals
+        if any(v is not None for v in m['wind']):
+            models[model_name] = m
+    if not times or not models:
+        return None
+    return {'updated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'time': times, 'models': models}
+
+
 def write_json_atomic(path, obj):
     """Write via a unique temp file so concurrent writers can't corrupt it."""
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix='.tmp')
@@ -381,6 +427,15 @@ def main():
             print(f"  BOM daily: {len(daily['data'])} days")
     except Exception as e:
         print(f"  BOM daily error: {e}")
+
+    try:
+        weekly = fetch_weekly()
+        if weekly:
+            os.makedirs(LATEST_DIR, exist_ok=True)
+            write_json_atomic(os.path.join(LATEST_DIR, 'weekly.json'), weekly)
+            print(f"  Weekly: {len(weekly['time'])} hours, {len(weekly['models'])} models")
+    except Exception as e:
+        print(f"  Weekly error: {e}")
 
     today = datetime.now(CANBERRA_TZ).date()
     for i in range(FORECAST_DAYS):
